@@ -1,4 +1,12 @@
-![Vibe Coded with Claude Code](docs/vibe-coded-disclosure.png)
+⚠️ ARCHIVED
+
+On March 23rd 2026, Anthropic announced that Claude can now control the desktop automatically, see: [Put Claude to work on your computer](https://claude.com/blog/dispatch-and-computer-use)
+
+> In Claude Cowork and Claude Code, you can now enable Claude to use your computer to complete tasks. When Claude doesn’t have access to the tools it needs, it will point, click, and navigate what’s on your screen to perform the task itself. It can open files, use the browser, and run dev tools automatically — with no setup required. 
+
+Now this repo redundant as it can be achieved now through their own app in probably a much safer way, though obviously it should still be used with great care. I am therefore archiving this project. It might be useful as either a mosquito-in-amber snapshot of the time in which it was created or as inspriation for other orchestrators for different tool frameworks.
+
+---
 
 > **Disclosure**: This project was developed using Claude Code, Anthropic's AI-powered coding assistant, as part of an experimental "vibe coding" approach to rapid prototyping and development.
 

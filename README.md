@@ -2,7 +2,7 @@
 
 # AutoMac MCP
 
-A locally-hosted MCP server that exposes full macOS UI automation over HTTP (SSE transport). Run it on your Mac, get a URL, and paste it into any AI app or agent that supports custom MCP integration to control your entire desktop remotely.
+A locally-hosted MCP server that exposes full macOS UI automation over HTTP. Run it on your Mac, get a URL, and paste it into any AI app or agent that supports custom MCP integration to control your entire desktop remotely.
 
 Currently only written to support Mac.
 
@@ -15,20 +15,20 @@ Currently only written to support Mac.
 ## How It Works
 
 ```
-AI App (any device)  ->  http://localhost:8000/sse  ->  AutoMac MCP Server  ->  macOS System APIs
+AI App (any device)  ->  http://localhost:8000/mcp  ->  AutoMac MCP Server  ->  macOS System APIs
 ```
 
 Once the server is running on your Mac, you get a local URL:
 
 ```
-http://localhost:8000/sse
+http://localhost:8000/mcp
 ```
 
 Paste this URL into any AI app or agent that supports custom MCP server integration. As long as the server is running on your Mac, the AI can automate your entire desktop: clicking, typing, reading the screen, switching apps, and more.
 
 ---
 
-## Quick Start (Local SSE Server)
+## Quick Start (Local MCP Server)
 
 ### Prerequisites
 
@@ -93,29 +93,25 @@ INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
 
 The server is now live. Press **Ctrl+C** to stop it.
 
-### Step 5 -- Verify the SSE endpoint
+### Step 5 -- Verify the MCP endpoint
 
 In a second terminal window:
 
 ```bash
-curl -N http://localhost:8000/sse
+curl http://localhost:8000/mcp
 ```
 
-You should see a stream of SSE data begin (the connection stays open). Press **Ctrl+C** to end it.
+You should receive a JSON response (or a 405 Method Not Allowed — both confirm the server is live).
 
 ### Step 6 -- Connect your AI app
 
-Copy the SSE URL and paste it into any AI app or agent that supports custom MCP server integration:
+Copy the MCP URL and paste it into any AI app or agent that supports custom MCP server integration:
 
 ```
-http://localhost:8000/sse
+http://localhost:8000/mcp
 ```
 
-The JSON-RPC message endpoint (also required by some clients) is:
-
-```
-http://localhost:8000/messages/
-```
+> **Note for Littlebird and similar apps**: when prompted for a "server URL", paste `http://localhost:8000/mcp` exactly. Do **not** append any extra path suffix.
 
 The server must remain running on your Mac for the connection to stay active. You can keep a Terminal window open in the background, or run it as a background process:
 

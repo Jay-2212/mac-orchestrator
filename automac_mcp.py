@@ -8,6 +8,8 @@ import pyautogui
 import easyocr
 import numpy as np
 from mcp.server.fastmcp import FastMCP
+from fastapi import FastAPI
+import uvicorn
 try:
     from Cocoa import NSWorkspace
     from Quartz import CGWindowListCopyWindowInfo, kCGWindowListOptionOnScreenOnly, kCGNullWindowID, CGEventCreateScrollWheelEvent, CGEventPost, kCGScrollEventUnitPixel, kCGHIDEventTap
@@ -608,10 +610,14 @@ def get_available_apps() -> str:
     return json.dumps({"success": True, "apps": apps}, indent=2)
 
 
-def main():
-    """Entry point for the MCP server. Runs streamable-http on http://127.0.0.1:8000/mcp."""
-    mcp.run(transport="streamable-http")
-
-
 if __name__ == "__main__":
-    main()
+    # Create a base FastAPI app
+    app = FastAPI(title="Automac MCP Server")
+    # Create the Starlette app from the FastMCP server
+    # This automatically mounts /sse and /messages paths properly
+    mcp_app = mcp.server.create_starlette_app()
+
+    # Mount the MCP app to the root path
+    app.mount("/", mcp_app)
+    # Run the server on 127.0.0.1:8000
+    uvicorn.run(app, host="127.0.0.1", port=8000)

@@ -16,8 +16,8 @@ try:
 except ImportError:
     ACCESSIBILITY_AVAILABLE = False
 
-# Initialize the MCP server
-mcp = FastMCP("AutoMac MCP - macOS UI Automation")
+# Initialize the MCP server (streamable-http transport on localhost:8000, path /mcp)
+mcp = FastMCP("AutoMac MCP - macOS UI Automation", host="127.0.0.1", port=8000)
 
 # Initialize OCR reader and pyautogui settings
 reader = easyocr.Reader(['en'])
@@ -609,8 +609,8 @@ def get_available_apps() -> str:
 
 
 def main():
-    """Entry point for the MCP server."""
-    mcp.run()
+    """Entry point for the MCP server. Runs streamable-http on http://127.0.0.1:8000/mcp."""
+    mcp.run(transport="streamable-http")
 
 
 if __name__ == "__main__":

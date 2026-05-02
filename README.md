@@ -1,73 +1,147 @@
-⚠️ ARCHIVED
-
-On March 23rd 2026, Anthropic announced that Claude can now control the desktop automatically, see: [Put Claude to work on your computer](https://claude.com/blog/dispatch-and-computer-use)
-
-> In Claude Cowork and Claude Code, you can now enable Claude to use your computer to complete tasks. When Claude doesn’t have access to the tools it needs, it will point, click, and navigate what’s on your screen to perform the task itself. It can open files, use the browser, and run dev tools automatically — with no setup required. 
-
-Now this repo redundant as it can be achieved now through their own app in probably a much safer way, though obviously it should still be used with great care. I am therefore archiving this project. It might be useful as either a mosquito-in-amber snapshot of the time in which it was created or as inspriation for other orchestrators for different tool frameworks.
-
----
-
 > **Disclosure**: This project was developed using Claude Code, Anthropic's AI-powered coding assistant, as part of an experimental "vibe coding" approach to rapid prototyping and development.
 
 # AutoMac MCP
 
-A MCP server intended to run locally that provides full control of your local OS UI.
+A locally-hosted MCP server that exposes full macOS UI automation over HTTP. Run it on your Mac, get a URL, and paste it into any AI app or agent that supports custom MCP integration to control your entire desktop remotely.
 
 Currently only written to support Mac.
 
-⚠️ **WARNING**: This is an experimental project that grants an AI assistant direct control over your operating system's user interface. This is potentially dangerous and should only be used in controlled environments for research purposes. The project is designed to test how effectively an LLM can utilize automated UI orchestration tools, not for production use.
+> **WARNING**: This is an experimental project that grants an AI assistant direct control over your operating system's user interface. Only run it in environments you control and never expose the port to the public internet. Monitor the AI's actions closely.
 
-Experimental and intended for use with Cluade Desktop. Use the MCP server integration command confirmation prompt features to keep it safe!
+[See it in action: Automated Steam game purchase case study](#case-study-automated-purchase-a-steam-game)
 
-📖 **[See it in action: Automated Steam game purchase case study](#case-study-automated-purchase-a-steam-game)**
+---
 
-## Quick Start
+## How It Works
 
-1. **Install dependencies**:
-   ```bash
-   uv sync
-   ```
+```
+AI App (any device)  ->  http://localhost:8000/mcp  ->  AutoMac MCP Server  ->  macOS System APIs
+```
 
-2. **Add to Claude Desktop** - Go to Settings > Developer > Edit Config and add the following to your `claude_desktop_config.json` file (do not use `fastmcp install` as it doesn't work reliably with uv-based projects):
-   ```json
-   {
-     "mcpServers": {
-       "automac-mcp": {
-         "command": "/path/to/automac-mcp/.venv/bin/python",
-         "args": ["/path/to/automac-mcp/automac_mcp.py"]
-       }
-     }
-   }
-   ```
+Once the server is running on your Mac, you get a local URL:
 
-3. **Grant macOS permissions** - Enable Accessibility and Screen Recording permissions for your terminal in System Settings > Privacy & Security.
+```
+http://localhost:8000/mcp
+```
 
-4. **Restart Claude Desktop** and start automating your macOS UI!
+Paste this URL into any AI app or agent that supports custom MCP server integration. As long as the server is running on your Mac, the AI can automate your entire desktop: clicking, typing, reading the screen, switching apps, and more.
 
-For best results, turn on "Increase contrast" in System Preferences > Accessibility > Display
+---
 
-## Permissions & First-Time Setup
+## Quick Start (Local MCP Server)
 
-To use AutoMac MCP, you need to grant accessibility permissions to your terminal or Python interpreter:
+### Prerequisites
 
-1. **Grant Initial macOS Permissions**
-   - Go to **System Settings** > **Privacy & Security**
-   - Add your terminal (Terminal.app, iTerm2, etc.) to **Accessibility** and **Screen Recording**
-   - Restart your terminal after granting permissions
+- macOS (Apple Silicon or Intel)
+- Python 3.10 or later
+- `uv` package manager -- install with:
+  ```bash
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+  ```
 
-2. **Configure Tool Permissions for Full Automation**
-   
-   ⚠️ **For experimental full automation**: When Claude first attempts to use any tool, you'll see permission prompts. To enable seamless automation, select "Always allow in future" for each tool. 
-   
-   **This is risky** - it grants the AI complete control over your UI without confirmation prompts. Only do this in a controlled environment for research purposes, and always monitor the AI's actions closely.
-   
-   This experimental approach tests the current state-of-the-art in LLM-driven OS automation.
+### Step 1 -- Clone the repo
 
-3. **Test the setup**
-   - Run the MCP server - it should now have access to window information and screen capture
+```bash
+git clone https://github.com/Jay-2212/mac-orchestrator.git
+cd mac-orchestrator
+```
 
-**Note**: You may need to grant permissions to both your terminal app and the Python interpreter separately depending on your setup.
+### Step 2 -- Create virtual environment and install dependencies
+
+```bash
+uv venv
+source .venv/bin/activate
+uv sync
+```
+
+Alternatively, using plain pip:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e .
+```
+
+### Step 3 -- Grant macOS permissions
+
+The server needs two macOS permissions. Without them it will start but will be unable to read the screen or control input.
+
+1. Open **System Settings -> Privacy & Security -> Accessibility**
+   - Add your terminal app (Terminal.app, iTerm2, Warp, etc.)
+2. Open **System Settings -> Privacy & Security -> Screen Recording**
+   - Add your terminal app
+
+Restart your terminal after granting both permissions.
+
+> You may also need to grant these permissions to the Python interpreter (`.venv/bin/python`) separately. If a permission dialog appears when you first run a tool, grant it.
+
+### Step 4 -- Start the server
+
+```bash
+source .venv/bin/activate   # if not already active
+python automac_mcp.py
+```
+
+You should see output like:
+
+```
+INFO:     Started server process [12345]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
+```
+
+The server is now live. Press **Ctrl+C** to stop it.
+
+### Step 5 -- Verify the MCP endpoint
+
+In a second terminal window:
+
+```bash
+curl http://localhost:8000/mcp
+```
+
+You should receive a JSON response (or a 405 Method Not Allowed — both confirm the server is live).
+
+### Step 6 -- Connect your AI app
+
+Copy the MCP URL and paste it into any AI app or agent that supports custom MCP server integration:
+
+```
+http://localhost:8000/mcp
+```
+
+> **Note for Littlebird and similar apps**: when prompted for a "server URL", paste `http://localhost:8000/mcp` exactly. Do **not** append any extra path suffix.
+
+The server must remain running on your Mac for the connection to stay active. You can keep a Terminal window open in the background, or run it as a background process:
+
+```bash
+nohup python automac_mcp.py > automac_mcp.log 2>&1 &
+```
+
+To stop the background process, find its PID and stop it:
+
+```bash
+# Find the process listening on port 8000:
+lsof -i :8000
+# Then stop it (replace 12345 with the actual PID shown above):
+kill 12345
+```
+
+---
+
+## Permissions & Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| `PermissionError` on screenshot or mouse control | Grant Accessibility + Screen Recording in System Settings, then restart Terminal |
+| Port 8000 already in use | Run `lsof -i :8000` to find the PID, stop the conflicting process, or change `port=XXXX` in the `FastMCP(...)` call in `automac_mcp.py` |
+| AI app says "connection refused" | Ensure the server is running (`python automac_mcp.py`) and your Mac is not in sleep mode |
+| OCR / `get_screen_text` is slow on first call | `easyocr` downloads model weights on first use -- allow a minute for the download to complete |
+
+For best OCR results, enable **Increase Contrast** in System Settings -> Accessibility -> Display.
+
+---
 
 ## MCP server commands:
 

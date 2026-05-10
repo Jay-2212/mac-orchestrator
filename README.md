@@ -12,7 +12,7 @@ A powerful, self-hosted Model Context Protocol (MCP) server that exposes full ma
 ## 🎯 How It Works
 
 ```
-AI Agent (Any device)  ->  http://localhost:8000/mcp  ->  Mac Orchestrator MCP  ->  macOS System APIs
+AI Agent (Cloud/Local)  ->  http://localhost:8000/mcp (or ngrok URL)  ->  Mac Orchestrator MCP  ->  macOS System APIs
 ```
 
 Once running, the server provides a standard MCP interface exposing tools to:
@@ -72,22 +72,23 @@ source .venv/bin/activate
 python automac_mcp.py
 ```
 
+Upon starting, the server will prompt you:
+1. **Telegram Setup:** (Optional) Enter your Telegram Bot Token and Chat ID to allow the server to send files to you.
+2. **ngrok Setup:** (Optional but required for cloud bots) Provide your [ngrok authtoken](https://dashboard.ngrok.com) to securely expose the server to the internet via a temporary tunnel.
+
 You should see output similar to:
-```
+```text
 Mac Orchestrator
 Your local MCP server for macOS UI automation.
 ...
 SUCCESS! Mac Orchestrator is now live.
-🔗 http://127.0.0.1:8000/mcp
+🔗 https://[random-string].ngrok-free.app/mcp
 ```
+*(If you skip ngrok, the URL will be `http://127.0.0.1:8000/mcp`)*
 
 ### Step 5: Connect Your AI App
 
-Copy the MCP URL and provide it to any AI agent or platform that supports external MCP connections (such as Claude Desktop, Littlebird, etc.):
-
-```
-http://localhost:8000/mcp
-```
+Copy the provided MCP URL (`https://...ngrok-free.app/mcp` for cloud bots, or `http://localhost:8000/mcp` for local desktop apps) and provide it to your AI agent or platform that supports external MCP connections.
 
 ## 🛠️ MCP Tools Overview
 

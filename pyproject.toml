@@ -17,6 +17,9 @@ dependencies = [
     "pyobjc-framework-ApplicationServices>=11.1",
     "easyocr>=1.7.0",
     "numpy>=1.21.0",
+    "pyngrok>=7.0.0",
+    "rich>=13.0.0",
+    "requests>=2.33.1",
 ]
 
 [project.scripts]

@@ -1,8 +1,12 @@
 # Mac Orchestrator (AutoMac MCP)
 
-A powerful, self-hosted Model Context Protocol (MCP) server that exposes full macOS UI automation over HTTP. Run it on your Mac, and connect it to any AI assistant or agent that supports MCP to grant it the ability to seamlessly orchestrate your local environment.
+A lean, efficient, and feature-rich Mac orchestrator locally hosted MCP server that exposes full macOS UI automation over HTTP. Run it on your Mac, and connect it to any AI assistant or agent that supports MCP to grant it the ability to seamlessly orchestrate your local environment.
 
 **Note: This project is strictly for macOS (Apple Silicon or Intel).**
+
+> [!NOTE]
+> **Project Status:** We have recently optimized the server to be much leaner. By modifying and compressing tool calls, we have cut the toolset in half (from 46 to 18 tools), making it highly efficient for AI agents while remaining feature-rich.
+
 
 > [!WARNING]
 > This server grants an AI assistant direct, system-level control over your operating system's user interface. Only run it in environments you fully control and **never** expose the port to the public internet without proper auth. Monitor the AI's actions closely.
@@ -17,9 +21,11 @@ AI Agent (Cloud/Local)  ->  http://localhost:8000/mcp (or ngrok URL)  ->  Mac Or
 
 Once running, the server provides a standard MCP interface exposing tools to:
 - Comprehend the screen via Apple's native Accessibility APIs and optical character recognition (OCR).
-- Perform mouse movements, clicks, scrolling, and keyboard shortcuts.
+- Perform mouse actions, keyboard input, and scrolling with Retina display support.
+- Chain multiple UI actions into atomic macros with realistic inter-step timing.
 - Open, focus, and manage running applications natively.
-- Execute terminal commands and perform local file I/O safely.
+- Execute terminal commands (with configurable timeouts and background mode).
+- Search files instantly via macOS Spotlight and perform local file I/O.
 
 ## 🚀 Quick Start
 
@@ -90,23 +96,55 @@ SUCCESS! Mac Orchestrator is now live.
 
 Copy the provided MCP URL (`https://...ngrok-free.app/mcp` for cloud bots, or `http://localhost:8000/mcp` for local desktop apps) and provide it to your AI agent or platform that supports external MCP connections.
 
-## 🛠️ MCP Tools Overview
+## 🛠️ MCP Tools (18 Tools)
 
-Mac Orchestrator provides a rich set of specialized tools out of the box:
+Mac Orchestrator provides a lean, powerful set of tools designed so any AI agent can understand them at first glance:
 
-### UI Comprehension
-- `get_screen_layout()`: Fetches window bounds, apps, and layouts via native macOS Accessibility APIs.
-- `get_screen_text()`: Employs `easyocr` to read on-screen text with precise coordinate bounding boxes.
-- `focus_app(app_name, timeout)`: Reliably brings an application to the foreground.
-- `get_available_apps()`: Lists all currently running background/foreground applications.
+### Keyboard & Mouse
+| Tool | Description |
+|---|---|
+| `press_keystroke(key, modifiers)` | Press any key with optional modifiers. Replaces all individual shortcut tools. E.g., `key="c", modifiers=["command"]` for Copy. |
+| `mouse_action(x, y, action, hold_keys)` | Click, double-click, right-click, or move the mouse. Supports modifier-held clicks. |
+| `type_text(text)` | Type a string of text into the focused field. |
+| `scroll(dx, dy)` | Pixel-precise horizontal and vertical scrolling. |
 
-### Keyboard & Mouse Control
-- **Mouse**: `mouse_move(x, y)`, `mouse_single_click(x, y)`, `mouse_double_click(x, y)`, `scroll(dx, dy)`
-- **Keyboard Utilities**: Wide array of system shortcuts including `type_text(text)`, `keyboard_shortcut_select_all()`, `keyboard_shortcut_spotlight_search()`, `keyboard_shortcut_quit_app()`, etc.
+### Macro Execution
+| Tool | Description |
+|---|---|
+| `execute_macro(actions, default_delay_ms)` | **Chain multiple UI actions in one call.** Accepts a list of action dicts and executes them sequentially with a configurable inter-step delay (default 750ms) so macOS UI has time to animate. Supports: keystroke, type, click, scroll, focus_app, delay. |
 
-### System & File I/O
-- `run_terminal_command(command)`: Execute safe, sandboxed terminal queries.
-- `read_file(path)`, `write_file(path, content)`, `list_directory(path)`, `smart_search(directory, pattern)`
+### Screen Comprehension
+| Tool | Description |
+|---|---|
+| `get_screen_size()` | Screen dimensions in pixels. |
+| `get_screen_layout()` | Window positions, apps, and layout via native Accessibility APIs. |
+| `get_screen_text()` | Read all on-screen text via OCR with coordinate bounding boxes. |
+| `focus_app(app_name, timeout)` | Bring an app to the foreground and wait for it to become active. |
+| `get_available_apps()` | List all currently running applications. |
+
+### Terminal & File System
+| Tool | Description |
+|---|---|
+| `run_terminal_command(command, timeout_seconds, run_in_background)` | Run shell commands with configurable timeout (up to 300s) and optional background mode that returns a PID. |
+| `find_file(query, search_dir, file_type)` | **Spotlight-powered file search** via `mdfind`. Millisecond results across the entire drive. |
+| `read_file(path)` | Read file contents. |
+| `write_file(path, content)` | Write/overwrite a file (auto-creates parent dirs). |
+| `list_directory(path)` | List directory contents (folders & files). |
+| `smart_search(directory, regex_pattern, file_extension_filter)` | Regex search inside files within a directory. |
+
+### Utility
+| Tool | Description |
+|---|---|
+| `play_sound_for_user_prompt()` | Play the macOS system bell to alert the user. |
+| `send_file_to_telegram(file_path, caption)` | Send a file to the user via Telegram. |
+
+### Standardized Responses
+
+Every tool returns a consistent JSON envelope:
+```json
+{"status": "success", "message": "Human-readable summary", ...}
+{"status": "error", "message": "What went wrong", ...}
+```
 
 ## 🛡️ Architecture & Safety
 
@@ -115,6 +153,7 @@ Mac Orchestrator is built on top of [FastMCP](https://github.com/jlowin/fastmcp)
 **Safety nets implemented:**
 - **Graceful Failures:** Operations that interact with the system or external programs are wrapped with robust exception handlers and strict timeouts, returning formatted JSON errors to the agent rather than crashing the MCP process.
 - **Lazy Loading:** Heavy dependencies like OCR models are dynamically loaded on their first execution, ensuring near-instantaneous startup times.
+- **Macro Timing:** The `execute_macro` tool inserts realistic delays (750ms default) between UI actions, preventing race conditions where the AI fires actions faster than macOS can animate.
 
 ## 🐛 Troubleshooting
 
@@ -136,7 +175,7 @@ For best visual AI comprehension results, it is recommended to enable **Increase
 Prompt provided to the AI: 
 > "Open Steam and buy one or more new games for me from my wishlist, pick the best ones for me. You have a budget of €5. You have my full permission to complete the purchase. Don't forget to switch back to the Claude app when you are done and report on the result."
 
-The AI used `focus_app("Steam")`, `get_screen_text()`, `mouse_single_click()`, and `scroll()` sequentially to:
+The AI used `focus_app("Steam")`, `get_screen_text()`, `mouse_action()`, and `scroll()` sequentially to:
 1. Navigate to the user's wishlist in the Steam UI.
 2. Read the text on screen (using the OCR capabilities) to parse the game names and prices.
 3. Identify a game ("Heroes of Book & Paper" at €4.55) that matched the criteria and budget.

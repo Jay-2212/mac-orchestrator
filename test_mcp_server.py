@@ -62,18 +62,37 @@ def test_mcp_server():
             print("✗ FastMCP instance not found")
             return False
             
-        # Check for decorated functions
-        functions = [
-            'mouse_single_click', 'type_text', 'scroll', 'focus_app', 
-            'get_screen_layout', 'get_screen_text', 'get_available_apps'
+        # Check for the refactored v2 tool set (18 tools, down from 46)
+        v2_tools = [
+            'press_keystroke', 'mouse_action', 'type_text', 'scroll',
+            'execute_macro', 'focus_app', 'get_available_apps',
+            'get_screen_size', 'get_screen_layout', 'get_screen_text',
+            'run_terminal_command', 'find_file',
+            'read_file', 'write_file', 'list_directory', 'smart_search',
+            'play_sound_for_user_prompt', 'send_file_to_telegram'
         ]
         
-        for func_name in functions:
+        for func_name in v2_tools:
             if hasattr(automac_mcp, func_name):
-                print(f"✓ Function {func_name} found")
+                print(f"✓ Tool {func_name} found")
             else:
-                print(f"✗ Function {func_name} not found")
+                print(f"✗ Tool {func_name} not found")
                 return False
+        
+        print(f"\n   Total tools verified: {len(v2_tools)}")
+        
+        # Verify old tools are REMOVED
+        old_tools = [
+            'keyboard_shortcut_return_key', 'keyboard_shortcut_escape_key',
+            'keyboard_shortcut_copy', 'keyboard_shortcut_paste',
+            'mouse_move', 'mouse_single_click', 'mouse_double_click'
+        ]
+        
+        for func_name in old_tools:
+            if hasattr(automac_mcp, func_name):
+                print(f"⚠ Old tool {func_name} still exists (should be removed)")
+            else:
+                print(f"✓ Old tool {func_name} correctly removed")
                 
     except ImportError as e:
         print(f"✗ Failed to import module: {e}")
@@ -84,38 +103,54 @@ def test_mcp_server():
     
     print("\n3. Testing individual functions...")
     
-    # Test functions that don't require UI interaction
     try:
-        # Test get_available_apps (should work on any macOS system)
+        # Test get_available_apps (returns structured JSON now)
         result = automac_mcp.get_available_apps()
-        if result and "apps" in result:
-            print("✓ get_available_apps returns data")
+        if result and result.get("status") == "success":
+            print(f"✓ get_available_apps: {result.get('message')}")
         else:
-            print("✗ get_available_apps failed")
+            print(f"✗ get_available_apps failed: {result}")
             
-        # Test focus_app with a quick timeout (using Finder which should be running)
+        # Test focus_app with a quick timeout
         try:
-            result = automac_mcp.focus_app("Finder", 5)  # 5 second timeout
-            if result and "success" in result:
-                print("✓ focus_app with timeout returns data")
+            result = automac_mcp.focus_app("Finder", 5)
+            if result and "status" in result:
+                print(f"✓ focus_app: {result.get('message')}")
             else:
-                print("✗ focus_app with timeout failed")
+                print(f"✗ focus_app failed: {result}")
         except Exception as e:
             print(f"✗ focus_app error: {e}")
+        
+        # Test press_keystroke (the new consolidated keyboard tool)
+        try:
+            result = automac_mcp.press_keystroke("escape")
+            if result and "status" in result:
+                print(f"✓ press_keystroke: {result.get('message')}")
+            else:
+                print(f"✗ press_keystroke failed: {result}")
+        except Exception as e:
+            print(f"✗ press_keystroke error: {e}")
             
-        # Test get_screen_layout (should return screen data or error)
+        # Test get_screen_layout
         result = automac_mcp.get_screen_layout()
-        if result and ("success" in result or "error" in result):
-            print("✓ get_screen_layout returns data")
+        if result and "status" in result:
+            print(f"✓ get_screen_layout: {result.get('message')}")
         else:
-            print("✗ get_screen_layout failed")
+            print(f"✗ get_screen_layout failed")
             
-        # Test get_screen_text (should return screen data or error)
-        result = automac_mcp.get_screen_text()
-        if result and ("success" in result or "error" in result):
-            print("✓ get_screen_text returns data")
+        # Test run_terminal_command with structured output
+        result = automac_mcp.run_terminal_command("echo hello", timeout_seconds=5)
+        if result and result.get("status") == "success":
+            print(f"✓ run_terminal_command: exit_code={result.get('exit_code')}, stdout='{result.get('stdout', '').strip()}'")
         else:
-            print("✗ get_screen_text failed")
+            print(f"✗ run_terminal_command failed: {result}")
+            
+        # Test find_file
+        result = automac_mcp.find_file("automac_mcp", search_dir="~/Documents/mac-orchestrator")
+        if result and result.get("status") == "success":
+            print(f"✓ find_file: {result.get('message')}")
+        else:
+            print(f"✗ find_file failed: {result}")
             
     except Exception as e:
         print(f"✗ Error testing functions: {e}")
@@ -150,8 +185,8 @@ def test_dependencies():
 
 
 if __name__ == "__main__":
-    print("AutoMac MCP Test Suite")
-    print("==================")
+    print("AutoMac MCP Test Suite (v2)")
+    print("==========================")
     
     # Test dependencies first
     if not test_dependencies():

@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+"""
+Mac Orchestrator (AutoMac MCP) — A lean MCP server for macOS UI automation.
+
+Exposes a small, powerful set of tools that allow any AI agent to control a
+macOS desktop: press keys, move the mouse, read the screen, run commands,
+and chain multiple UI actions into atomic macros with realistic timing.
+"""
 
 import subprocess
 import json
@@ -6,7 +13,9 @@ import time
 import os
 import sys
 import re
+import signal
 import requests
+from datetime import datetime
 from pathlib import Path
 from pyngrok import ngrok, conf
 from rich.console import Console
@@ -14,14 +23,17 @@ from rich.prompt import Prompt
 from rich.panel import Panel
 from typing import Any, Dict, List, Optional
 import pyautogui
-import easyocr
 import numpy as np
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.server import TransportSecuritySettings
 try:
     from Cocoa import NSWorkspace
-    from Quartz import CGWindowListCopyWindowInfo, kCGWindowListOptionOnScreenOnly, kCGNullWindowID, CGEventCreateScrollWheelEvent, CGEventPost, kCGScrollEventUnitPixel, kCGHIDEventTap
-    from ApplicationServices import AXUIElementCreateApplication, AXUIElementCopyAttributeValue, kAXWindowsAttribute, kAXTitleAttribute, kAXPositionAttribute, kAXSizeAttribute, kAXRoleAttribute
+    from Quartz import (CGWindowListCopyWindowInfo, kCGWindowListOptionOnScreenOnly,
+                        kCGNullWindowID, CGEventCreateScrollWheelEvent, CGEventPost,
+                        kCGScrollEventUnitPixel, kCGHIDEventTap)
+    from ApplicationServices import (AXUIElementCreateApplication, AXUIElementCopyAttributeValue,
+                                     kAXWindowsAttribute, kAXTitleAttribute, kAXPositionAttribute,
+                                     kAXSizeAttribute, kAXRoleAttribute)
     ACCESSIBILITY_AVAILABLE = True
 except ImportError:
     ACCESSIBILITY_AVAILABLE = False
@@ -29,847 +41,756 @@ except ImportError:
 TELEGRAM_BOT_TOKEN = ""
 TELEGRAM_CHAT_ID = ""
 
-# Initialize the MCP server (streamable-http transport on localhost:8000, path /mcp)
-# We disable DNS rebinding protection because ngrok forwards requests with the ngrok Host header.
 mcp = FastMCP(
-    "AutoMac MCP - macOS UI Automation", 
-    host="127.0.0.1", 
-    port=8000,
+    "AutoMac MCP - macOS UI Automation",
+    host="127.0.0.1", port=8000,
     transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False)
 )
 
-# Initialize pyautogui settings
 pyautogui.FAILSAFE = True
 _ocr_reader = None
 
 def get_ocr_reader():
+    """Lazy-load the EasyOCR reader so startup stays fast."""
     global _ocr_reader
     if _ocr_reader is None:
         import easyocr
         _ocr_reader = easyocr.Reader(['en'])
     return _ocr_reader
 
+# ── Response Helpers ──────────────────────────────────────────────────────────
 
-def _scale_coordinates_for_display(x: int, y: int) -> tuple[int, int]:
-    """Scale coordinates for retina/high-DPI displays."""
+def _ok(message: str, **data) -> Dict[str, Any]:
+    return {"status": "success", "message": message, **data}
+
+def _fail(message: str, **data) -> Dict[str, Any]:
+    return {"status": "error", "message": message, **data}
+
+# ── Coordinate Scaling (Retina) ───────────────────────────────────────────────
+
+def _scale(x: int, y: int) -> tuple[int, int]:
+    """Map screenshot coords to pyautogui coords on HiDPI displays."""
     try:
-        # Get the actual screen size from pyautogui
-        screen_width, screen_height = pyautogui.size()
-        
-        # Take a screenshot to get the logical size
-        screenshot = pyautogui.screenshot()
-        logical_width, logical_height = screenshot.size
-        
-        # Calculate scaling factors
-        scale_x = screen_width / logical_width
-        scale_y = screen_height / logical_height
-        
-        # Scale the coordinates
-        scaled_x = int(x * scale_x)
-        scaled_y = int(y * scale_y)
-        
-        return scaled_x, scaled_y
+        sw, sh = pyautogui.size()
+        ss = pyautogui.screenshot()
+        return int(x * sw / ss.size[0]), int(y * sh / ss.size[1])
     except Exception:
-        # If scaling fails, return original coordinates
         return x, y
 
-@mcp.tool()
-def get_screen_size() -> Dict[str, Any]:
+# ── AppleScript Key Mapping ──────────────────────────────────────────────────
+# ("keystroke", val) → keystroke <val>;  ("keycode", N) → key code N
+
+KEY_MAP = {
+    "return": ("keystroke", "return"), "enter": ("keystroke", "return"),
+    "tab": ("keystroke", "tab"),
+    "escape": ("keycode", 53), "esc": ("keycode", 53),
+    "space": ("keystroke", '" "'),
+    "delete": ("keycode", 51), "backspace": ("keycode", 51),
+    "forward_delete": ("keycode", 117),
+    "up": ("keycode", 126), "down": ("keycode", 125),
+    "left": ("keycode", 123), "right": ("keycode", 124),
+    "home": ("keycode", 115), "end": ("keycode", 119),
+    "page_up": ("keycode", 116), "page_down": ("keycode", 121),
+    "f1": ("keycode", 122), "f2": ("keycode", 120), "f3": ("keycode", 99),
+    "f4": ("keycode", 118), "f5": ("keycode", 96),  "f6": ("keycode", 97),
+    "f7": ("keycode", 98),  "f8": ("keycode", 100), "f9": ("keycode", 101),
+    "f10": ("keycode", 109), "f11": ("keycode", 103), "f12": ("keycode", 111),
+}
+
+MODIFIER_MAP = {
+    "command": "command down", "cmd": "command down",
+    "shift": "shift down",
+    "option": "option down", "alt": "option down",
+    "control": "control down", "ctrl": "control down",
+}
+
+def _build_keystroke_cmd(key: str, modifiers: list = None) -> str:
+    """Build AppleScript keystroke command string."""
+    mod_clause = ""
+    if modifiers:
+        parts = []
+        for m in modifiers:
+            mapped = MODIFIER_MAP.get(m.lower())
+            if not mapped:
+                raise ValueError(f"Unknown modifier '{m}'. Valid: {list(MODIFIER_MAP.keys())}")
+            parts.append(mapped)
+        mod_clause = f" using {{{', '.join(parts)}}}"
+
+    kl = key.lower()
+    if kl in KEY_MAP:
+        kind, val = KEY_MAP[kl]
+        return f"keystroke {val}{mod_clause}" if kind == "keystroke" else f"key code {val}{mod_clause}"
+    elif len(key) == 1:
+        return f'keystroke "{key}"{mod_clause}'
+    else:
+        raise ValueError(f"Unknown key '{key}'. Use a character or: {sorted(KEY_MAP.keys())}")
+
+def _run_applescript(body: str, timeout: int = 10) -> Dict[str, Any]:
+    """Execute AppleScript inside a System Events tell block."""
+    script = f'tell application "System Events"\n{body}\nend tell'
     try:
-        screen_width, screen_height = pyautogui.size()
-        return {"success": True, "message": f"Screen size = ({screen_width}, {screen_height})"}
+        r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=timeout)
+        if r.returncode != 0:
+            return _fail(f"AppleScript error: {r.stderr.strip()}")
+        return _ok(f"Executed: {body.strip()}")
+    except subprocess.TimeoutExpired:
+        return _fail(f"AppleScript timed out after {timeout}s")
     except Exception as e:
-        return {"success": False, "error": f"Failed to get screen size: {str(e)}"}
+        return _fail(f"Execution failed: {e}")
 
+# ── Internal Action Implementations ──────────────────────────────────────────
+# These are called by individual MCP tools AND by execute_macro.
 
-@mcp.tool()
-def mouse_move(x: int, y: int) -> Dict[str, Any]:
-    """Move mouse to the specified screen coordinates."""
-    if x is None or y is None:
-        return {"success": False, "error": "x and y coordinates are required"}
-    
+def _do_keystroke(key: str, modifiers: list = None) -> Dict[str, Any]:
     try:
-        # Scale coordinates for retina displays
-        scaled_x, scaled_y = _scale_coordinates_for_display(x, y)
-        pyautogui.moveTo(x=scaled_x, y=scaled_y)
-        return {"success": True, "message": f"Moved mouse pointer to ({x}, {y})"}
-    except Exception as e:
-        return {"success": False, "error": f"Failed to move mouse: {str(e)}"}
+        cmd = _build_keystroke_cmd(key, modifiers)
+    except ValueError as e:
+        return _fail(str(e))
+    mod_s = f" + {'+'.join(modifiers)}" if modifiers else ""
+    res = _run_applescript(cmd)
+    if res["status"] == "success":
+        res["message"] = f"Pressed: {key}{mod_s}"
+    return res
 
-
-@mcp.tool()
-def mouse_single_click(x: int, y: int) -> Dict[str, Any]:
-    """Single click at the specified screen coordinates."""
-    if x is None or y is None:
-        return {"success": False, "error": "x and y coordinates are required"}
-    
+def _do_mouse(x: int, y: int, action: str = "click", hold_keys: list = None) -> Dict[str, Any]:
+    valid = {"move", "click", "double_click", "right_click"}
+    if action not in valid:
+        return _fail(f"Invalid action '{action}'. Valid: {sorted(valid)}")
+    held = []
     try:
-        # Scale coordinates for retina displays
-        scaled_x, scaled_y = _scale_coordinates_for_display(x, y)
-        pyautogui.click(x=scaled_x, y=scaled_y, clicks=1)
-        return {"success": True, "message": f"Single clicked at ({x}, {y})"}
+        sx, sy = _scale(x, y)
+        pg_map = {"command": "command", "cmd": "command", "shift": "shift",
+                  "option": "option", "alt": "option", "control": "ctrl", "ctrl": "ctrl"}
+        if hold_keys:
+            for hk in hold_keys:
+                pk = pg_map.get(hk.lower())
+                if pk:
+                    pyautogui.keyDown(pk)
+                    held.append(pk)
+        if action == "move":
+            pyautogui.moveTo(x=sx, y=sy)
+        elif action == "click":
+            pyautogui.click(x=sx, y=sy, clicks=1)
+        elif action == "double_click":
+            pyautogui.click(x=sx, y=sy, clicks=2)
+        elif action == "right_click":
+            pyautogui.rightClick(x=sx, y=sy)
+        for hk in reversed(held):
+            pyautogui.keyUp(hk)
+        hs = f" (holding {'+'.join(hold_keys)})" if hold_keys else ""
+        return _ok(f"{action} at ({x}, {y}){hs}")
     except Exception as e:
-        return {"success": False, "error": f"Failed to click: {str(e)}"}
+        for hk in reversed(held):
+            try: pyautogui.keyUp(hk)
+            except: pass
+        return _fail(f"Mouse action failed: {e}")
 
-
-@mcp.tool()
-def mouse_double_click(x: int, y: int) -> Dict[str, Any]:
-    """Double click at the specified screen coordinates."""
-    if x is None or y is None:
-        return {"success": False, "error": "x and y coordinates are required"}
-    
-    try:
-        # Scale coordinates for retina displays
-        scaled_x, scaled_y = _scale_coordinates_for_display(x, y)
-        pyautogui.click(x=scaled_x, y=scaled_y, clicks=2)
-        return {"success": True, "message": f"Double clicked at ({x}, {y})"}
-    except Exception as e:
-        return {"success": False, "error": f"Failed to double click: {str(e)}"}
-
-
-@mcp.tool()
-def type_text(text: str) -> Dict[str, Any]:
-    """Type the specified text."""
+def _do_type(text: str) -> Dict[str, Any]:
     if not text:
-        return {"success": False, "error": "text is required"}
-    
+        return _fail("text is required")
     try:
         pyautogui.write(text)
-        return {"success": True, "message": f"Typed: {text}"}
+        return _ok(f"Typed: {text}")
     except Exception as e:
-        return {"success": False, "error": f"Failed to type text: {str(e)}"}
+        return _fail(f"Failed to type: {e}")
 
-
-@mcp.tool()
-def scroll(dx: int = 0, dy: int = 0) -> Dict[str, Any]:
-    """Scroll with the specified pixel delta values.
-    Args:
-        dx: Horizontal scroll pixel delta (positive = right, negative = left)
-        dy: Vertical scroll pixel delta (positive = down, negative = up)
-    """
+def _do_scroll(dx: int = 0, dy: int = 0) -> Dict[str, Any]:
     try:
         if dy != 0:
             CGEventPost(kCGHIDEventTap, CGEventCreateScrollWheelEvent(None, kCGScrollEventUnitPixel, 1, -dy))
         if dx != 0:
             pyautogui.hscroll(clicks=dx)
-        return {"success": True, "message": f"Scrolled dx={dx}, dy={dy}"}
+        return _ok(f"Scrolled dx={dx}, dy={dy}")
     except Exception as e:
-        return {"success": False, "error": f"Failed to scroll: {str(e)}"}
+        return _fail(f"Scroll failed: {e}")
 
-
-@mcp.tool()
-def play_sound_for_user_prompt() -> Dict[str, Any]:
-    """Play the system bell sound to alert the user."""
+def _do_focus_app(app_name: str, timeout: int = 30) -> Dict[str, Any]:
+    if not app_name:
+        return _fail("app_name is required")
+    if timeout <= 0:
+        return _fail("timeout must be positive")
     try:
-        result = subprocess.run(
-            ["osascript", "-e", "beep"],
-            capture_output=True,
-            text=True,
-            timeout=5
-        )
-        
-        if result.returncode != 0:
-            return {
-                "success": False, 
-                "error": f"Failed to play system bell: {result.stderr.strip()}"
-            }
-        
-        return {"success": True, "message": "System bell played"}
+        r = subprocess.run(["osascript", "-e", f'tell application "{app_name}" to activate'],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode != 0:
+            return _fail(f"Failed to activate '{app_name}': {r.stderr.strip()}")
     except Exception as e:
-        return {"success": False, "error": f"Execution failed: {str(e)}"}
+        return _fail(f"Execution failed: {e}")
+    start = time.time()
+    last = None
+    while time.time() - start < timeout:
+        try:
+            if ACCESSIBILITY_AVAILABLE:
+                ws = NSWorkspace.sharedWorkspace()
+                aa = ws.activeApplication()
+                if aa:
+                    an = aa.get("NSApplicationName", "")
+                    if an.lower() == app_name.lower():
+                        el = round(time.time() - start, 2)
+                        return _ok(f"Focused '{app_name}' ({el}s)", elapsed_time=el,
+                                   active_app={"name": an,
+                                               "bundle_id": aa.get("NSApplicationBundleIdentifier", ""),
+                                               "pid": aa.get("NSApplicationProcessIdentifier", -1)})
+                    last = an
+            else:
+                cs = 'tell application "System Events" to get name of first application process whose frontmost is true'
+                cr = subprocess.run(["osascript", "-e", cs], capture_output=True, text=True)
+                if cr.returncode == 0:
+                    fn = cr.stdout.strip()
+                    if fn.lower() == app_name.lower():
+                        el = round(time.time() - start, 2)
+                        return _ok(f"Focused '{app_name}' ({el}s)", elapsed_time=el,
+                                   active_app={"name": fn})
+                    last = fn
+        except Exception:
+            pass
+        time.sleep(0.5)
+    return _fail(f"Timeout waiting for '{app_name}' after {timeout}s", last_active_app=last)
 
 
-def _execute_applescript_keystroke(keystroke_command: str, description: str) -> Dict[str, Any]:
-    """Helper function to execute AppleScript keystrokes."""
-    script = f'''
-    tell application "System Events"
-        {keystroke_command}
-    end tell
-    '''
-    
-    try:
-        result = subprocess.run(
-            ["osascript", "-e", script],
-            capture_output=True,
-            text=True,
-            timeout=10
-        )
-        
-        if result.returncode != 0:
-            return {"success": False, "error": f"AppleScript error: {result.stderr.strip()}"}
-        
-        return {"success": True, "message": f"Executed: {description}"}
-    except Exception as e:
-        return {"success": False, "error": f"Execution failed: {str(e)}"}
+# ═══════════════════════════════════════════════════════════════════════════════
+#  MCP TOOLS — The public API that AI agents see and call
+# ═══════════════════════════════════════════════════════════════════════════════
 
-
-@mcp.tool()
-def keyboard_shortcut_return_key() -> Dict[str, Any]:
-    """Press the Return/Enter key."""
-    return _execute_applescript_keystroke('keystroke return', "Return key")
-
-
-@mcp.tool()
-def keyboard_shortcut_escape_key() -> Dict[str, Any]:
-    """Press the Escape key."""
-    return _execute_applescript_keystroke('key code 53', "Escape key")
-
-
-@mcp.tool()
-def keyboard_shortcut_tab_key() -> Dict[str, Any]:
-    """Press the Tab key."""
-    return _execute_applescript_keystroke('keystroke tab', "Tab key")
-
+# ── 1. Keyboard ───────────────────────────────────────────────────────────────
 
 @mcp.tool()
-def keyboard_shortcut_space_key() -> Dict[str, Any]:
-    """Press the Space key."""
-    return _execute_applescript_keystroke('keystroke " "', "Space key")
+def press_keystroke(key: str, modifiers: list[str] = []) -> Dict[str, Any]:
+    """Press a single key, optionally with modifier keys held down.
+
+    This replaces all individual keyboard shortcut tools. Any key combo can
+    be expressed here.
+
+    Args:
+        key: The key to press. Single character ("a", "1", "/") or named key:
+             "return", "escape", "tab", "space", "delete", "forward_delete",
+             "up", "down", "left", "right", "home", "end", "page_up",
+             "page_down", "f1" through "f12".
+        modifiers: Modifier keys to hold. Valid: "command"/"cmd", "shift",
+                   "option"/"alt", "control"/"ctrl".
+
+    Common shortcuts:
+        Copy  → key="c", modifiers=["command"]
+        Paste → key="v", modifiers=["command"]
+        Undo  → key="z", modifiers=["command"]
+        Redo  → key="z", modifiers=["command", "shift"]
+        Save  → key="s", modifiers=["command"]
+        Spotlight → key="space", modifiers=["command"]
+        Close window → key="w", modifiers=["command"]
+        Quit app → key="q", modifiers=["command"]
+        Force Quit → key="escape", modifiers=["command", "option"]
+        Select All → key="a", modifiers=["command"]
+    """
+    return _do_keystroke(key, modifiers if modifiers else None)
 
 
-@mcp.tool()
-def keyboard_shortcut_delete_key() -> Dict[str, Any]:
-    """Press the Delete key (backspace)."""
-    return _execute_applescript_keystroke('key code 51', "Delete key")
-
-
-@mcp.tool()
-def keyboard_shortcut_forward_delete_key() -> Dict[str, Any]:
-    """Press the Forward Delete key."""
-    return _execute_applescript_keystroke('key code 117', "Forward Delete key")
-
-
-@mcp.tool()
-def keyboard_shortcut_arrow_up() -> Dict[str, Any]:
-    """Press the Up Arrow key."""
-    return _execute_applescript_keystroke('key code 126', "Up Arrow key")
-
-
-@mcp.tool()
-def keyboard_shortcut_arrow_down() -> Dict[str, Any]:
-    """Press the Down Arrow key."""
-    return _execute_applescript_keystroke('key code 125', "Down Arrow key")
-
-
-@mcp.tool()
-def keyboard_shortcut_arrow_left() -> Dict[str, Any]:
-    """Press the Left Arrow key."""
-    return _execute_applescript_keystroke('key code 123', "Left Arrow key")
-
+# ── 2. Mouse ──────────────────────────────────────────────────────────────────
 
 @mcp.tool()
-def keyboard_shortcut_arrow_right() -> Dict[str, Any]:
-    """Press the Right Arrow key."""
-    return _execute_applescript_keystroke('key code 124', "Right Arrow key")
+def mouse_action(x: int, y: int, action: str = "click",
+                 hold_keys: list[str] = []) -> Dict[str, Any]:
+    """Perform a mouse action at screen coordinates.
+
+    Args:
+        x: Pixels from left edge.
+        y: Pixels from top edge.
+        action: "click" (default), "double_click", "right_click", or "move".
+        hold_keys: Modifier keys to hold during action (e.g. ["command"]).
+    """
+    if x is None or y is None:
+        return _fail("x and y coordinates are required")
+    return _do_mouse(x, y, action, hold_keys if hold_keys else None)
 
 
-@mcp.tool()
-def keyboard_shortcut_select_all() -> Dict[str, Any]:
-    """Select all text (Cmd+A)."""
-    return _execute_applescript_keystroke('keystroke "a" using {command down}', "Select All (Cmd+A)")
-
-
-@mcp.tool()
-def keyboard_shortcut_copy() -> Dict[str, Any]:
-    """Copy selected content (Cmd+C)."""
-    return _execute_applescript_keystroke('keystroke "c" using {command down}', "Copy (Cmd+C)")
-
-
-@mcp.tool()
-def keyboard_shortcut_paste() -> Dict[str, Any]:
-    """Paste from clipboard (Cmd+V)."""
-    return _execute_applescript_keystroke('keystroke "v" using {command down}', "Paste (Cmd+V)")
-
+# ── 3. Text Input ────────────────────────────────────────────────────────────
 
 @mcp.tool()
-def keyboard_shortcut_cut() -> Dict[str, Any]:
-    """Cut selected content (Cmd+X)."""
-    return _execute_applescript_keystroke('keystroke "x" using {command down}', "Cut (Cmd+X)")
+def type_text(text: str) -> Dict[str, Any]:
+    """Type a string of text into the focused input field.
+
+    For special keys or shortcuts (Return, Cmd+V), use press_keystroke instead.
+
+    Args:
+        text: The text string to type.
+    """
+    return _do_type(text)
 
 
-@mcp.tool()
-def keyboard_shortcut_undo() -> Dict[str, Any]:
-    """Undo last action (Cmd+Z)."""
-    return _execute_applescript_keystroke('keystroke "z" using {command down}', "Undo (Cmd+Z)")
-
-
-@mcp.tool()
-def keyboard_shortcut_redo() -> Dict[str, Any]:
-    """Redo last undone action (Cmd+Shift+Z)."""
-    return _execute_applescript_keystroke('keystroke "z" using {command down, shift down}', "Redo (Cmd+Shift+Z)")
-
+# ── 4. Scrolling ─────────────────────────────────────────────────────────────
 
 @mcp.tool()
-def keyboard_shortcut_save() -> Dict[str, Any]:
-    """Save current document (Cmd+S)."""
-    return _execute_applescript_keystroke('keystroke "s" using {command down}', "Save (Cmd+S)")
+def scroll(dx: int = 0, dy: int = 0) -> Dict[str, Any]:
+    """Scroll at the current mouse position.
+
+    Args:
+        dx: Horizontal pixels (positive=right, negative=left).
+        dy: Vertical pixels (positive=down, negative=up).
+    """
+    return _do_scroll(dx, dy)
 
 
-@mcp.tool()
-def keyboard_shortcut_new() -> Dict[str, Any]:
-    """Create new document (Cmd+N)."""
-    return _execute_applescript_keystroke('keystroke "n" using {command down}', "New (Cmd+N)")
-
-
-@mcp.tool()
-def keyboard_shortcut_open() -> Dict[str, Any]:
-    """Open document (Cmd+O)."""
-    return _execute_applescript_keystroke('keystroke "o" using {command down}', "Open (Cmd+O)")
-
+# ── 5. Macro Execution ───────────────────────────────────────────────────────
 
 @mcp.tool()
-def keyboard_shortcut_find() -> Dict[str, Any]:
-    """Find in document (Cmd+F)."""
-    return _execute_applescript_keystroke('keystroke "f" using {command down}', "Find (Cmd+F)")
+def execute_macro(actions: list[dict], default_delay_ms: int = 750) -> Dict[str, Any]:
+    """Execute a sequence of UI actions as a single batch with realistic timing.
+
+    Instead of making separate tool calls (each needing an LLM round-trip),
+    send the whole recipe in one call. A delay is inserted between actions
+    so macOS UI has time to animate (Spotlight appearing, windows switching).
+
+    Args:
+        actions: List of action dicts. Each must have an "action" key:
+            {"action": "keystroke", "key": "space", "modifiers": ["command"]}
+            {"action": "type", "text": "Hello World"}
+            {"action": "click", "x": 100, "y": 200}
+            {"action": "double_click", "x": 100, "y": 200}
+            {"action": "right_click", "x": 100, "y": 200}
+            {"action": "move", "x": 100, "y": 200}
+            {"action": "scroll", "dx": 0, "dy": -300}
+            {"action": "focus_app", "app": "Notes"}
+            {"action": "delay", "ms": 2000}  ← explicit extra pause
+        default_delay_ms: Pause between actions in ms (default 750).
+                          Increase for slow UI transitions. The AI can also
+                          insert explicit delay actions for known-slow steps.
+
+    Example — Open Notes and type a message:
+        actions=[
+            {"action": "focus_app", "app": "Notes"},
+            {"action": "keystroke", "key": "n", "modifiers": ["command"]},
+            {"action": "type", "text": "Hello from AI!"}
+        ]
+    """
+    if not actions:
+        return _fail("actions list is empty")
+
+    delay_s = max(0, default_delay_ms) / 1000.0
+    results = []
+    for i, act in enumerate(actions):
+        action_type = act.get("action")
+        if not action_type:
+            results.append({"step": i + 1, **_fail("Missing 'action' key")})
+            break
+
+        # Dispatch to internal implementations
+        if action_type == "keystroke":
+            res = _do_keystroke(act.get("key", ""), act.get("modifiers"))
+        elif action_type == "type":
+            res = _do_type(act.get("text", ""))
+        elif action_type in ("click", "double_click", "right_click", "move"):
+            res = _do_mouse(act.get("x", 0), act.get("y", 0), action_type, act.get("hold_keys"))
+        elif action_type == "scroll":
+            res = _do_scroll(act.get("dx", 0), act.get("dy", 0))
+        elif action_type == "focus_app":
+            res = _do_focus_app(act.get("app", ""), act.get("timeout", 30))
+        elif action_type == "delay":
+            ms = act.get("ms", 1000)
+            time.sleep(ms / 1000.0)
+            res = _ok(f"Delayed {ms}ms")
+        else:
+            res = _fail(f"Unknown action type: {action_type}")
+
+        results.append({"step": i + 1, "action": action_type, **res})
+
+        # Stop on error
+        if res.get("status") == "error":
+            break
+
+        # Inter-action delay (skip after last action and after explicit delays)
+        if i < len(actions) - 1 and action_type != "delay":
+            time.sleep(delay_s)
+
+    failed = [r for r in results if r.get("status") == "error"]
+    if failed:
+        return _fail(f"Macro stopped at step {failed[0]['step']}: {failed[0]['message']}",
+                     steps_completed=len(results), results=results)
+    return _ok(f"Macro completed: {len(results)} actions executed", results=results)
 
 
-@mcp.tool()
-def keyboard_shortcut_close_window() -> Dict[str, Any]:
-    """Close current window (Cmd+W)."""
-    return _execute_applescript_keystroke('keystroke "w" using {command down}', "Close Window (Cmd+W)")
-
-
-@mcp.tool()
-def keyboard_shortcut_quit_app() -> Dict[str, Any]:
-    """Quit current application (Cmd+Q)."""
-    return _execute_applescript_keystroke('keystroke "q" using {command down}', "Quit App (Cmd+Q)")
-
-
-@mcp.tool()
-def keyboard_shortcut_minimize_window() -> Dict[str, Any]:
-    """Minimize current window (Cmd+M)."""
-    return _execute_applescript_keystroke('keystroke "m" using {command down}', "Minimize Window (Cmd+M)")
-
-
-@mcp.tool()
-def keyboard_shortcut_hide_app() -> Dict[str, Any]:
-    """Hide current application (Cmd+H)."""
-    return _execute_applescript_keystroke('keystroke "h" using {command down}', "Hide App (Cmd+H)")
-
-
-@mcp.tool()
-def keyboard_shortcut_switch_app_forward() -> Dict[str, Any]:
-    """Switch to next application (Cmd+Tab)."""
-    return _execute_applescript_keystroke('keystroke tab using {command down}', "Switch App Forward (Cmd+Tab)")
-
-
-@mcp.tool()
-def keyboard_shortcut_switch_app_backward() -> Dict[str, Any]:
-    """Switch to previous application (Cmd+Shift+Tab)."""
-    return _execute_applescript_keystroke('keystroke tab using {command down, shift down}', "Switch App Backward (Cmd+Shift+Tab)")
-
-
-@mcp.tool()
-def keyboard_shortcut_spotlight_search() -> Dict[str, Any]:
-    """Open Spotlight search (Cmd+Space)."""
-    return _execute_applescript_keystroke('keystroke " " using {command down}', "Spotlight Search (Cmd+Space)")
-
-
-@mcp.tool()
-def keyboard_shortcut_force_quit() -> Dict[str, Any]:
-    """Open Force Quit dialog (Cmd+Option+Esc)."""
-    return _execute_applescript_keystroke('key code 53 using {command down, option down}', "Force Quit (Cmd+Option+Esc)")
-
-
-@mcp.tool()
-def keyboard_shortcut_refresh() -> Dict[str, Any]:
-    """Refresh/Reload (Cmd+R)."""
-    return _execute_applescript_keystroke('keystroke "r" using {command down}', "Refresh (Cmd+R)")
-
+# ── 6. App Management ────────────────────────────────────────────────────────
 
 @mcp.tool()
 def focus_app(app_name: str, timeout: int = 30) -> Dict[str, Any]:
-    """Bring the specified application to the foreground and wait for it to become active.
-    
+    """Bring an application to the foreground and wait for it to become active.
+
     Args:
-        app_name: Name of the application to focus
-        timeout: Maximum time to wait for app to become active (default: 30 seconds)
+        app_name: Name of the app (e.g. "Safari", "Notes", "Finder").
+        timeout: Max seconds to wait (default 30).
     """
-    if not app_name:
-        return {"success": False, "error": "app_name is required"}
-    
-    if timeout <= 0:
-        return {"success": False, "error": "timeout must be positive"}
-    
+    return _do_focus_app(app_name, timeout)
+
+@mcp.tool()
+def get_available_apps() -> Dict[str, Any]:
+    """List all currently running (non-background) applications."""
+    script = 'tell application "System Events"\nget name of (processes where background only is false)\nend tell'
     try:
-        # First, try to activate the app
-        script = f'tell application "{app_name}" to activate'
-        
-        result = subprocess.run(
-            ["osascript", "-e", script],
-            capture_output=True,
-            text=True,
-            timeout=10
-        )
-        
-        if result.returncode != 0:
-            return {
-                "success": False, 
-                "error": f"Failed to activate app '{app_name}': {result.stderr.strip()}"
-            }
+        r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=30)
+        if r.returncode != 0:
+            return _fail(f"Failed to get apps: {r.stderr}")
+        apps = [a.strip() for a in r.stdout.split(", ")]
+        return _ok(f"Found {len(apps)} running apps", apps=apps)
     except Exception as e:
-        return {"success": False, "error": f"Execution failed: {str(e)}"}
-    
-    # Wait for the app to become the active application
-    start_time = time.time()
-    last_active_app = None
-    
-    while time.time() - start_time < timeout:
-        try:
-            if ACCESSIBILITY_AVAILABLE:
-                # Use Cocoa NSWorkspace to check active app
-                workspace = NSWorkspace.sharedWorkspace()
-                active_app = workspace.activeApplication()
-                if active_app:
-                    active_app_name = active_app.get("NSApplicationName", "")
-                    if active_app_name.lower() == app_name.lower():
-                        elapsed_time = round(time.time() - start_time, 2)
-                        return {
-                            "success": True, 
-                            "message": f"Successfully focused '{app_name}' (took {elapsed_time}s)",
-                            "elapsed_time": elapsed_time,
-                            "active_app": {
-                                "name": active_app_name,
-                                "bundle_id": active_app.get("NSApplicationBundleIdentifier", "Unknown"),
-                                "pid": active_app.get("NSApplicationProcessIdentifier", -1)
-                            }
-                        }
-                    last_active_app = active_app_name
-            else:
-                # Fallback: use AppleScript to check frontmost app
-                check_script = 'tell application "System Events" to get name of first application process whose frontmost is true'
-                check_result = subprocess.run(
-                    ["osascript", "-e", check_script],
-                    capture_output=True,
-                    text=True
-                )
-                
-                if check_result.returncode == 0:
-                    frontmost_app = check_result.stdout.strip()
-                    if frontmost_app.lower() == app_name.lower():
-                        elapsed_time = round(time.time() - start_time, 2)
-                        return {
-                            "success": True, 
-                            "message": f"Successfully focused '{app_name}' (took {elapsed_time}s)",
-                            "elapsed_time": elapsed_time,
-                            "active_app": {"name": frontmost_app}
-                        }
-                    last_active_app = frontmost_app
-        
-        except Exception as e:
-            # Continue waiting even if we can't check the active app
-            pass
-        
-        # Wait a bit before checking again
-        time.sleep(0.5)
-    
-    # Timeout reached
-    return {
-        "success": False,
-        "message": f"Timeout waiting for '{app_name}' to become active after {timeout}s",
-        "timeout": timeout,
-        "last_active_app": last_active_app,
-        "elapsed_time": timeout
-    }
+        return _fail(f"Execution failed: {e}")
 
+
+# ── 7. Screen Comprehension ──────────────────────────────────────────────────
 
 @mcp.tool()
-def get_screen_layout() -> str:
-    """Get information about windows and applications currently visible on the screen."""
-    return _get_screen_content_accessibility()
-
+def get_screen_size() -> Dict[str, Any]:
+    """Get the screen dimensions in pixels."""
+    try:
+        w, h = pyautogui.size()
+        return _ok(f"Screen size: {w}x{h}", width=w, height=h)
+    except Exception as e:
+        return _fail(f"Failed: {e}")
 
 @mcp.tool()
-def get_screen_text() -> str:
-    """Get all text currently visible on the screen using OCR."""
-    return _get_screen_content_ocr()
-
-
-def _get_screen_content_accessibility() -> str:
-    """Get screen content using macOS accessibility APIs."""
+def get_screen_layout() -> Dict[str, Any]:
+    """Get window positions and apps visible on screen via Accessibility APIs."""
     if not ACCESSIBILITY_AVAILABLE:
-        return json.dumps({
-            "success": False,
-            "error": "macOS accessibility frameworks not available",
-            "message": "Install pyobjc-framework-Cocoa and pyobjc-framework-Quartz"
-        }, indent=2)
-    
+        return _fail("macOS accessibility frameworks not available")
     try:
-        screen_info = {
-            "mode": "accessibility",
-            "timestamp": str(subprocess.run(["date"], capture_output=True, text=True).stdout.strip()),
-            "windows": [],
-            "active_app": None
-        }
-        
-        # Get active application
+        info = {"windows": [], "active_app": None}
         try:
-            workspace = NSWorkspace.sharedWorkspace()
-            active_app = workspace.activeApplication()
-            if active_app:
-                screen_info["active_app"] = {
-                    "name": active_app.get("NSApplicationName", "Unknown"),
-                    "bundle_id": active_app.get("NSApplicationBundleIdentifier", "Unknown"),
-                    "pid": active_app.get("NSApplicationProcessIdentifier", -1)
+            ws = NSWorkspace.sharedWorkspace()
+            aa = ws.activeApplication()
+            if aa:
+                info["active_app"] = {
+                    "name": aa.get("NSApplicationName", "Unknown"),
+                    "bundle_id": aa.get("NSApplicationBundleIdentifier", ""),
+                    "pid": aa.get("NSApplicationProcessIdentifier", -1)
                 }
         except Exception as e:
-            screen_info["active_app_error"] = str(e)
-        
-        # Get window information using Quartz
+            info["active_app_error"] = str(e)
         try:
-            window_list = CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly, kCGNullWindowID)
-            
-            for window in window_list:
-                # Skip windows without titles or that are too small
-                window_name = window.get('kCGWindowName', '')
-                window_bounds = window.get('kCGWindowBounds', {})
-                
-                if (window_name and 
-                    window_bounds.get('Width', 0) > 50 and 
-                    window_bounds.get('Height', 0) > 50):
-                    
-                    window_info = {
-                        "title": window_name,
-                        "app": window.get('kCGWindowOwnerName', 'Unknown'),
-                        "bounds": {
-                            "x": int(window_bounds.get('X', 0)),
-                            "y": int(window_bounds.get('Y', 0)),
-                            "width": int(window_bounds.get('Width', 0)),
-                            "height": int(window_bounds.get('Height', 0))
-                        },
-                        "layer": window.get('kCGWindowLayer', 0),
-                        "pid": window.get('kCGWindowOwnerPID', -1)
-                    }
-                    screen_info["windows"].append(window_info)
-        
+            wl = CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly, kCGNullWindowID)
+            for w in wl:
+                name = w.get('kCGWindowName', '')
+                b = w.get('kCGWindowBounds', {})
+                if name and b.get('Width', 0) > 50 and b.get('Height', 0) > 50:
+                    info["windows"].append({
+                        "title": name, "app": w.get('kCGWindowOwnerName', 'Unknown'),
+                        "bounds": {"x": int(b.get('X', 0)), "y": int(b.get('Y', 0)),
+                                   "width": int(b.get('Width', 0)), "height": int(b.get('Height', 0))},
+                        "layer": w.get('kCGWindowLayer', 0),
+                        "pid": w.get('kCGWindowOwnerPID', -1)
+                    })
         except Exception as e:
-            screen_info["windows_error"] = str(e)
-        
-        # Sort windows by layer (front to back)
-        screen_info["windows"].sort(key=lambda w: w.get("layer", 0))
-        
-        # Get screen size
+            info["windows_error"] = str(e)
+        info["windows"].sort(key=lambda w: w.get("layer", 0))
         try:
-            screenshot = pyautogui.screenshot()
-            screen_info["screen_size"] = {
-                "width": screenshot.width,
-                "height": screenshot.height
-            }
-        except Exception as e:
-            screen_info["screen_size_error"] = str(e)
-        
-        return json.dumps({
-            "success": True,
-            "screen_info": screen_info,
-            "message": f"Found {len(screen_info['windows'])} visible windows"
-        }, indent=2)
-        
+            ss = pyautogui.screenshot()
+            info["screen_size"] = {"width": ss.width, "height": ss.height}
+        except Exception:
+            pass
+        return _ok(f"Found {len(info['windows'])} visible windows", screen_info=info)
     except Exception as e:
-        return json.dumps({
-            "success": False,
-            "error": str(e),
-            "message": "Failed to get screen content using accessibility"
-        }, indent=2)
-
-
-def _get_screen_content_ocr() -> str:
-    """Get screen content using OCR to read all text on screen."""
-    try:
-        # Take screenshot
-        screenshot = pyautogui.screenshot()
-        
-        # Convert PIL Image to numpy array for easyocr
-        screenshot_array = np.array(screenshot)
-        
-        # Use OCR to extract all text
-        ocr_reader = get_ocr_reader()
-        results = ocr_reader.readtext(screenshot_array)
-        
-        screen_info = {
-            "mode": "ocr",
-            "timestamp": str(subprocess.run(["date"], capture_output=True, text=True).stdout.strip()),
-            "screen_size": {
-                "width": screenshot.width,
-                "height": screenshot.height
-            },
-            "text_elements": [],
-            "full_text": ""
-        }
-        
-        all_text_lines = []
-        
-        for (bbox, detected_text, confidence) in results:
-            if confidence > 0.3:  # Lower threshold for general screen reading
-                x1, y1 = bbox[0]
-                x2, y2 = bbox[2]
-                center_x = int((x1 + x2) / 2)
-                center_y = int((y1 + y2) / 2)
-                
-                text_element = {
-                    "text": detected_text.strip(),
-                    "confidence": round(confidence, 3),
-                    "position": {
-                        "center_x": center_x,
-                        "center_y": center_y,
-                        "bbox": [[int(point[0]), int(point[1])] for point in bbox]
-                    }
-                }
-                
-                screen_info["text_elements"].append(text_element)
-                all_text_lines.append(detected_text.strip())
-        
-        # Sort text elements by vertical position (top to bottom, then left to right)
-        screen_info["text_elements"].sort(key=lambda x: (x["position"]["center_y"], x["position"]["center_x"]))
-        
-        # Create full text representation
-        screen_info["full_text"] = "\n".join([elem["text"] for elem in screen_info["text_elements"]])
-        
-        return json.dumps({
-            "success": True,
-            "screen_info": screen_info,
-            "message": f"Found {len(screen_info['text_elements'])} text elements on screen"
-        }, indent=2)
-        
-    except Exception as e:
-        return json.dumps({
-            "success": False,
-            "error": str(e),
-            "message": "Failed to get screen content using OCR"
-        }, indent=2)
-
-
+        return _fail(f"Failed: {e}")
 
 @mcp.tool()
-def get_available_apps() -> str:
-    """Get a list of all running applications."""
-    script = '''
-    tell application "System Events"
-        get name of (processes where background only is false)
-    end tell
-    '''
+def get_screen_text() -> Dict[str, Any]:
+    """Read all text currently visible on screen using OCR."""
+    try:
+        ss = pyautogui.screenshot()
+        arr = np.array(ss)
+        results = get_ocr_reader().readtext(arr)
+        elements = []
+        for (bbox, text, conf) in results:
+            if conf > 0.3:
+                x1, y1 = bbox[0]; x2, y2 = bbox[2]
+                elements.append({
+                    "text": text.strip(), "confidence": round(conf, 3),
+                    "position": {"center_x": int((x1+x2)/2), "center_y": int((y1+y2)/2),
+                                 "bbox": [[int(p[0]), int(p[1])] for p in bbox]}
+                })
+        elements.sort(key=lambda e: (e["position"]["center_y"], e["position"]["center_x"]))
+        full_text = "\n".join(e["text"] for e in elements)
+        return _ok(f"Found {len(elements)} text elements",
+                   screen_size={"width": ss.width, "height": ss.height},
+                   text_elements=elements, full_text=full_text)
+    except Exception as e:
+        return _fail(f"OCR failed: {e}")
+
+
+# ── 8. Terminal ───────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def run_terminal_command(command: str, timeout_seconds: int = 30,
+                         run_in_background: bool = False) -> Dict[str, Any]:
+    """Execute a terminal command with configurable timeout and background mode.
+
+    Args:
+        command: Shell command to run.
+        timeout_seconds: Max wait time in seconds (default 30, max 300).
+        run_in_background: If true, start async and return the PID immediately.
+                          Use this for dev servers, long builds, etc.
+    """
+    timeout_seconds = max(1, min(timeout_seconds, 300))
+    try:
+        if run_in_background:
+            proc = subprocess.Popen(command, shell=True, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL, start_new_session=True)
+            return _ok(f"Background process started (PID {proc.pid})", pid=proc.pid)
+        r = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=timeout_seconds)
+        return _ok("Command completed",
+                   stdout=r.stdout, stderr=r.stderr, exit_code=r.returncode)
+    except subprocess.TimeoutExpired:
+        return _fail(f"Command timed out after {timeout_seconds}s")
+    except Exception as e:
+        return _fail(f"Execution failed: {e}")
+
+
+# ── 9. Spotlight File Search ─────────────────────────────────────────────────
+
+@mcp.tool()
+def find_file(query: str, search_dir: str = "", file_type: str = "", sort_by: str = "", limit: int = 50) -> Dict[str, Any]:
+    """Find files using macOS Spotlight (mdfind) — millisecond results across the whole drive.
     
+    NOTE: Returns a list of objects with metadata (path, name, last_modified, size_kb) 
+    instead of raw strings. This is a breaking change for agents expecting raw strings.
+
+    Args:
+        query: Search query (filename, content keyword, etc.)
+        search_dir: Optional directory to scope the search.
+        file_type: Optional extension filter (e.g. ".pdf", ".zip").
+        sort_by: Optional sort order ("date_desc", "date_asc", "size_desc", "size_asc", "name_asc", "name_desc").
+        limit: Max number of results to return (default 50).
+    """
+    if not query:
+        return _fail("query is required")
     try:
-        result = subprocess.run(
-            ["osascript", "-e", script],
-            capture_output=True,
-            text=True,
-            timeout=30
-        )
+        cmd = ["mdfind"]
+        if search_dir:
+            expanded = os.path.expanduser(search_dir)
+            if os.path.isdir(expanded):
+                cmd.extend(["-onlyin", expanded])
+        search = f"kMDItemFSName == '*{query}*'" if file_type == "" else f"kMDItemFSName == '*{query}*{file_type}'"
+        cmd.append(search)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        paths = [f for f in r.stdout.strip().split("\n") if f]
         
-        if result.returncode != 0:
-            return json.dumps({"success": False, "error": f"Failed to get apps: {result.stderr}"}, indent=2)
-        
-        apps = [app.strip() for app in result.stdout.split(", ")]
-        return json.dumps({"success": True, "apps": apps}, indent=2)
+        files_data = []
+        for p in paths:
+            try:
+                st = os.stat(p)
+                files_data.append({
+                    "path": p,
+                    "name": os.path.basename(p),
+                    "last_modified": datetime.fromtimestamp(st.st_mtime).isoformat(),
+                    "size_kb": round(st.st_size / 1024, 2)
+                })
+            except OSError:
+                continue
+                
+        if sort_by:
+            if sort_by == "date_desc":
+                files_data.sort(key=lambda x: x["last_modified"], reverse=True)
+            elif sort_by == "date_asc":
+                files_data.sort(key=lambda x: x["last_modified"])
+            elif sort_by == "size_desc":
+                files_data.sort(key=lambda x: x["size_kb"], reverse=True)
+            elif sort_by == "size_asc":
+                files_data.sort(key=lambda x: x["size_kb"])
+            elif sort_by == "name_asc":
+                files_data.sort(key=lambda x: x["name"])
+            elif sort_by == "name_desc":
+                files_data.sort(key=lambda x: x["name"], reverse=True)
+                
+        files_data = files_data[:limit]
+        return _ok(f"Found {len(files_data)} files", files=files_data)
     except Exception as e:
-        return json.dumps({"success": False, "error": f"Execution failed: {str(e)}"}, indent=2)
+        return _fail(f"Search failed: {e}")
 
+
+# ── 10. File I/O ─────────────────────────────────────────────────────────────
 
 @mcp.tool()
-def run_terminal_command(command: str) -> str:
-    """Execute a terminal command with a 30-second timeout."""
-    try:
-        result = subprocess.run(
-            command,
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=30
-        )
-        if result.returncode == 0:
-            return result.stdout if result.stdout else "Command executed successfully with no output."
-        else:
-            return f"Command failed with return code {result.returncode}:\n{result.stderr}"
-    except subprocess.TimeoutExpired as e:
-        return f"TimeoutExpired: Command took longer than 30 seconds.\n{str(e)}"
-    except Exception as e:
-        return f"Exception: {str(e)}"
+def read_file(path: str) -> Dict[str, Any]:
+    """Read a file's contents.
 
+    Args:
+        path: Absolute or ~-relative path to the file.
+    """
+    try:
+        p = os.path.expanduser(path)
+        with open(p, "r", encoding="utf-8") as f:
+            content = f.read()
+        return _ok(f"Read {len(content)} chars from {p}", content=content)
+    except Exception as e:
+        return _fail(f"Read failed: {e}")
 
 @mcp.tool()
-def read_file(path: str) -> str:
-    """Read the contents of a file."""
-    try:
-        expanded_path = os.path.expanduser(path)
-        with open(expanded_path, "r", encoding="utf-8") as f:
-            return f.read()
-    except Exception as e:
-        return f"Exception: {str(e)}"
+def write_file(path: str, content: str) -> Dict[str, Any]:
+    """Write (or overwrite) a file.
 
-
-@mcp.tool()
-def write_file(path: str, content: str) -> str:
-    """Write or overwrite the contents of a file."""
+    Args:
+        path: Absolute or ~-relative file path. Parent dirs created automatically.
+        content: The text content to write.
+    """
     try:
-        expanded_path = os.path.expanduser(path)
-        # Ensure directory exists
-        os.makedirs(os.path.dirname(os.path.abspath(expanded_path)), exist_ok=True)
-        with open(expanded_path, "w", encoding="utf-8") as f:
+        p = os.path.expanduser(path)
+        os.makedirs(os.path.dirname(os.path.abspath(p)), exist_ok=True)
+        with open(p, "w", encoding="utf-8") as f:
             f.write(content)
-        return f"Successfully wrote to {expanded_path}"
+        return _ok(f"Wrote {len(content)} chars to {p}")
     except Exception as e:
-        return f"Exception: {str(e)}"
-
+        return _fail(f"Write failed: {e}")
 
 @mcp.tool()
-def list_directory(path: str) -> str:
-    """List directory contents, distinguishing between files and folders."""
+def list_directory(path: str) -> Dict[str, Any]:
+    """List contents of a directory.
+    
+    NOTE: Returns objects with metadata (name, path, last_modified, size_kb) 
+    instead of raw strings. This is a breaking change for agents expecting raw strings.
+
+    Args:
+        path: Absolute or ~-relative directory path.
+    """
     try:
-        expanded_path = os.path.expanduser(path)
-        if not os.path.exists(expanded_path):
-            return f"Error: Directory '{expanded_path}' does not exist."
-        if not os.path.isdir(expanded_path):
-            return f"Error: Path '{expanded_path}' is not a directory."
-            
-        items = os.listdir(expanded_path)
+        p = os.path.expanduser(path)
+        if not os.path.isdir(p):
+            return _fail(f"Not a directory: {p}")
+        items = os.listdir(p)
+        
         folders = []
         files = []
-        for item in items:
-            item_path = os.path.join(expanded_path, item)
-            if os.path.isdir(item_path):
-                folders.append(item)
-            else:
-                files.append(item)
-                
-        folders.sort()
-        files.sort()
         
-        output = [f"Contents of {expanded_path}:\n"]
-        if folders:
-            output.append("Folders:")
-            for folder in folders:
-                output.append(f"  📁 {folder}/")
-            output.append("")
-        if files:
-            output.append("Files:")
-            for file in files:
-                output.append(f"  📄 {file}")
+        for i in items:
+            full_path = os.path.join(p, i)
+            try:
+                st = os.stat(full_path)
+                item_data = {
+                    "name": i,
+                    "path": full_path,
+                    "last_modified": datetime.fromtimestamp(st.st_mtime).isoformat(),
+                    "size_kb": round(st.st_size / 1024, 2)
+                }
+                if os.path.isdir(full_path):
+                    folders.append(item_data)
+                else:
+                    files.append(item_data)
+            except OSError:
+                continue
                 
-        if not folders and not files:
-            output.append("(Empty directory)")
-            
-        return "\n".join(output)
+        folders.sort(key=lambda x: x["name"])
+        files.sort(key=lambda x: x["name"])
+        
+        return _ok(f"{len(folders)} folders, {len(files)} files in {p}",
+                   folders=folders, files=files)
     except Exception as e:
-        return f"Exception: {str(e)}"
+        return _fail(f"Failed: {e}")
 
+
+# ── 11. Regex Search ─────────────────────────────────────────────────────────
 
 @mcp.tool()
-def smart_search(directory: str, regex_pattern: str, file_extension_filter: Optional[str] = None) -> str:
-    """Recursively search for a regex pattern in files within a directory."""
+def smart_search(directory: str, regex_pattern: str,
+                 file_extension_filter: Optional[str] = None) -> Dict[str, Any]:
+    """Search for a regex pattern inside files within a directory.
+
+    Args:
+        directory: Root directory to search recursively.
+        regex_pattern: Regex pattern to match against file contents.
+        file_extension_filter: Optional file extension (e.g. ".py").
+    """
     try:
-        expanded_dir = os.path.expanduser(directory)
-        if not os.path.isdir(expanded_dir):
-            return f"Error: '{expanded_dir}' is not a valid directory."
-            
-        # Ignore these common junk/hidden directories completely
-        ignore_dirs = {".git", "node_modules", "venv", ".venv", "__pycache__", ".idea", ".vscode"}
-        
+        d = os.path.expanduser(directory)
+        if not os.path.isdir(d):
+            return _fail(f"Not a directory: {d}")
+        ignore = {".git", "node_modules", "venv", ".venv", "__pycache__", ".idea", ".vscode"}
         try:
-            pattern = re.compile(regex_pattern)
+            pat = re.compile(regex_pattern)
         except re.error as e:
-            return f"Error: Invalid regex pattern '{regex_pattern}': {str(e)}"
-            
+            return _fail(f"Invalid regex: {e}")
         results = []
         char_count = 0
-        MAX_CHARS = 10000
-        truncated = False
-        
-        for root, dirs, files in os.walk(expanded_dir):
-            # Modifying dirs in-place to prune hidden and ignored directories
-            dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ignore_dirs]
-            
-            for file in files:
-                if file.startswith('.'):
+        MAX = 10000
+        for root, dirs, files in os.walk(d):
+            dirs[:] = [x for x in dirs if not x.startswith('.') and x not in ignore]
+            for fname in files:
+                if fname.startswith('.'):
                     continue
-                    
-                if file_extension_filter and not file.endswith(file_extension_filter):
+                if file_extension_filter and not fname.endswith(file_extension_filter):
                     continue
-                    
-                file_path = os.path.join(root, file)
-                
+                fp = os.path.join(root, fname)
                 try:
-                    with open(file_path, "r", encoding="utf-8") as f:
+                    with open(fp, "r", encoding="utf-8") as f:
                         lines = f.readlines()
-                        
-                    file_matches = []
+                    matches = []
                     for i, line in enumerate(lines):
-                        if pattern.search(line):
-                            file_matches.append(f"  Line {i+1}: {line.strip()}")
-                            
-                    if file_matches:
-                        match_str = f"File: {file_path}\n" + "\n".join(file_matches) + "\n\n"
-                        
-                        if char_count + len(match_str) > MAX_CHARS:
-                            results.append(match_str[:MAX_CHARS - char_count] + "\n...[TRUNCATED due to length limit]")
-                            truncated = True
-                            break
-                        else:
-                            results.append(match_str)
-                            char_count += len(match_str)
-                            
-                except (PermissionError, UnicodeDecodeError):
-                    # Silently skip files we can't read or decode (e.g. binary files)
+                        if pat.search(line):
+                            matches.append({"line": i + 1, "content": line.strip()})
+                    if matches:
+                        entry = {"file": fp, "matches": matches}
+                        s = json.dumps(entry)
+                        if char_count + len(s) > MAX:
+                            results.append({"file": fp, "matches": matches[:3], "truncated": True})
+                            return _ok(f"Found matches (truncated at {MAX} chars)", results=results)
+                        results.append(entry)
+                        char_count += len(s)
+                except (PermissionError, UnicodeDecodeError, Exception):
                     continue
-                except Exception:
-                    # Silently skip other read errors per the prompt
-                    continue
-                    
-            if truncated:
-                break
-                
         if not results:
-            return f"No matches found for '{regex_pattern}' in {expanded_dir}"
-            
-        return "".join(results)
+            return _ok(f"No matches for '{regex_pattern}' in {d}", results=[])
+        return _ok(f"Found matches in {len(results)} files", results=results)
     except Exception as e:
-        return f"Exception: {str(e)}"
+        return _fail(f"Search failed: {e}")
 
+
+# ── 12. Utility ──────────────────────────────────────────────────────────────
 
 @mcp.tool()
-def send_file_to_telegram(file_path: str, caption: str = "") -> str:
-    """Send a file to the user via Telegram."""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return "Error: Telegram is not configured. Please restart Mac Orchestrator and provide credentials."
-        
+def play_sound_for_user_prompt() -> Dict[str, Any]:
+    """Play the macOS system bell sound to alert the user."""
     try:
-        expanded_path = os.path.expanduser(file_path)
-        
-        if not os.path.exists(expanded_path):
-            return f"Error: File '{expanded_path}' does not exist."
-            
-        file_size = os.path.getsize(expanded_path)
-        if file_size > 50 * 1024 * 1024:
-            return f"Error: File is {file_size / (1024 * 1024):.2f}MB, which exceeds Telegram's 50MB bot limit."
-            
+        r = subprocess.run(["osascript", "-e", "beep"], capture_output=True, text=True, timeout=5)
+        if r.returncode != 0:
+            return _fail(f"Bell failed: {r.stderr.strip()}")
+        return _ok("System bell played")
+    except Exception as e:
+        return _fail(f"Failed: {e}")
+
+@mcp.tool()
+def send_file_to_telegram(file_path: str, caption: str = "") -> Dict[str, Any]:
+    """Send a file to the user via Telegram.
+
+    Args:
+        file_path: Path to the file to send.
+        caption: Optional caption for the file.
+    """
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return _fail("Telegram not configured. Restart and provide credentials.")
+    try:
+        p = os.path.expanduser(file_path)
+        if not os.path.exists(p):
+            return _fail(f"File not found: {p}")
+        sz = os.path.getsize(p)
+        if sz > 50 * 1024 * 1024:
+            return _fail(f"File too large ({sz / 1048576:.1f}MB > 50MB limit)")
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
-        
-        with open(expanded_path, "rb") as f:
-            files = {"document": f}
+        with open(p, "rb") as f:
             data = {"chat_id": TELEGRAM_CHAT_ID}
             if caption:
                 data["caption"] = caption
-                
-            response = requests.post(url, data=data, files=files, timeout=60)
-            
-        if response.status_code == 200:
-            return f"Successfully sent '{os.path.basename(expanded_path)}' to Telegram."
-        else:
-            return f"Error from Telegram API (Status {response.status_code}): {response.text}"
-            
+            resp = requests.post(url, data=data, files={"document": f}, timeout=60)
+        if resp.status_code == 200:
+            return _ok(f"Sent '{os.path.basename(p)}' to Telegram")
+        return _fail(f"Telegram API error ({resp.status_code}): {resp.text}")
     except Exception as e:
-        return f"Exception: {str(e)}"
+        return _fail(f"Failed: {e}")
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SERVER SETUP & MAIN
+# ═══════════════════════════════════════════════════════════════════════════════
 
 console = Console()
 
 def setup_telegram():
     """Sets up Telegram configuration securely."""
     global TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
-    
     config_dir = os.path.expanduser("~/.config/mac-orchestrator")
     config_path = os.path.join(config_dir, "config.json")
-    
-    # Try to load existing config
     try:
         if os.path.exists(config_path):
             with open(config_path, "r") as f:
@@ -878,7 +799,6 @@ def setup_telegram():
                 TELEGRAM_CHAT_ID = config.get("TELEGRAM_CHAT_ID", "")
     except Exception:
         pass
-        
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         setup = Prompt.ask("\n[bold cyan]Do you want to configure Telegram integration for file sending?[/bold cyan]", choices=["y", "n"], default="y")
         if setup.lower() == 'y':
@@ -890,7 +810,6 @@ def setup_telegram():
             ))
             bot_token = Prompt.ask("[bold green]Enter your Telegram Bot Token[/bold green]").strip()
             chat_id = Prompt.ask("[bold green]Enter your Telegram Chat ID[/bold green]").strip()
-            
             if bot_token and chat_id:
                 TELEGRAM_BOT_TOKEN = bot_token
                 TELEGRAM_CHAT_ID = chat_id
@@ -899,17 +818,15 @@ def setup_telegram():
                     config_data = {}
                     if os.path.exists(config_path):
                         with open(config_path, "r") as f:
-                            try:
-                                config_data = json.load(f)
-                            except:
-                                pass
+                            try: config_data = json.load(f)
+                            except: pass
                     config_data["TELEGRAM_BOT_TOKEN"] = TELEGRAM_BOT_TOKEN
                     config_data["TELEGRAM_CHAT_ID"] = TELEGRAM_CHAT_ID
                     with open(config_path, "w") as f:
                         json.dump(config_data, f, indent=4)
-                    console.print("[green]✓ Telegram credentials saved successfully![/green]")
+                    console.print("[green]✓ Telegram credentials saved![/green]")
                 except Exception as e:
-                    console.print(f"[yellow]Could not save config to {config_path}: {e}[/yellow]")
+                    console.print(f"[yellow]Could not save config: {e}[/yellow]")
             else:
                 console.print("[red]Incomplete Telegram setup. File sending will not work.[/red]")
         else:
@@ -918,7 +835,6 @@ def setup_telegram():
 def setup_ngrok():
     """Sets up ngrok tunnel, prompting for auth token if not configured."""
     try:
-        # First check if ngrok is already running globally or from a previous session
         import urllib.request
         try:
             req = urllib.request.Request("http://127.0.0.1:4040/api/tunnels")
@@ -933,18 +849,15 @@ def setup_ngrok():
                             return url
         except Exception:
             pass
-
         expose = Prompt.ask("\n[bold cyan]Do you want to expose Mac Orchestrator publicly via ngrok?[/bold cyan] (Allows cloud bots to connect)", choices=["y", "n"], default="y")
         if expose.lower() != 'y':
-            console.print("[yellow]Skipping ngrok setup. Server will only be available locally.[/yellow]")
+            console.print("[yellow]Skipping ngrok. Server will only be available locally.[/yellow]")
             return None
-            
         ngrok_config_paths = [
             os.path.expanduser("~/Library/Application Support/ngrok/ngrok.yml"),
             os.path.expanduser("~/.ngrok2/ngrok.yml"),
             os.path.expanduser("~/.config/ngrok/ngrok.yml")
         ]
-        
         has_token = False
         for path in ngrok_config_paths:
             if os.path.exists(path):
@@ -955,11 +868,10 @@ def setup_ngrok():
                             break
                 except Exception:
                     pass
-        
         if not has_token:
             console.print(Panel.fit(
                 "To expose your local server, you need an ngrok authtoken.\n"
-                "1. Sign up / Log in at [link=https://dashboard.ngrok.com/get-started/your-authtoken]https://dashboard.ngrok.com[/link]\n"
+                "1. Sign up / Log in at [link=https://dashboard.ngrok.com]https://dashboard.ngrok.com[/link]\n"
                 "2. Copy your Auth Token and paste it below.",
                 title="[bold blue]ngrok Setup[/bold blue]", border_style="blue"
             ))
@@ -970,32 +882,26 @@ def setup_ngrok():
             else:
                 console.print("[red]No token provided. Skipping ngrok setup.[/red]")
                 return None
-                
         console.print("[cyan]Starting ngrok tunnel...[/cyan]")
         public_url = ngrok.connect(8000).public_url
         return public_url
-        
     except Exception as e:
         console.print(f"[bold red]Failed to setup ngrok:[/bold red] {e}")
         return None
 
 def main():
-    # Automatically kill any existing process running on port 8000 so we can start fresh
     try:
         subprocess.run("kill -9 $(lsof -t -i:8000)", shell=True, check=False, stderr=subprocess.DEVNULL)
-        time.sleep(0.5) # Give it a moment to free the port
+        time.sleep(0.5)
     except Exception:
         pass
-
     console.print(Panel.fit(
         "[bold magenta]Mac Orchestrator[/bold magenta]\n"
         "Your local MCP server for macOS UI automation.",
         border_style="magenta"
     ))
-    
     setup_telegram()
     public_url = setup_ngrok()
-    
     if public_url:
         mcp_url = f"{public_url}/mcp"
         console.print("\n[bold green]SUCCESS! Mac Orchestrator is now live.[/bold green]")
@@ -1004,11 +910,8 @@ def main():
     else:
         console.print("\n[bold green]Mac Orchestrator is starting locally.[/bold green]")
         console.print("🔗 [bold underline cyan]http://localhost:8000/mcp[/bold underline cyan]")
-        
     console.print("\n[dim]Press Ctrl+C to stop the server[/dim]\n")
-    
     try:
-        # Serve MCP over streamable HTTP at /mcp on localhost:8000
         mcp.run(transport="streamable-http", mount_path="/mcp")
     except KeyboardInterrupt:
         pass

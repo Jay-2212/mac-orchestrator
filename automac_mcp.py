@@ -556,7 +556,7 @@ def find_file(query: str, search_dir: str = "", file_type: str = "", sort_by: st
     Args:
         query: Search query (filename, content keyword, etc.)
         search_dir: Optional directory to scope the search.
-        file_type: Optional extension filter (e.g. ".pdf", ".zip").
+        file_type: Optional extension filter (e.g. "pdf", "zip").
         sort_by: Optional sort order ("date_desc", "date_asc", "size_desc", "size_asc", "name_asc", "name_desc").
         limit: Max number of results to return (default 50).
         include_source: If True, fetches the source URL (kMDItemWhereFroms) for each file.
@@ -569,11 +569,34 @@ def find_file(query: str, search_dir: str = "", file_type: str = "", sort_by: st
             expanded = os.path.expanduser(search_dir)
             if os.path.isdir(expanded):
                 cmd.extend(["-onlyin", expanded])
-        search = f"kMDItemFSName == '*{query}*'" if file_type == "" else f"kMDItemFSName == '*{query}*{file_type}'"
+        
+        # Smart Query Construction
+        if "kMDItem" in query or ":" in query:
+            search = query
+        else:
+            search = f"kMDItemFSName == '*{query}*'cd"
+            
+        if file_type:
+            ext = file_type.lstrip('.')
+            search = f"({search}) && kMDItemFSName == '*.{ext}'cd"
+            
         cmd.append(search)
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
         paths = [f for f in r.stdout.strip().split("\n") if f]
         
+        # Smarter Slicing
+        needs_stat_for_sort = sort_by in ("date_desc", "date_asc", "size_desc", "size_asc")
+        
+        if not needs_stat_for_sort:
+            # Sort paths directly if name-based or no sort
+            if sort_by == "name_asc":
+                paths.sort(key=lambda x: os.path.basename(x))
+            elif sort_by == "name_desc":
+                paths.sort(key=lambda x: os.path.basename(x), reverse=True)
+            
+            # Slice early
+            paths = paths[:limit]
+            
         files_data = []
         for p in paths:
             try:
@@ -584,20 +607,12 @@ def find_file(query: str, search_dir: str = "", file_type: str = "", sort_by: st
                     "last_modified": datetime.fromtimestamp(st.st_mtime).isoformat(),
                     "size_kb": round(st.st_size / 1024, 2)
                 }
-                
-                if include_source:
-                    mdls_r = subprocess.run(["mdls", "-name", "kMDItemWhereFroms", p], capture_output=True, text=True, timeout=5)
-                    if mdls_r.returncode == 0:
-                        urls = re.findall(r'"(https?://.*?)"', mdls_r.stdout)
-                        item["source_urls"] = urls
-                    else:
-                        item["source_urls"] = []
-                
                 files_data.append(item)
             except OSError:
                 continue
                 
-        if sort_by:
+        # If we needed stats for sort, we do it now on the full list, then slice
+        if needs_stat_for_sort:
             if sort_by == "date_desc":
                 files_data.sort(key=lambda x: x["last_modified"], reverse=True)
             elif sort_by == "date_asc":
@@ -606,12 +621,25 @@ def find_file(query: str, search_dir: str = "", file_type: str = "", sort_by: st
                 files_data.sort(key=lambda x: x["size_kb"], reverse=True)
             elif sort_by == "size_asc":
                 files_data.sort(key=lambda x: x["size_kb"])
-            elif sort_by == "name_asc":
-                files_data.sort(key=lambda x: x["name"])
-            elif sort_by == "name_desc":
-                files_data.sort(key=lambda x: x["name"], reverse=True)
                 
-        files_data = files_data[:limit]
+            files_data = files_data[:limit]
+            
+        # Deferred Metadata Fetching (mdls)
+        if include_source and files_data:
+            for item in files_data:
+                try:
+                    mdls_r = subprocess.run(["mdls", "-name", "kMDItemWhereFroms", item["path"]], 
+                                            capture_output=True, text=True, timeout=1.5)
+                    if mdls_r.returncode == 0:
+                        urls = re.findall(r'"(https?://.*?)"', mdls_r.stdout)
+                        item["source_urls"] = urls
+                    else:
+                        item["source_urls"] = []
+                except subprocess.TimeoutExpired:
+                    item["source_urls"] = [] # Graceful timeout
+                except Exception:
+                    item["source_urls"] = []
+                    
         return _ok(f"Found {len(files_data)} files", files=files_data)
     except Exception as e:
         return _fail(f"Search failed: {e}")
@@ -620,25 +648,50 @@ def find_file(query: str, search_dir: str = "", file_type: str = "", sort_by: st
 # ── 10. File I/O ─────────────────────────────────────────────────────────────
 
 @mcp.tool()
-def read_file(path: str, preview: bool = False, preview_size_kb: int = 1) -> Dict[str, Any]:
+def read_file(path: str, preview: bool = False, preview_size_kb: int = 1, preview_lines: Optional[int] = None) -> Dict[str, Any]:
     """Read a file's contents.
 
     Args:
         path: Absolute or ~-relative path to the file.
         preview: If True, returns only the head and tail of the file to save context window.
         preview_size_kb: Size in KB to read from both head and tail in preview mode (default 1).
+        preview_lines: If provided, returns the first N and last N lines using native tools.
     """
     try:
         p = os.path.expanduser(path)
-        file_size = os.path.getsize(p)
         
+        # Adaptive Previewing (Subprocess Fast Path)
+        if preview_lines is not None:
+            try:
+                # Get head
+                head_r = subprocess.run(["head", "-n", str(preview_lines), p], capture_output=True, text=True, timeout=5)
+                # Get tail
+                tail_r = subprocess.run(["tail", "-n", str(preview_lines), p], capture_output=True, text=True, timeout=5)
+                
+                content = head_r.stdout + f"\n\n... [TRUNCATED - PREVIEW MODE ({preview_lines} Lines Head/Tail)] ...\n\n" + tail_r.stdout
+                return _ok(f"Read preview ({preview_lines} lines head/tail) from {p}", content=content)
+            except Exception as e:
+                return _fail(f"Fast preview failed: {e}")
+
+        file_size = os.path.getsize(p)
         chunk_size = preview_size_kb * 1024
         
         if preview and file_size > (chunk_size * 2):
             with open(p, "rb") as f:
                 head = f.read(chunk_size).decode('utf-8', errors='replace')
                 f.seek(-chunk_size, os.SEEK_END)
-                tail = f.read(chunk_size).decode('utf-8', errors='replace')
+                tail_bytes = f.read(chunk_size)
+                
+                # UTF-8 Resilience: find first newline and slice
+                try:
+                    first_nl = tail_bytes.index(b'\n')
+                    tail_bytes = tail_bytes[first_nl + 1:]
+                except ValueError:
+                    # No newline found, just decode what we have
+                    pass
+                    
+                tail = tail_bytes.decode('utf-8', errors='replace')
+                
             content = head + f"\n\n... [TRUNCATED - PREVIEW MODE ({preview_size_kb}KB Head/Tail)] ...\n\n" + tail
             return _ok(f"Read preview ({preview_size_kb}KB head/tail) from {p}", content=content)
         else:
@@ -666,7 +719,7 @@ def write_file(path: str, content: str) -> Dict[str, Any]:
         return _fail(f"Write failed: {e}")
 
 @mcp.tool()
-def list_directory(path: str, limit: int = 50, sort_by: str = "date_desc", summary_only: bool = False) -> Dict[str, Any]:
+def list_directory(path: str, limit: int = 50, sort_by: str = "date_desc", summary_only: bool = False, offset: int = 0) -> Dict[str, Any]:
     """List contents of a directory.
     
     NOTE: Returns objects with metadata (name, path, last_modified, size_kb) 
@@ -677,90 +730,153 @@ def list_directory(path: str, limit: int = 50, sort_by: str = "date_desc", summa
         limit: Max number of results to return (default 50).
         sort_by: Sort order ("date_desc", "date_asc", "size_desc", "size_asc", "name_asc", "name_desc").
         summary_only: If True, returns a high-level survey (counts, sizes, extensions, age) instead of file lists.
+        offset: Number of items to skip (default 0).
     """
     from collections import Counter
     try:
         p = os.path.expanduser(path)
         if not os.path.isdir(p):
             return _fail(f"Not a directory: {p}")
-        items = os.listdir(p)
-        
-        folders = []
-        files = []
-        
-        for i in items:
-            full_path = os.path.join(p, i)
-            try:
-                st = os.stat(full_path)
-                item_data = {
-                    "name": i,
-                    "path": full_path,
-                    "last_modified": datetime.fromtimestamp(st.st_mtime).isoformat(),
-                    "size_kb": round(st.st_size / 1024, 2)
-                }
-                if os.path.isdir(full_path):
-                    folders.append(item_data)
-                else:
-                    files.append(item_data)
-            except OSError:
-                continue
-                
-        if summary_only:
-            exts = [os.path.splitext(f["name"])[1].lower() for f in files if os.path.splitext(f["name"])[1]]
-            top_extensions = dict(Counter(exts).most_common(5))
             
+        # Summary Mode Guard (O(1) memory)
+        if summary_only:
+            total_folders = 0
+            total_files = 0
+            total_size_kb = 0.0
+            extensions = []
             age_distribution = {"< 1 day": 0, "1-7 days": 0, "8-30 days": 0, "31-365 days": 0, "> 1 year": 0}
             now = time.time()
-            total_size_kb = 0.0
             
-            for f in files:
-                total_size_kb += f["size_kb"]
-                try:
-                    st = os.stat(f["path"])
-                    days_old = (now - st.st_mtime) / 86400
-                    if days_old < 1: age_distribution["< 1 day"] += 1
-                    elif days_old <= 7: age_distribution["1-7 days"] += 1
-                    elif days_old <= 30: age_distribution["8-30 days"] += 1
-                    elif days_old <= 365: age_distribution["31-365 days"] += 1
-                    else: age_distribution["> 1 year"] += 1
-                except OSError:
-                    continue
-                    
+            with os.scandir(p) as it:
+                for entry in it:
+                    try:
+                        if entry.is_dir():
+                            total_folders += 1
+                        else:
+                            total_files += 1
+                            ext = os.path.splitext(entry.name)[1].lower()
+                            if ext:
+                                extensions.append(ext)
+                                
+                            st = entry.stat()
+                            total_size_kb += st.st_size / 1024
+                            
+                            days_old = (now - st.st_mtime) / 86400
+                            if days_old < 1: age_distribution["< 1 day"] += 1
+                            elif days_old <= 7: age_distribution["1-7 days"] += 1
+                            elif days_old <= 30: age_distribution["8-30 days"] += 1
+                            elif days_old <= 365: age_distribution["31-365 days"] += 1
+                            else: age_distribution["> 1 year"] += 1
+                    except OSError:
+                        continue
+                        
+            top_extensions = dict(Counter(extensions).most_common(5))
             return _ok(f"Summary for {p}", 
                        summary={
-                           "total_folders": len(folders),
-                           "total_files": len(files),
+                           "total_folders": total_folders,
+                           "total_files": total_files,
                            "total_size_mb": round(total_size_kb / 1024, 2),
                            "top_extensions": top_extensions,
                            "age_distribution": age_distribution
                        })
+                       
+        # Normal Mode
+        entries = []
+        with os.scandir(p) as it:
+            for entry in it:
+                entries.append(entry)
+                
+        needs_stat_for_sort = sort_by in ("date_desc", "date_asc", "size_desc", "size_asc")
         
-        # Apply sorting
-        if sort_by:
-            if sort_by == "date_desc":
-                files.sort(key=lambda x: x["last_modified"], reverse=True)
-            elif sort_by == "date_asc":
-                files.sort(key=lambda x: x["last_modified"])
-            elif sort_by == "size_desc":
-                files.sort(key=lambda x: x["size_kb"], reverse=True)
-            elif sort_by == "size_asc":
-                files.sort(key=lambda x: x["size_kb"])
-            elif sort_by == "name_asc":
+        folders = []
+        files = []
+        
+        # Pre-Stat Sorting (Fast Path)
+        if not needs_stat_for_sort:
+            # Separate and sort by name first
+            for entry in entries:
+                try:
+                    if entry.is_dir():
+                        folders.append({"name": entry.name, "path": entry.path})
+                    else:
+                        files.append({"name": entry.name, "path": entry.path})
+                except OSError:
+                    continue
+                    
+            if sort_by == "name_asc":
+                folders.sort(key=lambda x: x["name"])
                 files.sort(key=lambda x: x["name"])
             elif sort_by == "name_desc":
+                folders.sort(key=lambda x: x["name"], reverse=True)
                 files.sort(key=lambda x: x["name"], reverse=True)
                 
-            if sort_by in ("name_asc", "name_desc"):
-                folders.sort(key=lambda x: x["name"], reverse=(sort_by == "name_desc"))
-            elif sort_by in ("date_desc", "date_asc"):
-                folders.sort(key=lambda x: x["last_modified"], reverse=(sort_by == "date_desc"))
-            elif sort_by in ("size_desc", "size_asc"):
-                folders.sort(key=lambda x: x["size_kb"], reverse=(sort_by == "size_desc"))
+            # Apply offset and limit
+            folders = folders[offset:offset+limit]
+            files = files[offset:offset+limit]
+            
+            # Now stat ONLY the sliced batch
+            for item in folders:
+                try:
+                    st = os.stat(item["path"])
+                    item["last_modified"] = datetime.fromtimestamp(st.st_mtime).isoformat()
+                    item["size_kb"] = round(st.st_size / 1024, 2)
+                except OSError:
+                    item["last_modified"] = "unknown"
+                    item["size_kb"] = 0
+                    
+            for item in files:
+                try:
+                    st = os.stat(item["path"])
+                    item["last_modified"] = datetime.fromtimestamp(st.st_mtime).isoformat()
+                    item["size_kb"] = round(st.st_size / 1024, 2)
+                except OSError:
+                    item["last_modified"] = "unknown"
+                    item["size_kb"] = 0
+                    
+        else:
+            # Need stat for sort
+            all_items = []
+            for entry in entries:
+                try:
+                    st = entry.stat()
+                    item_data = {
+                        "name": entry.name,
+                        "path": entry.path,
+                        "is_dir": entry.is_dir(),
+                        "last_modified": datetime.fromtimestamp(st.st_mtime).isoformat(),
+                        "size_kb": round(st.st_size / 1024, 2)
+                    }
+                    all_items.append(item_data)
+                except OSError:
+                    continue
+                    
+            # Separate
+            folders = [x for x in all_items if x["is_dir"]]
+            files = [x for x in all_items if not x["is_dir"]]
+            
+            # Sort
+            if sort_by == "date_desc":
+                folders.sort(key=lambda x: x["last_modified"], reverse=True)
+                files.sort(key=lambda x: x["last_modified"], reverse=True)
+            elif sort_by == "date_asc":
+                folders.sort(key=lambda x: x["last_modified"])
+                files.sort(key=lambda x: x["last_modified"])
+            elif sort_by == "size_desc":
+                folders.sort(key=lambda x: x["size_kb"], reverse=True)
+                files.sort(key=lambda x: x["size_kb"], reverse=True)
+            elif sort_by == "size_asc":
+                folders.sort(key=lambda x: x["size_kb"])
+                files.sort(key=lambda x: x["size_kb"])
                 
-        folders = folders[:limit]
-        files = files[:limit]
-        
-        return _ok(f"{len(folders)} folders, {len(files)} files in {p} (limited to {limit})",
+            # Apply offset and limit
+            folders = folders[offset:offset+limit]
+            files = files[offset:offset+limit]
+            
+            # Clean up temporary "is_dir" key
+            for x in folders: x.pop("is_dir", None)
+            for x in files: x.pop("is_dir", None)
+            
+        return _ok(f"{len(folders)} folders, {len(files)} files in {p} (offset {offset}, limit {limit})",
                    folders=folders, files=files)
     except Exception as e:
         return _fail(f"Failed: {e}")

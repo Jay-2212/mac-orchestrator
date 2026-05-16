@@ -126,10 +126,10 @@ Mac Orchestrator provides a lean, powerful set of tools designed so any AI agent
 | Tool | Description |
 |---|---|
 | `run_terminal_command(command, timeout_seconds, run_in_background)` | Run shell commands with configurable timeout (up to 300s) and optional background mode that returns a PID. |
-| `find_file(query, search_dir, file_type)` | **Spotlight-powered file search** via `mdfind`. Millisecond results across the entire drive. |
-| `read_file(path)` | Read file contents. |
+| `find_file(query, search_dir, file_type, sort_by, limit, include_source)` | **Spotlight-powered file search** via `mdfind`. Supports sorting, limits, and fetching source URLs (caution: may slow down search). |
+| `read_file(path, preview, preview_size_kb)` | Read file contents. Supports preview mode (head and tail) to save context window. |
 | `write_file(path, content)` | Write/overwrite a file (auto-creates parent dirs). |
-| `list_directory(path)` | List directory contents (folders & files). |
+| `list_directory(path, limit, sort_by, summary_only)` | List directory contents. Supports sorting, limits, and a high-level summary mode (file counts, sizes, age distribution). |
 | `smart_search(directory, regex_pattern, file_extension_filter)` | Regex search inside files within a directory. |
 
 ### Utility
@@ -164,23 +164,3 @@ Mac Orchestrator is built on top of [FastMCP](https://github.com/jlowin/fastmcp)
 | OCR takes 10+ seconds on the first call | `easyocr` downloads PyTorch model weights on its initial execution. Give it a moment to download. Subsequent calls will be fast. |
 
 For best visual AI comprehension results, it is recommended to enable **Increase Contrast** in *System Settings -> Accessibility -> Display*.
-
----
-
-<details>
-<summary><b>Case Study: Automated Steam Game Purchase</b></summary>
-
-*This was a real session in which the AI agent autonomously navigated the Steam desktop app to make a purchase within a specific budget constraint.*
-
-Prompt provided to the AI: 
-> "Open Steam and buy one or more new games for me from my wishlist, pick the best ones for me. You have a budget of €5. You have my full permission to complete the purchase. Don't forget to switch back to the Claude app when you are done and report on the result."
-
-The AI used `focus_app("Steam")`, `get_screen_text()`, `mouse_action()`, and `scroll()` sequentially to:
-1. Navigate to the user's wishlist in the Steam UI.
-2. Read the text on screen (using the OCR capabilities) to parse the game names and prices.
-3. Identify a game ("Heroes of Book & Paper" at €4.55) that matched the criteria and budget.
-4. Add it to the cart, navigate through the PayPal checkout, agree to the Subscriber Agreement, and complete the transaction autonomously.
-5. Focus back on the Claude app to deliver the final report.
-
-*(Screenshots of this flow were captured and successfully verified the behavior of the `mac-orchestrator` in a live environment).*
-</details>

@@ -543,11 +543,15 @@ def run_terminal_command(command: str, timeout_seconds: int = 30,
 # ── 9. Spotlight File Search ─────────────────────────────────────────────────
 
 @mcp.tool()
-def find_file(query: str, search_dir: str = "", file_type: str = "", sort_by: str = "", limit: int = 50) -> Dict[str, Any]:
+def find_file(query: str, search_dir: str = "", file_type: str = "", sort_by: str = "", limit: int = 50, include_source: bool = False) -> Dict[str, Any]:
     """Find files using macOS Spotlight (mdfind) — millisecond results across the whole drive.
     
     NOTE: Returns a list of objects with metadata (path, name, last_modified, size_kb) 
-    instead of raw strings. This is a breaking change for agents expecting raw strings.
+    instead of raw strings.
+
+    WARNING: Setting include_source to True will execute 'mdls' for each file found,
+    which can significantly slow down the search. Use this only with a low 'limit'
+    and for a small number of files when you need to find source URLs (e.g., origin domain).
 
     Args:
         query: Search query (filename, content keyword, etc.)
@@ -555,6 +559,7 @@ def find_file(query: str, search_dir: str = "", file_type: str = "", sort_by: st
         file_type: Optional extension filter (e.g. ".pdf", ".zip").
         sort_by: Optional sort order ("date_desc", "date_asc", "size_desc", "size_asc", "name_asc", "name_desc").
         limit: Max number of results to return (default 50).
+        include_source: If True, fetches the source URL (kMDItemWhereFroms) for each file.
     """
     if not query:
         return _fail("query is required")
@@ -573,12 +578,22 @@ def find_file(query: str, search_dir: str = "", file_type: str = "", sort_by: st
         for p in paths:
             try:
                 st = os.stat(p)
-                files_data.append({
+                item = {
                     "path": p,
                     "name": os.path.basename(p),
                     "last_modified": datetime.fromtimestamp(st.st_mtime).isoformat(),
                     "size_kb": round(st.st_size / 1024, 2)
-                })
+                }
+                
+                if include_source:
+                    mdls_r = subprocess.run(["mdls", "-name", "kMDItemWhereFroms", p], capture_output=True, text=True, timeout=5)
+                    if mdls_r.returncode == 0:
+                        urls = re.findall(r'"(https?://.*?)"', mdls_r.stdout)
+                        item["source_urls"] = urls
+                    else:
+                        item["source_urls"] = []
+                
+                files_data.append(item)
             except OSError:
                 continue
                 
@@ -605,17 +620,31 @@ def find_file(query: str, search_dir: str = "", file_type: str = "", sort_by: st
 # ── 10. File I/O ─────────────────────────────────────────────────────────────
 
 @mcp.tool()
-def read_file(path: str) -> Dict[str, Any]:
+def read_file(path: str, preview: bool = False, preview_size_kb: int = 1) -> Dict[str, Any]:
     """Read a file's contents.
 
     Args:
         path: Absolute or ~-relative path to the file.
+        preview: If True, returns only the head and tail of the file to save context window.
+        preview_size_kb: Size in KB to read from both head and tail in preview mode (default 1).
     """
     try:
         p = os.path.expanduser(path)
-        with open(p, "r", encoding="utf-8") as f:
-            content = f.read()
-        return _ok(f"Read {len(content)} chars from {p}", content=content)
+        file_size = os.path.getsize(p)
+        
+        chunk_size = preview_size_kb * 1024
+        
+        if preview and file_size > (chunk_size * 2):
+            with open(p, "rb") as f:
+                head = f.read(chunk_size).decode('utf-8', errors='replace')
+                f.seek(-chunk_size, os.SEEK_END)
+                tail = f.read(chunk_size).decode('utf-8', errors='replace')
+            content = head + f"\n\n... [TRUNCATED - PREVIEW MODE ({preview_size_kb}KB Head/Tail)] ...\n\n" + tail
+            return _ok(f"Read preview ({preview_size_kb}KB head/tail) from {p}", content=content)
+        else:
+            with open(p, "r", encoding="utf-8") as f:
+                content = f.read()
+            return _ok(f"Read {len(content)} chars from {p}", content=content)
     except Exception as e:
         return _fail(f"Read failed: {e}")
 
@@ -637,15 +666,19 @@ def write_file(path: str, content: str) -> Dict[str, Any]:
         return _fail(f"Write failed: {e}")
 
 @mcp.tool()
-def list_directory(path: str) -> Dict[str, Any]:
+def list_directory(path: str, limit: int = 50, sort_by: str = "date_desc", summary_only: bool = False) -> Dict[str, Any]:
     """List contents of a directory.
     
     NOTE: Returns objects with metadata (name, path, last_modified, size_kb) 
-    instead of raw strings. This is a breaking change for agents expecting raw strings.
+    instead of raw strings.
 
     Args:
         path: Absolute or ~-relative directory path.
+        limit: Max number of results to return (default 50).
+        sort_by: Sort order ("date_desc", "date_asc", "size_desc", "size_asc", "name_asc", "name_desc").
+        summary_only: If True, returns a high-level survey (counts, sizes, extensions, age) instead of file lists.
     """
+    from collections import Counter
     try:
         p = os.path.expanduser(path)
         if not os.path.isdir(p):
@@ -672,10 +705,62 @@ def list_directory(path: str) -> Dict[str, Any]:
             except OSError:
                 continue
                 
-        folders.sort(key=lambda x: x["name"])
-        files.sort(key=lambda x: x["name"])
+        if summary_only:
+            exts = [os.path.splitext(f["name"])[1].lower() for f in files if os.path.splitext(f["name"])[1]]
+            top_extensions = dict(Counter(exts).most_common(5))
+            
+            age_distribution = {"< 1 day": 0, "1-7 days": 0, "8-30 days": 0, "31-365 days": 0, "> 1 year": 0}
+            now = time.time()
+            total_size_kb = 0.0
+            
+            for f in files:
+                total_size_kb += f["size_kb"]
+                try:
+                    st = os.stat(f["path"])
+                    days_old = (now - st.st_mtime) / 86400
+                    if days_old < 1: age_distribution["< 1 day"] += 1
+                    elif days_old <= 7: age_distribution["1-7 days"] += 1
+                    elif days_old <= 30: age_distribution["8-30 days"] += 1
+                    elif days_old <= 365: age_distribution["31-365 days"] += 1
+                    else: age_distribution["> 1 year"] += 1
+                except OSError:
+                    continue
+                    
+            return _ok(f"Summary for {p}", 
+                       summary={
+                           "total_folders": len(folders),
+                           "total_files": len(files),
+                           "total_size_mb": round(total_size_kb / 1024, 2),
+                           "top_extensions": top_extensions,
+                           "age_distribution": age_distribution
+                       })
         
-        return _ok(f"{len(folders)} folders, {len(files)} files in {p}",
+        # Apply sorting
+        if sort_by:
+            if sort_by == "date_desc":
+                files.sort(key=lambda x: x["last_modified"], reverse=True)
+            elif sort_by == "date_asc":
+                files.sort(key=lambda x: x["last_modified"])
+            elif sort_by == "size_desc":
+                files.sort(key=lambda x: x["size_kb"], reverse=True)
+            elif sort_by == "size_asc":
+                files.sort(key=lambda x: x["size_kb"])
+            elif sort_by == "name_asc":
+                files.sort(key=lambda x: x["name"])
+            elif sort_by == "name_desc":
+                files.sort(key=lambda x: x["name"], reverse=True)
+                
+            if sort_by in ("name_asc", "name_desc"):
+                folders.sort(key=lambda x: x["name"], reverse=(sort_by == "name_desc"))
+            elif sort_by in ("date_desc", "date_asc"):
+                folders.sort(key=lambda x: x["last_modified"], reverse=(sort_by == "date_desc"))
+            elif sort_by in ("size_desc", "size_asc"):
+                folders.sort(key=lambda x: x["size_kb"], reverse=(sort_by == "size_desc"))
+                
+        folders = folders[:limit]
+        files = files[:limit]
+        
+        return _ok(f"{len(folders)} folders, {len(files)} files in {p} (limited to {limit})",
                    folders=folders, files=files)
     except Exception as e:
         return _fail(f"Failed: {e}")

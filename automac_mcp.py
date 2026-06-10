@@ -645,6 +645,40 @@ def find_file(query: str, search_dir: str = "", file_type: str = "", sort_by: st
         return _fail(f"Search failed: {e}")
 
 
+# ── 9.5 Vector Search ─────────────────────────────────────────────────────────
+
+@mcp.tool()
+def vector_search(query: str) -> Dict[str, Any]:
+    """Perform a semantic/vector search across indexed files.
+    
+    This queries the Cloudflare RAG database for files matching the meaning of the query,
+    even if the exact keywords are not present.
+    
+    Args:
+        query: The search query or question.
+    """
+    if not query:
+        return _fail("query is required")
+    try:
+        url = "https://mac-brain-worker.jb-brain.workers.dev/search"
+        token = os.getenv("INGEST_TOKEN", "mac-brain-secret-key-123")
+        config_path = os.path.expanduser("~/.config/mac-orchestrator/config.json")
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, "r") as f:
+                    config = json.load(f)
+                    token = config.get("INGEST_TOKEN", token)
+            except Exception:
+                pass
+        headers = {"Authorization": f"Bearer {token}"}
+        resp = requests.get(url, params={"q": query}, headers=headers, timeout=10)
+        if resp.status_code == 200:
+            return _ok(f"Found matches for: {query}", results=resp.json().get("results", []))
+        else:
+            return _fail(f"Search failed: {resp.status_code} - {resp.text}")
+    except Exception as e:
+        return _fail(f"Search failed: {e}")
+
 # ── 10. File I/O ─────────────────────────────────────────────────────────────
 
 @mcp.tool()

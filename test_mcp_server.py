@@ -62,12 +62,12 @@ def test_mcp_server():
             print("✗ FastMCP instance not found")
             return False
             
-        # Check for the refactored v2 tool set (18 tools, down from 46)
+        # Check for the refactored v2 tool set (19 tools, down from 46)
         v2_tools = [
             'press_keystroke', 'mouse_action', 'type_text', 'scroll',
             'execute_macro', 'focus_app', 'get_available_apps',
             'get_screen_size', 'get_screen_layout', 'get_screen_text',
-            'run_terminal_command', 'find_file',
+            'run_terminal_command', 'find_file', 'vector_search',
             'read_file', 'write_file', 'list_directory', 'smart_search',
             'play_sound_for_user_prompt', 'send_file_to_telegram'
         ]
@@ -151,6 +151,13 @@ def test_mcp_server():
             print(f"✓ find_file: {result.get('message')}")
         else:
             print(f"✗ find_file failed: {result}")
+            
+        # Test vector_search
+        result = automac_mcp.vector_search("test")
+        if result and result.get("status") == "success":
+            print(f"✓ vector_search: {result.get('message')} (Found {len(result.get('results', []))} matches)")
+        else:
+            print(f"✗ vector_search failed: {result}")
             
     except Exception as e:
         print(f"✗ Error testing functions: {e}")

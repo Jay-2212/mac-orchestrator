@@ -20,6 +20,10 @@ dependencies = [
     "pyngrok>=7.0.0",
     "rich>=13.0.0",
     "requests>=2.33.1",
+    "pypdf>=6.11.0",
+    "python-docx>=1.2.0",
+    "openpyxl>=3.1.5",
+    "python-pptx>=1.0.2",
 ]
 
 [project.scripts]

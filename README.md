@@ -1,166 +1,290 @@
-# Mac Orchestrator (AutoMac MCP)
+<h1 align="center">Mac Orchestrator</h1>
 
-A lean, efficient, and feature-rich Mac orchestrator locally hosted MCP server that exposes full macOS UI automation over HTTP. Run it on your Mac, and connect it to any AI assistant or agent that supports MCP to grant it the ability to seamlessly orchestrate your local environment.
+<p align="center">
+  <strong>The only MCP server that unifies macOS UI control and terminal automation in a single, lean interface.</strong>
+</p>
 
-**Note: This project is strictly for macOS (Apple Silicon or Intel).**
-
-> [!NOTE]
-> **Project Status:** We have recently optimized the server to be much leaner. By modifying and compressing tool calls, we have cut the toolset in half (from 46 to 18 tools), making it highly efficient for AI agents while remaining feature-rich.
-
-
-> [!WARNING]
-> This server grants an AI assistant direct, system-level control over your operating system's user interface. Only run it in environments you fully control and **never** expose the port to the public internet without proper auth. Monitor the AI's actions closely.
+<p align="center">
+  <a href="https://github.com/Jay-2212/mac-orchestrator/stargazers"><img src="https://img.shields.io/github/stars/Jay-2212/mac-orchestrator?style=flat-square&color=yellow" alt="Stars"></a>
+  <a href="https://github.com/Jay-2212/mac-orchestrator/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-CC0--1.0-blue?style=flat-square" alt="License: CC0-1.0"></a>
+  <img src="https://img.shields.io/badge/python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python 3.10+">
+  <img src="https://img.shields.io/badge/platform-macOS-black?style=flat-square&logo=apple&logoColor=white" alt="macOS">
+  <img src="https://img.shields.io/badge/MCP%20tools-20-orange?style=flat-square" alt="20 MCP Tools">
+  <a href="https://github.com/jlowin/fastmcp"><img src="https://img.shields.io/badge/powered%20by-FastMCP-blueviolet?style=flat-square" alt="FastMCP"></a>
+</p>
 
 ---
 
-## 🎯 How It Works
+Mac Orchestrator is a self-hosted [MCP](https://modelcontextprotocol.io) server that gives any AI agent 20 tools to fully control a Mac desktop. It is unique in combining both UI automation (keyboard, mouse, screen OCR, Accessibility API) and shell-level terminal access in a single lean server — no other macOS MCP does both.
+
+Run it locally or expose it over ngrok to connect it to any cloud AI agent or assistant.
+
+> [!WARNING]
+> This server grants an AI assistant direct, system-level control over your Mac. Only run it in environments you fully control. Never expose the port publicly without authentication.
+
+> [!NOTE]
+> **macOS only.** Requires Apple Silicon or Intel Mac. Windows and Linux are not supported.
+
+---
+
+## How It Works
 
 ```
-AI Agent (Cloud/Local)  ->  http://localhost:8000/mcp (or ngrok URL)  ->  Mac Orchestrator MCP  ->  macOS System APIs
+AI Agent (Claude, GPT, local LLM)
+         │
+         │  MCP over HTTP (JSON-RPC)
+         ▼
+http://localhost:8000/mcp   (or ngrok public URL for cloud agents)
+         │
+         ▼
+ Mac Orchestrator MCP Server
+         │
+         ├── pyobjc / Accessibility API  →  Window layout, focus, key events
+         ├── pyautogui + CGEvent          →  Mouse, scroll, Retina-aware input
+         ├── osascript / AppleScript      →  App activation, keystroke dispatch
+         ├── EasyOCR                      →  On-screen text with bounding boxes
+         └── subprocess                   →  Shell commands, background jobs
 ```
 
-Once running, the server provides a standard MCP interface exposing tools to:
-- Comprehend the screen via Apple's native Accessibility APIs and optical character recognition (OCR).
-- Perform mouse actions, keyboard input, and scrolling with Retina display support.
-- Chain multiple UI actions into atomic macros with realistic inter-step timing.
-- Open, focus, and manage running applications natively.
-- Execute terminal commands (with configurable timeouts and background mode).
-- Search files instantly via macOS Spotlight and perform local file I/O.
+---
 
-## 🚀 Quick Start
+## Quick Start
 
 ### Prerequisites
 
 - macOS (Apple Silicon or Intel)
-- Python 3.10 or later
-- [uv package manager](https://astral.sh/uv/) (recommended) or standard `pip`
+- Python 3.10+
+- [`uv`](https://astral.sh/uv/) (recommended) or `pip`
 
-### Step 1: Clone the Repository
+### 1 — Clone
 
 ```bash
 git clone https://github.com/Jay-2212/mac-orchestrator.git
 cd mac-orchestrator
 ```
 
-### Step 2: Install Dependencies
+### 2 — Install dependencies
 
-Using `uv` (Recommended):
 ```bash
-uv venv
-source .venv/bin/activate
+# Using uv (recommended)
 uv sync
+
+# Or pip
+python3 -m venv .venv && source .venv/bin/activate && pip install -e .
 ```
 
-Alternatively, using `pip`:
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e .
-```
+### 3 — Grant macOS permissions
 
-### Step 3: Grant Required macOS Permissions
+The server needs two permissions. If missing, UI tools fail gracefully with a `PERMISSION` error.
 
-The server interacts natively with the macOS UI, which requires system-level permissions. 
-If these permissions are not granted, the server will start but will gracefully fail when executing input tools.
+| Permission | Where to grant |
+|---|---|
+| **Accessibility** | System Settings → Privacy & Security → Accessibility → add your terminal app |
+| **Screen Recording** | System Settings → Privacy & Security → Screen Recording → add your terminal app |
 
-1. Open **System Settings -> Privacy & Security -> Accessibility**
-   - Add your terminal app (Terminal.app, iTerm2, Warp, etc.)
-2. Open **System Settings -> Privacy & Security -> Screen Recording**
-   - Add your terminal app
+> [!TIP]
+> Restart your terminal app entirely after granting permissions for them to take effect.
 
-*Note: Restart your terminal app entirely after granting these permissions.*
-
-### Step 4: Start the Server
+### 4 — Start the server
 
 ```bash
-# Ensure your virtual environment is active
-source .venv/bin/activate
-python automac_mcp.py
+uv run python automac_mcp.py
+# or, if installed as a package:
+automac-mcp
 ```
 
-Upon starting, the server will prompt you:
-1. **Telegram Setup:** (Optional) Enter your Telegram Bot Token and Chat ID to allow the server to send files to you.
-2. **ngrok Setup:** (Optional but required for cloud bots) Provide your [ngrok authtoken](https://dashboard.ngrok.com) to securely expose the server to the internet via a temporary tunnel.
+On startup the server will optionally prompt for Telegram and ngrok setup (see [Optional Setup](#optional-setup)). Once running:
 
-You should see output similar to:
-```text
+```
 Mac Orchestrator
 Your local MCP server for macOS UI automation.
 ...
 SUCCESS! Mac Orchestrator is now live.
-🔗 https://[random-string].ngrok-free.app/mcp
+🔗 https://xxxx-xx-xx.ngrok-free.app/mcp
 ```
-*(If you skip ngrok, the URL will be `http://127.0.0.1:8000/mcp`)*
 
-### Step 5: Connect Your AI App
+### 5 — Connect your AI
 
-Copy the provided MCP URL (`https://...ngrok-free.app/mcp` for cloud bots, or `http://localhost:8000/mcp` for local desktop apps) and provide it to your AI agent or platform that supports external MCP connections.
+Copy the MCP URL and add it to your AI app or agent as an external MCP server:
+- **Cloud agent (Claude.ai, custom API agent):** use the `https://...ngrok-free.app/mcp` URL
+- **Local desktop app:** use `http://localhost:8000/mcp`
 
-## 🛠️ MCP Tools (18 Tools)
+---
 
-Mac Orchestrator provides a lean, powerful set of tools designed so any AI agent can understand them at first glance:
+## MCP Tools — 20 Tools
 
-### Keyboard & Mouse
+### Keyboard & Input
+
 | Tool | Description |
 |---|---|
-| `press_keystroke(key, modifiers)` | Press any key with optional modifiers. Replaces all individual shortcut tools. E.g., `key="c", modifiers=["command"]` for Copy. |
-| `mouse_action(x, y, action, hold_keys)` | Click, double-click, right-click, or move the mouse. Supports modifier-held clicks. |
-| `type_text(text)` | Type a string of text into the focused field. |
+| `press_keystroke(key, modifiers)` | Press any key with optional modifiers. `key="c", modifiers=["command"]` → ⌘C. |
+| `type_text(text, use_clipboard)` | Type a string into the focused field. Auto-uses clipboard for non-ASCII (Unicode, CJK, emoji). |
 | `scroll(dx, dy)` | Pixel-precise horizontal and vertical scrolling. |
 
-### Macro Execution
-| Tool | Description |
-|---|---|
-| `execute_macro(actions, default_delay_ms)` | **Chain multiple UI actions in one call.** Accepts a list of action dicts and executes them sequentially with a configurable inter-step delay (default 750ms) so macOS UI has time to animate. Supports: keystroke, type, click, scroll, focus_app, delay. |
+### Mouse
 
-### Screen Comprehension
 | Tool | Description |
 |---|---|
-| `get_screen_size()` | Screen dimensions in pixels. |
-| `get_screen_layout()` | Window positions, apps, and layout via native Accessibility APIs. |
-| `get_screen_text()` | Read all on-screen text via OCR with coordinate bounding boxes. |
+| `mouse_action(x, y, action, hold_keys, end_x, end_y)` | Click, double-click, right-click, move, or **drag**. Accepts logical coordinates (matches OCR output). For drag, provide `end_x`/`end_y`. |
+
+### Macro Execution
+
+| Tool | Description |
+|---|---|
+| `execute_macro(actions, default_delay_ms)` | **Chain multiple actions in a single call.** Executes keystroke, type, click, scroll, focus_app, run_command, write_file, set_clipboard, and delay steps sequentially with configurable inter-step timing (default 750 ms). Returns per-step results and a `recovery_hint` on failure. |
+
+### App Management
+
+| Tool | Description |
+|---|---|
 | `focus_app(app_name, timeout)` | Bring an app to the foreground and wait for it to become active. |
 | `get_available_apps()` | List all currently running applications. |
 
-### Terminal & File System
+### Screen
+
 | Tool | Description |
 |---|---|
-| `run_terminal_command(command, timeout_seconds, run_in_background)` | Run shell commands with configurable timeout (up to 300s) and optional background mode that returns a PID. |
-| `find_file(query, search_dir, file_type, sort_by, limit, include_source)` | **Spotlight-powered file search** via `mdfind`. Supports sorting, limits, and fetching source URLs (caution: may slow down search). |
-| `read_file(path, preview, preview_size_kb)` | Read file contents. Supports preview mode (head and tail) to save context window. |
-| `write_file(path, content)` | Write/overwrite a file (auto-creates parent dirs). |
-| `list_directory(path, limit, sort_by, summary_only)` | List directory contents. Supports sorting, limits, and a high-level summary mode (file counts, sizes, age distribution). |
-| `smart_search(directory, regex_pattern, file_extension_filter)` | Regex search inside files within a directory. |
+| `get_screen_size()` | Returns `logical_width/height`, `pixel_width/height`, and `scale_factor`. |
+| `get_screen_layout()` | Window list with positions and app names via the native Accessibility API. |
+| `get_screen_text(screenshot)` | **OCR mode** (default): returns `text_elements` with bounding boxes in logical coords — pass directly to `mouse_action`. **Screenshot mode** (`screenshot=True`): saves a timestamped PNG to `~/Desktop/` and returns the path. |
+
+### Terminal
+
+| Tool | Description |
+|---|---|
+| `run_terminal_command(command, timeout_seconds, run_in_background, max_output_chars)` | Run any shell command. Timeout up to 300 s. Background mode returns a PID immediately. Output capped at `max_output_chars` (default 10 000). |
+
+### File System
+
+| Tool | Description |
+|---|---|
+| `find_file(query, search_dir, file_type, sort_by, limit)` | Spotlight-powered file search via `mdfind`. Filter by type, sort by date or name, limit results. |
+| `vector_search(query)` | Semantic search over your indexed files via Cloudflare RAG (requires `indexer.py` setup). |
+| `read_file(path, preview, preview_size_kb, preview_lines)` | Read file contents. Preview mode returns head + tail to save context window. |
+| `write_file(path, content, mode)` | Write or append to a file. `mode="append"` adds to the end; parent dirs are auto-created. |
+| `list_directory(path, limit, sort_by, summary_only, offset)` | List directory contents with sorting, pagination, and a high-level summary mode. |
+| `smart_search(directory, regex_pattern, file_extension_filter, max_chars)` | Regex search inside files within a directory. Returns matched lines with file paths. |
 
 ### Utility
+
 | Tool | Description |
 |---|---|
-| `play_sound_for_user_prompt()` | Play the macOS system bell to alert the user. |
-| `send_file_to_telegram(file_path, caption)` | Send a file to the user via Telegram. |
+| `clipboard(action, content)` | Get or set clipboard contents. Unicode-safe. `action="get"` returns content + length; `action="set"` loads text into the clipboard. |
+| `play_sound_for_user_prompt()` | Play the macOS system bell to alert the user that input is needed. |
+| `send_file_to_telegram(file_path, caption)` | Send a file to the user via Telegram bot. |
 
-### Standardized Responses
+---
 
-Every tool returns a consistent JSON envelope:
+## Coordinate System
+
+All screen tools use **logical** coordinates consistently — no manual Retina scaling needed:
+
+- `get_screen_size()` → `logical_width / logical_height` (e.g. 1280 × 832 on a 14" MacBook Pro)
+- `get_screen_text()` → OCR positions already in logical space
+- `mouse_action()` → accepts logical coords, calls `_scale()` internally
+
+Do not use `pixel_width / pixel_height` for mouse targeting. Use `logical_width / logical_height`.
+
+---
+
+## Standardized Responses
+
+Every tool returns a consistent JSON envelope. Always check `status` before using other fields.
+
 ```json
-{"status": "success", "message": "Human-readable summary", ...}
-{"status": "error", "message": "What went wrong", ...}
+{ "status": "success", "message": "...", ...tool_data }
+{ "status": "error",   "message": "...", "error_code": "PERMISSION" }
 ```
 
-## 🛡️ Architecture & Safety
+**Error codes:** `PERMISSION` · `TIMEOUT` · `NOT_FOUND` · `INVALID_PARAM` · `EXEC_ERROR` · `GENERIC`
 
-Mac Orchestrator is built on top of [FastMCP](https://github.com/jlowin/fastmcp), converting incoming JSON-RPC calls over HTTP into native macOS executions via `pyobjc`, `pyautogui`, and `osascript`. 
+---
 
-**Safety nets implemented:**
-- **Graceful Failures:** Operations that interact with the system or external programs are wrapped with robust exception handlers and strict timeouts, returning formatted JSON errors to the agent rather than crashing the MCP process.
-- **Lazy Loading:** Heavy dependencies like OCR models are dynamically loaded on their first execution, ensuring near-instantaneous startup times.
-- **Macro Timing:** The `execute_macro` tool inserts realistic delays (750ms default) between UI actions, preventing race conditions where the AI fires actions faster than macOS can animate.
+## Common Patterns
 
-## 🐛 Troubleshooting
+**Type Unicode text into an app:**
+```python
+execute_macro([
+    {"action": "focus_app", "app": "Notes"},
+    {"action": "keystroke", "key": "n", "modifiers": ["command"]},
+    {"action": "delay", "ms": 500},
+    {"action": "type", "text": "café ñoño 你好"}
+])
+```
+
+**Click something on screen using OCR:**
+```python
+elements = get_screen_text()["text_elements"]
+btn = next(e for e in elements if "Submit" in e["text"])
+mouse_action(x=btn["position"]["center_x"], y=btn["position"]["center_y"])
+```
+
+**Run a shell command:**
+```python
+result = run_terminal_command("git log --oneline -10", timeout_seconds=10)
+print(result["stdout"])
+```
+
+**Take a timestamped screenshot:**
+```python
+result = get_screen_text(screenshot=True)
+# → {"screenshot_path": "~/Desktop/orchestrator_screenshot_20260101_120000.png", ...}
+```
+
+**Drag a file in Finder:**
+```python
+mouse_action(x=200, y=300, action="drag", end_x=500, end_y=300)
+```
+
+---
+
+## Optional Setup
+
+### Telegram Notifications
+
+Send files back to yourself from the agent. On startup, enter:
+1. `TELEGRAM_BOT_TOKEN` — create a bot via [@BotFather](https://t.me/botfather)
+2. `TELEGRAM_CHAT_ID` — get it from [@userinfobot](https://t.me/userinfobot)
+
+Or persist them in `~/.config/mac-orchestrator/config.json`:
+```json
+{
+  "TELEGRAM_BOT_TOKEN": "...",
+  "TELEGRAM_CHAT_ID": "..."
+}
+```
+
+### Remote Access via ngrok
+
+Required for cloud AI agents that cannot reach `localhost`. On startup, provide your [ngrok authtoken](https://dashboard.ngrok.com). The server will print a public `https://...ngrok-free.app/mcp` URL to share with your agent.
+
+---
+
+## Architecture & Safety
+
+Mac Orchestrator is built on [FastMCP](https://github.com/jlowin/fastmcp), which translates incoming MCP JSON-RPC calls over HTTP into native macOS system calls via `pyobjc`, `pyautogui`, and `osascript`.
+
+**Safety mechanisms:**
+- **Graceful failures** — every tool catches exceptions and returns a structured JSON error rather than crashing the server process.
+- **Strict timeouts** — AppleScript and subprocess calls have configurable timeouts; the server stays responsive even if a command hangs.
+- **Lazy OCR loading** — EasyOCR and its PyTorch weights are loaded on the first `get_screen_text` call, not at import time, keeping startup near-instant.
+- **Macro timing** — `execute_macro` inserts 750 ms delays between steps by default, preventing race conditions caused by firing actions faster than macOS can animate.
+- **pyautogui failsafe** — moving the mouse to the top-left corner of the screen aborts all pyautogui actions immediately.
+
+---
+
+## Troubleshooting
 
 | Symptom | Fix |
 |---|---|
-| AI attempts to click but nothing happens | Verify **Accessibility** permissions for your terminal app in System Settings. |
-| Server throws port conflict errors | A previous instance might still be running. Use `lsof -i :8000` to find it and `kill -9 <PID>`, or change the port in `automac_mcp.py`. |
-| OCR takes 10+ seconds on the first call | `easyocr` downloads PyTorch model weights on its initial execution. Give it a moment to download. Subsequent calls will be fast. |
+| Click / keyboard actions do nothing | Grant **Accessibility** permission for your terminal app in System Settings → Privacy & Security. |
+| `PERMISSION` error on screen tools | Grant **Screen Recording** permission for your terminal app. Restart the terminal after granting. |
+| Port 8000 already in use | Run `lsof -i :8000` to find the process, then `kill <PID>`. Or change the port in `automac_mcp.py`. |
+| First `get_screen_text` call is slow (~5 s) | EasyOCR downloads PyTorch model weights on first run. Subsequent calls are fast. |
+| ngrok tunnel not appearing | Ensure you provided a valid authtoken. Free ngrok accounts allow one simultaneous tunnel. |
 
-For best visual AI comprehension results, it is recommended to enable **Increase Contrast** in *System Settings -> Accessibility -> Display*.
+---
+
+## License
+
+[CC0 1.0 Universal](LICENSE) — public domain dedication. Use freely, no attribution required.

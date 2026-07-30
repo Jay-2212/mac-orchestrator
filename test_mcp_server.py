@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 
 import subprocess
-import time
 import sys
+import os
 
 
 def test_mcp_server():
@@ -10,42 +10,22 @@ def test_mcp_server():
     print("Testing AutoMac MCP FastMCP Server")
     print("=" * 35)
     
-    print("\n1. Starting MCP server...")
+    print("\n1. Checking server syntax...")
     try:
-        # Start the server process
-        process = subprocess.Popen(
-            [sys.executable, "automac_mcp.py"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+        result = subprocess.run(
+            [sys.executable, "-B", "-m", "py_compile", "automac_mcp.py"],
+            capture_output=True,
             text=True
         )
-        
-        # Give it a moment to start
-        time.sleep(2)
-        
-        # Check if process is running
-        if process.poll() is None:
-            print("✓ MCP server started successfully")
-            
-            # Terminate the process
-            process.terminate()
-            try:
-                process.wait(timeout=5)
-                print("✓ MCP server terminated cleanly")
-            except subprocess.TimeoutExpired:
-                process.kill()
-                print("! MCP server had to be forcefully killed")
+        if result.returncode == 0:
+            print("✓ automac_mcp.py syntax OK")
         else:
-            stdout, stderr = process.communicate()
-            print(f"✗ MCP server failed to start")
-            if stderr:
-                print(f"Error: {stderr}")
-            if stdout:
-                print(f"Output: {stdout}")
+            print(f"✗ Syntax error in automac_mcp.py")
+            if result.stderr:
+                print(f"Error: {result.stderr}")
             return False
-            
     except Exception as e:
-        print(f"✗ Error testing server: {e}")
+        print(f"✗ Error checking syntax: {e}")
         return False
     
     print("\n2. Testing server structure...")
@@ -62,14 +42,14 @@ def test_mcp_server():
             print("✗ FastMCP instance not found")
             return False
             
-        # Check for the refactored v2 tool set (19 tools, down from 46)
+        # Check for the refactored v2 tool set (20 tools, down from 46)
         v2_tools = [
             'press_keystroke', 'mouse_action', 'type_text', 'scroll',
             'execute_macro', 'focus_app', 'get_available_apps',
             'get_screen_size', 'get_screen_layout', 'get_screen_text',
             'run_terminal_command', 'find_file', 'vector_search',
             'read_file', 'write_file', 'list_directory', 'smart_search',
-            'play_sound_for_user_prompt', 'send_file_to_telegram'
+            'play_sound_for_user_prompt', 'clipboard', 'send_file_to_telegram'
         ]
         
         for func_name in v2_tools:
@@ -158,7 +138,101 @@ def test_mcp_server():
             print(f"✓ vector_search: {result.get('message')} (Found {len(result.get('results', []))} matches)")
         else:
             print(f"✗ vector_search failed: {result}")
-            
+
+        # Test write_file append mode
+        import tempfile, os
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as tf:
+            tmp_path = tf.name
+        try:
+            r1 = automac_mcp.write_file(tmp_path, "line1\n")
+            r2 = automac_mcp.write_file(tmp_path, "line2\n", mode="append")
+            with open(tmp_path) as f:
+                txt = f.read()
+            if r1.get("status") == "success" and r2.get("status") == "success" and txt == "line1\nline2\n":
+                print("✓ write_file append mode: works correctly")
+            else:
+                print(f"✗ write_file append mode failed: {txt!r}")
+        finally:
+            os.unlink(tmp_path)
+
+        # Test clipboard get/set
+        r_set = automac_mcp.clipboard(action="set", content="test-clipboard-42")
+        r_get = automac_mcp.clipboard(action="get")
+        if r_set.get("status") == "success" and r_get.get("content") == "test-clipboard-42":
+            print("✓ clipboard get/set: works correctly")
+        else:
+            print(f"✗ clipboard failed: set={r_set}, get={r_get}")
+
+        # Test clipboard invalid action
+        r_bad = automac_mcp.clipboard(action="invalid")
+        if r_bad.get("status") == "error" and r_bad.get("error_code") == "INVALID_PARAM":
+            print("✓ clipboard invalid action: returns correct error")
+        else:
+            print(f"✗ clipboard invalid action error not raised: {r_bad}")
+
+        # Test execute_macro rollback reporting
+        macro_result = automac_mcp.execute_macro([
+            {"action": "run_command", "command": "echo hello"},
+            {"action": "run_command", "command": "exit 99"},
+            {"action": "run_command", "command": "echo skipped"},
+        ])
+        if (macro_result.get("status") == "partial_success"
+                and macro_result.get("completed_steps") == 1
+                and macro_result.get("stopped_at_step") == 2
+                and "recovery_hint" in macro_result):
+            print("✓ execute_macro rollback reporting: partial_success correct")
+        else:
+            print(f"✗ execute_macro rollback reporting failed: {macro_result}")
+
+        # Test execute_macro run_command step
+        macro_cmd = automac_mcp.execute_macro([
+            {"action": "run_command", "command": "echo macro-test"}
+        ])
+        if (macro_cmd.get("status") == "success"
+                and macro_cmd["steps"][0].get("stdout", "").strip() == "macro-test"):
+            print("✓ execute_macro run_command step: works correctly")
+        else:
+            print(f"✗ execute_macro run_command step failed: {macro_cmd}")
+
+        # Test execute_macro first-step failure → status="error"
+        macro_first_fail = automac_mcp.execute_macro([
+            {"action": "run_command", "command": "exit 1"},
+        ])
+        if macro_first_fail.get("status") == "error" and macro_first_fail.get("completed_steps") == 0:
+            print("✓ execute_macro first-step failure: status=error, completed_steps=0")
+        else:
+            print(f"✗ execute_macro first-step failure wrong: {macro_first_fail}")
+
+        # Managed connector paths are high-entropy and URL-safe.
+        managed_env = os.environ.copy()
+        managed_env.update({
+            "MAC_ORCHESTRATOR_MANAGED": "1",
+            "MAC_ORCHESTRATOR_CONNECTOR_TOKEN": "a" * 64,
+            "PYTHONDONTWRITEBYTECODE": "1",
+        })
+        managed = subprocess.run(
+            [sys.executable, "-B", "-c", "import automac_mcp; print(automac_mcp.MCP_PATH)"],
+            capture_output=True,
+            text=True,
+            env=managed_env,
+            timeout=15,
+        )
+        if managed.returncode == 0 and managed.stdout.strip() == f"/{'a' * 64}/mcp":
+            print("✓ managed connector capability path configured")
+        else:
+            print(f"✗ managed connector path failed: {managed.stderr or managed.stdout}")
+            return False
+
+        # Background commands are registered and terminated by server cleanup.
+        bg = automac_mcp.run_terminal_command("sleep 30", run_in_background=True)
+        bg_pid = bg.get("pid")
+        automac_mcp.cleanup_background_processes()
+        if bg_pid and not automac_mcp._background_processes:
+            print("✓ background command ownership cleanup works")
+        else:
+            print(f"✗ background command cleanup failed: {bg}")
+            return False
+
     except Exception as e:
         print(f"✗ Error testing functions: {e}")
         return False

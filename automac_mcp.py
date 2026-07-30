@@ -14,6 +14,9 @@ import os
 import sys
 import re
 import signal
+import atexit
+import logging
+import threading
 import requests
 from datetime import datetime
 from pathlib import Path
@@ -41,14 +44,79 @@ except ImportError:
 TELEGRAM_BOT_TOKEN = ""
 TELEGRAM_CHAT_ID = ""
 
+MANAGED_MODE = os.getenv("MAC_ORCHESTRATOR_MANAGED") == "1"
+CONNECTOR_TOKEN = os.getenv("MAC_ORCHESTRATOR_CONNECTOR_TOKEN", "").strip()
+if CONNECTOR_TOKEN and not re.fullmatch(r"[A-Za-z0-9_-]{32,128}", CONNECTOR_TOKEN):
+    raise RuntimeError("MAC_ORCHESTRATOR_CONNECTOR_TOKEN must be 32-128 URL-safe characters")
+
+MCP_PATH = f"/{CONNECTOR_TOKEN}/mcp" if CONNECTOR_TOKEN else "/mcp"
+
+# A remote tunnel preserves its public Host header. Managed mode therefore uses
+# a high-entropy capability path as the authentication boundary and disables
+# Host validation. Direct local development keeps FastMCP's loopback defaults.
+transport_security = (
+    TransportSecuritySettings(enable_dns_rebinding_protection=False)
+    if MANAGED_MODE
+    else None
+)
 mcp = FastMCP(
     "AutoMac MCP - macOS UI Automation",
-    host="127.0.0.1", port=8000,
-    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False)
+    host="127.0.0.1",
+    port=8000,
+    streamable_http_path=MCP_PATH,
+    transport_security=transport_security,
 )
 
 pyautogui.FAILSAFE = True
 _ocr_reader = None
+_background_processes: dict[int, subprocess.Popen] = {}
+_background_processes_lock = threading.Lock()
+
+
+def _reap_background_processes() -> None:
+    with _background_processes_lock:
+        finished = [pid for pid, proc in _background_processes.items() if proc.poll() is not None]
+        for pid in finished:
+            _background_processes.pop(pid, None)
+
+
+def cleanup_background_processes() -> None:
+    """Terminate only background commands launched by this server instance."""
+    with _background_processes_lock:
+        processes = list(_background_processes.values())
+        _background_processes.clear()
+
+    for proc in processes:
+        if proc.poll() is not None:
+            continue
+        try:
+            if MANAGED_MODE:
+                # Managed children share the server's process group. The native
+                # supervisor terminates that entire group on forced shutdown.
+                proc.terminate()
+            else:
+                os.killpg(proc.pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+
+    deadline = time.monotonic() + 2.0
+    for proc in processes:
+        if proc.poll() is not None:
+            continue
+        remaining = max(0.0, deadline - time.monotonic())
+        try:
+            proc.wait(timeout=remaining)
+        except subprocess.TimeoutExpired:
+            try:
+                if MANAGED_MODE:
+                    proc.kill()
+                else:
+                    os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+
+
+atexit.register(cleanup_background_processes)
 
 def get_ocr_reader():
     """Lazy-load the EasyOCR reader so startup stays fast."""
@@ -773,8 +841,12 @@ def run_terminal_command(command: str, timeout_seconds: int = 30,
     timeout_seconds = max(1, min(timeout_seconds, 300))
     try:
         if run_in_background:
+            _reap_background_processes()
             proc = subprocess.Popen(command, shell=True, stdout=subprocess.DEVNULL,
-                                    stderr=subprocess.DEVNULL, start_new_session=True)
+                                    stderr=subprocess.DEVNULL,
+                                    start_new_session=not MANAGED_MODE)
+            with _background_processes_lock:
+                _background_processes[proc.pid] = proc
             return _ok(f"Background process started (PID {proc.pid})", pid=proc.pid)
         r = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=timeout_seconds)
 
@@ -943,7 +1015,7 @@ def vector_search(query: str) -> Dict[str, Any]:
         return _fail("query is required")
     try:
         url = "https://mac-brain-worker.jb-brain.workers.dev/search"
-        token = os.getenv("INGEST_TOKEN", "mac-brain-secret-key-123")
+        token = os.getenv("INGEST_TOKEN", "")
         config_path = os.path.expanduser("~/.config/mac-orchestrator/config.json")
         if os.path.exists(config_path):
             try:
@@ -952,6 +1024,29 @@ def vector_search(query: str) -> Dict[str, Any]:
                     token = config.get("INGEST_TOKEN", token)
             except Exception:
                 pass
+        if not token:
+            keychain = subprocess.run(
+                [
+                    "/usr/bin/security",
+                    "find-generic-password",
+                    "-a",
+                    os.getenv("USER", ""),
+                    "-s",
+                    "com.jay.mac-orchestrator.ingest-token",
+                    "-w",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if keychain.returncode == 0:
+                token = keychain.stdout.strip()
+        if not token:
+            return _fail(
+                "Vector search is not configured. Store INGEST_TOKEN in "
+                "~/.config/mac-orchestrator/config.json or the "
+                "com.jay.mac-orchestrator.ingest-token Keychain item."
+            )
         headers = {"Authorization": f"Bearer {token}"}
         resp = requests.get(url, params={"q": query}, headers=headers, timeout=10)
         if resp.status_code == 200:
@@ -1349,7 +1444,7 @@ def send_file_to_telegram(file_path: str, caption: str = "") -> Dict[str, Any]:
 
 console = Console()
 
-def setup_telegram():
+def setup_telegram(interactive: bool = True):
     """Sets up Telegram configuration securely."""
     global TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
     config_dir = os.path.expanduser("~/.config/mac-orchestrator")
@@ -1362,7 +1457,7 @@ def setup_telegram():
                 TELEGRAM_CHAT_ID = config.get("TELEGRAM_CHAT_ID", "")
     except Exception:
         pass
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    if interactive and (not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID):
         setup = Prompt.ask("\n[bold cyan]Do you want to configure Telegram integration for file sending?[/bold cyan]", choices=["y", "n"], default="y")
         if setup.lower() == 'y':
             console.print(Panel.fit(
@@ -1453,23 +1548,38 @@ def setup_ngrok():
         return None
 
 def main():
-    try:
-        subprocess.run("kill -9 $(lsof -t -i:8000)", shell=True, check=False, stderr=subprocess.DEVNULL)
-        time.sleep(0.5)
-    except Exception:
-        pass
+    owner = ""
+    if "--managed-owner" in sys.argv:
+        try:
+            owner = sys.argv[sys.argv.index("--managed-owner") + 1]
+        except IndexError:
+            raise SystemExit("--managed-owner requires a value")
+
+    if MANAGED_MODE:
+        # Make the server the leader of a process group. The native supervisor
+        # can then terminate this server and every command child it owns without
+        # touching unrelated processes.
+        try:
+            os.setpgrp()
+        except OSError:
+            pass
+        logging.getLogger("uvicorn.access").disabled = True
+
     console.print(Panel.fit(
         "[bold magenta]Mac Orchestrator[/bold magenta]\n"
         "Your local MCP server for macOS UI automation.",
         border_style="magenta"
     ))
-    setup_telegram()
-    public_url = setup_ngrok()
+    setup_telegram(interactive=not MANAGED_MODE)
+    public_url = None if MANAGED_MODE else setup_ngrok()
     if public_url:
         mcp_url = f"{public_url}/mcp"
         console.print("\n[bold green]SUCCESS! Mac Orchestrator is now live.[/bold green]")
         console.print(f"🔗 [bold underline cyan]{mcp_url}[/bold underline cyan]")
         console.print("\nPaste this link into your cloud-hosted chatbots to give them access to this Mac.")
+    elif MANAGED_MODE:
+        console.print("\n[bold green]Mac Orchestrator is starting in managed mode.[/bold green]")
+        console.print("The authenticated connector URL is available from the menu-bar app.")
     else:
         console.print("\n[bold green]Mac Orchestrator is starting locally.[/bold green]")
         console.print("🔗 [bold underline cyan]http://localhost:8000/mcp[/bold underline cyan]")
@@ -1480,6 +1590,7 @@ def main():
         pass
     finally:
         console.print("\n[yellow]Shutting down...[/yellow]")
+        cleanup_background_processes()
         if public_url:
             ngrok.kill()
 

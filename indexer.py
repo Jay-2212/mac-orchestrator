@@ -4,6 +4,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import sqlite3
 import json
+import subprocess
 import time
 import uuid
 import requests
@@ -54,7 +55,41 @@ SUPPORTED_EXTENSIONS = {".txt", ".md", ".json", ".pdf", ".docx", ".xlsx", ".csv"
 
 # REPLACE THIS with your deployed Cloudflare Worker URL or localhost for testing
 WORKER_URL = "https://mac-brain-worker.jb-brain.workers.dev"
-INGEST_TOKEN = os.getenv("INGEST_TOKEN", "mac-brain-secret-key-123")
+def load_ingest_token():
+    token = os.getenv("INGEST_TOKEN", "")
+    if token:
+        return token
+    config_path = os.path.expanduser("~/.config/mac-orchestrator/config.json")
+    try:
+        with open(config_path, "r") as config_file:
+            token = json.load(config_file).get("INGEST_TOKEN", "")
+    except (OSError, ValueError):
+        pass
+    if token:
+        return token
+    try:
+        result = subprocess.run(
+            [
+                "/usr/bin/security",
+                "find-generic-password",
+                "-a",
+                os.getenv("USER", ""),
+                "-s",
+                "com.jay.mac-orchestrator.ingest-token",
+                "-w",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return ""
+
+
+INGEST_TOKEN = load_ingest_token()
 
 DB_PATH = os.path.expanduser("~/Documents/mac-orchestrator/sync_state.db")
 CHUNK_SIZE = 500
@@ -470,4 +505,9 @@ def upload_batch(batch):
     return False
 
 if __name__ == "__main__":
+    if not INGEST_TOKEN:
+        raise SystemExit(
+            "INGEST_TOKEN is required. Configure it in the local config or "
+            "the com.jay.mac-orchestrator.ingest-token Keychain item."
+        )
     run_indexer()

@@ -1,290 +1,306 @@
-<h1 align="center">Mac Orchestrator</h1>
+# Mac Orchestrator
 
-<p align="center">
-  <strong>The only MCP server that unifies macOS UI control and terminal automation in a single, lean interface.</strong>
-</p>
+Mac Orchestrator is a personal macOS MCP server that lets trusted AI clients
+control this Mac through one authenticated connector URL. It combines native
+macOS UI automation, screen reading, file access, clipboard control, terminal
+commands, and macros in one FastMCP server.
 
-<p align="center">
-  <a href="https://github.com/Jay-2212/mac-orchestrator/stargazers"><img src="https://img.shields.io/github/stars/Jay-2212/mac-orchestrator?style=flat-square&color=yellow" alt="Stars"></a>
-  <a href="https://github.com/Jay-2212/mac-orchestrator/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-CC0--1.0-blue?style=flat-square" alt="License: CC0-1.0"></a>
-  <img src="https://img.shields.io/badge/python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python 3.10+">
-  <img src="https://img.shields.io/badge/platform-macOS-black?style=flat-square&logo=apple&logoColor=white" alt="macOS">
-  <img src="https://img.shields.io/badge/MCP%20tools-20-orange?style=flat-square" alt="20 MCP Tools">
-  <a href="https://github.com/jlowin/fastmcp"><img src="https://img.shields.io/badge/powered%20by-FastMCP-blueviolet?style=flat-square" alt="FastMCP"></a>
-</p>
+> **Personal installation only.** This repository is configured for Jay's Mac.
+> It is not a public installer, App Store product, or multi-user service.
 
----
+## Architecture
 
-Mac Orchestrator is a self-hosted [MCP](https://modelcontextprotocol.io) server that gives any AI agent 20 tools to fully control a Mac desktop. It is unique in combining both UI automation (keyboard, mouse, screen OCR, Accessibility API) and shell-level terminal access in a single lean server — no other macOS MCP does both.
-
-Run it locally or expose it over ngrok to connect it to any cloud AI agent or assistant.
-
-> [!WARNING]
-> This server grants an AI assistant direct, system-level control over your Mac. Only run it in environments you fully control. Never expose the port publicly without authentication.
-
-> [!NOTE]
-> **macOS only.** Requires Apple Silicon or Intel Mac. Windows and Linux are not supported.
-
----
-
-## How It Works
-
-```
-AI Agent (Claude, GPT, local LLM)
-         │
-         │  MCP over HTTP (JSON-RPC)
-         ▼
-http://localhost:8000/mcp   (or ngrok public URL for cloud agents)
-         │
-         ▼
- Mac Orchestrator MCP Server
-         │
-         ├── pyobjc / Accessibility API  →  Window layout, focus, key events
-         ├── pyautogui + CGEvent          →  Mouse, scroll, Retina-aware input
-         ├── osascript / AppleScript      →  App activation, keystroke dispatch
-         ├── EasyOCR                      →  On-screen text with bounding boxes
-         └── subprocess                   →  Shell commands, background jobs
+```text
+macOS LaunchAgent
+  └── Mac Orchestrator menu-bar app (Swift supervisor)
+        ├── Python FastMCP server → 127.0.0.1:8000
+        └── ngrok agent → authenticated capability URL → local server
 ```
 
----
+The native menu-bar app owns both child processes. The Python server no longer
+kills whatever happens to use port 8000, and it does not own ngrok in managed
+mode. The app records only the PIDs it launches, adds a per-installation
+ownership marker, and validates that marker before cleaning stale processes.
 
-## Quick Start
+The Swift supervisor:
 
-### Prerequisites
+- prevents duplicate app instances with an exclusive local lock;
+- starts the Python server in its own process group;
+- starts ngrok only after the local MCP health check passes;
+- stops public ingress before stopping the server;
+- uses bounded restart backoff and a crash-loop circuit breaker;
+- cleans owned stale processes after an app crash;
+- terminates MCP-launched background command processes on stop or quit;
+- reconnects and rechecks health after wake;
+- writes small rotating diagnostic logs.
 
-- macOS (Apple Silicon or Intel)
-- Python 3.10+
-- [`uv`](https://astral.sh/uv/) (recommended) or `pip`
+## Authentication model
 
-### 1 — Clone
+Managed installations use a 256-bit random capability token stored in macOS
+Keychain. The token is part of the MCP endpoint path:
+
+```text
+https://<current-ngrok-host>/<keychain-token>/mcp
+```
+
+Requests to the ordinary public `/mcp` path return `404`. The exact connector
+URL is available only from **Copy Connector URL** in the menu-bar app.
+
+Treat that URL like a password. Anyone who obtains it can invoke the enabled
+Mac tools without per-action approval. Do not paste it into documents, issues,
+logs, screenshots, or chat messages other than the trusted MCP connector
+configuration in ChatGPT or Claude.
+
+The supervisor redacts the capability token from captured server output and
+discards its own health-probe access lines so the capability path is not written
+to local logs. ngrok provides TLS for the public connection.
+This intentionally simple capability-URL boundary is optimized for maximum MCP
+client compatibility on a single-user personal system; it is not a substitute
+for multi-user OAuth authorization.
+
+To rotate a leaked connector token:
 
 ```bash
-git clone https://github.com/Jay-2212/mac-orchestrator.git
-cd mac-orchestrator
+security delete-generic-password \
+  -s com.jay.mac-orchestrator \
+  -a connector-capability-token
 ```
 
-### 2 — Install dependencies
+Then quit and relaunch Mac Orchestrator. Copy the new connector URL into each
+trusted client.
+
+## Personal install or update
+
+Prerequisites:
+
+- macOS on Apple Silicon;
+- `uv`;
+- an ngrok account and authtoken already configured at
+  `~/Library/Application Support/ngrok/ngrok.yml`.
+
+From this checkout:
 
 ```bash
-# Using uv (recommended)
+./script/distribute.sh
+```
+
+The script:
+
+1. builds the Swift app in release mode;
+2. ad-hoc signs the personal app and bundled ngrok executable;
+3. installs the app at `/Applications/Mac Orchestrator.app`;
+4. installs a self-contained Python environment under
+   `~/Library/Application Support/Mac Orchestrator/runtime`;
+5. installs `~/Library/LaunchAgents/com.jay.mac-orchestrator.plist`;
+6. launches the menu-bar app.
+
+Run the same command to update the installation. It asks the running app to
+quit cleanly before replacing files. No Developer ID, notarization, App Store,
+or public-distribution packaging is performed.
+
+After installation, startup and login recovery do not require Terminal.
+
+## First launch and permissions
+
+The server starts automatically. Public ingress is disabled until you choose
+**Enable Public Connector** in the menu.
+
+The automation tools need:
+
+- **Accessibility** for keystrokes, clicks, app focus, and window information;
+- **Screen & System Audio Recording** for screenshots and OCR;
+- **Automation** permission when macOS asks to control System Events or another
+  application.
+
+Grant the permission to the installed Mac Orchestrator/Python helper shown by
+System Settings, then use **Restart** from the menu. Existing Terminal
+permissions do not necessarily transfer to the installed helper.
+
+## Menu-bar controls
+
+The status dot summarizes the product state:
+
+- green: server and public connector running;
+- blue: local server running, public connector disabled;
+- yellow: starting, stopping, or reconnecting;
+- red: failure that needs attention;
+- gray: stopped.
+
+The menu shows:
+
+- server status;
+- tunnel status;
+- current connector host;
+- **Copy Connector URL**;
+- **Start Server** / **Stop Server**;
+- **Enable Public Connector** / **Disable Public Connector**;
+- **Restart**;
+- **Open Logs**;
+- login-launch status;
+- **Quit Mac Orchestrator**.
+
+Quit always closes ngrok first, stops the Python process group, removes owned
+background jobs, and exits cleanly. Because the LaunchAgent records a successful
+exit, it does not immediately reopen the app. It starts again at the next login;
+you can also open `/Applications/Mac Orchestrator.app` manually.
+
+The public-connector preference persists. A fresh install defaults to disabled.
+After you explicitly enable it, login/crash recovery restores it automatically.
+
+## Connect ChatGPT or Claude
+
+1. Choose **Enable Public Connector**.
+2. Wait until the status dot is green.
+3. Choose **Copy Connector URL**.
+4. Paste the URL as a custom remote MCP connector in ChatGPT or Claude.
+5. Complete the client's one-time connector setup.
+
+Normal tool use does not show Mac Orchestrator per-action approval prompts. The
+connector capability URL is the trust boundary.
+
+The installer tightens existing mac-orchestrator and ngrok configuration files
+to owner-only permissions when those files are present. The connector token is
+stored in Keychain and redacted from managed server logs.
+
+The optional vector-search ingest credential is also read from the
+`com.jay.mac-orchestrator.ingest-token` Keychain item, with the existing local
+config retained as a development fallback. It is never stored in this
+repository.
+
+Free ngrok endpoints may change if the account loses its assigned endpoint.
+When that happens, use **Copy Connector URL** again and update the client.
+
+## Local development
+
+The existing Python workflow remains available:
+
+```bash
 uv sync
-
-# Or pip
-python3 -m venv .venv && source .venv/bin/activate && pip install -e .
+uv run python automac_mcp.py
 ```
 
-### 3 — Grant macOS permissions
+Direct development listens on `http://127.0.0.1:8000/mcp` and retains the
+interactive Telegram/ngrok setup. It never kills an existing port-8000
+listener; startup fails normally and leaves that process untouched.
 
-The server needs two permissions. If missing, UI tools fail gracefully with a `PERMISSION` error.
-
-| Permission | Where to grant |
-|---|---|
-| **Accessibility** | System Settings → Privacy & Security → Accessibility → add your terminal app |
-| **Screen Recording** | System Settings → Privacy & Security → Screen Recording → add your terminal app |
-
-> [!TIP]
-> Restart your terminal app entirely after granting permissions for them to take effect.
-
-### 4 — Start the server
+For the native development bundle:
 
 ```bash
-uv run python automac_mcp.py
-# or, if installed as a package:
-automac-mcp
+./script/build_and_run.sh
+./script/build_and_run.sh --verify
 ```
 
-On startup the server will optionally prompt for Telegram and ngrok setup (see [Optional Setup](#optional-setup)). Once running:
+## MCP tools
 
-```
-Mac Orchestrator
-Your local MCP server for macOS UI automation.
-...
-SUCCESS! Mac Orchestrator is now live.
-🔗 https://xxxx-xx-xx.ngrok-free.app/mcp
-```
-
-### 5 — Connect your AI
-
-Copy the MCP URL and add it to your AI app or agent as an external MCP server:
-- **Cloud agent (Claude.ai, custom API agent):** use the `https://...ngrok-free.app/mcp` URL
-- **Local desktop app:** use `http://localhost:8000/mcp`
-
----
-
-## MCP Tools — 20 Tools
-
-### Keyboard & Input
-
-| Tool | Description |
+| Area | Tools |
 |---|---|
-| `press_keystroke(key, modifiers)` | Press any key with optional modifiers. `key="c", modifiers=["command"]` → ⌘C. |
-| `type_text(text, use_clipboard)` | Type a string into the focused field. Auto-uses clipboard for non-ASCII (Unicode, CJK, emoji). |
-| `scroll(dx, dy)` | Pixel-precise horizontal and vertical scrolling. |
+| Keyboard and pointer | `press_keystroke`, `type_text`, `mouse_action`, `scroll` |
+| Macros and apps | `execute_macro`, `focus_app`, `get_available_apps` |
+| Screen | `get_screen_size`, `get_screen_layout`, `get_screen_text` |
+| Terminal | `run_terminal_command` |
+| Files | `find_file`, `vector_search`, `read_file`, `write_file`, `list_directory`, `smart_search` |
+| Utility | `clipboard`, `play_sound_for_user_prompt`, `send_file_to_telegram` |
 
-### Mouse
+All 20 existing tool names and normal arguments remain unchanged.
 
-| Tool | Description |
-|---|---|
-| `mouse_action(x, y, action, hold_keys, end_x, end_y)` | Click, double-click, right-click, move, or **drag**. Accepts logical coordinates (matches OCR output). For drag, provide `end_x`/`end_y`. |
+Background terminal commands are still supported, but the server now registers
+them and terminates them during managed shutdown. Synchronous commands remain
+bounded to a maximum 300-second timeout and output is capped.
 
-### Macro Execution
+## Logs and state
 
-| Tool | Description |
-|---|---|
-| `execute_macro(actions, default_delay_ms)` | **Chain multiple actions in a single call.** Executes keystroke, type, click, scroll, focus_app, run_command, write_file, set_clipboard, and delay steps sequentially with configurable inter-step timing (default 750 ms). Returns per-step results and a `recovery_hint` on failure. |
+Open the log folder from the menu, or inspect:
 
-### App Management
-
-| Tool | Description |
-|---|---|
-| `focus_app(app_name, timeout)` | Bring an app to the foreground and wait for it to become active. |
-| `get_available_apps()` | List all currently running applications. |
-
-### Screen
-
-| Tool | Description |
-|---|---|
-| `get_screen_size()` | Returns `logical_width/height`, `pixel_width/height`, and `scale_factor`. |
-| `get_screen_layout()` | Window list with positions and app names via the native Accessibility API. |
-| `get_screen_text(screenshot)` | **OCR mode** (default): returns `text_elements` with bounding boxes in logical coords — pass directly to `mouse_action`. **Screenshot mode** (`screenshot=True`): saves a timestamped PNG to `~/Desktop/` and returns the path. |
-
-### Terminal
-
-| Tool | Description |
-|---|---|
-| `run_terminal_command(command, timeout_seconds, run_in_background, max_output_chars)` | Run any shell command. Timeout up to 300 s. Background mode returns a PID immediately. Output capped at `max_output_chars` (default 10 000). |
-
-### File System
-
-| Tool | Description |
-|---|---|
-| `find_file(query, search_dir, file_type, sort_by, limit)` | Spotlight-powered file search via `mdfind`. Filter by type, sort by date or name, limit results. |
-| `vector_search(query)` | Semantic search over your indexed files via Cloudflare RAG (requires `indexer.py` setup). |
-| `read_file(path, preview, preview_size_kb, preview_lines)` | Read file contents. Preview mode returns head + tail to save context window. |
-| `write_file(path, content, mode)` | Write or append to a file. `mode="append"` adds to the end; parent dirs are auto-created. |
-| `list_directory(path, limit, sort_by, summary_only, offset)` | List directory contents with sorting, pagination, and a high-level summary mode. |
-| `smart_search(directory, regex_pattern, file_extension_filter, max_chars)` | Regex search inside files within a directory. Returns matched lines with file paths. |
-
-### Utility
-
-| Tool | Description |
-|---|---|
-| `clipboard(action, content)` | Get or set clipboard contents. Unicode-safe. `action="get"` returns content + length; `action="set"` loads text into the clipboard. |
-| `play_sound_for_user_prompt()` | Play the macOS system bell to alert the user that input is needed. |
-| `send_file_to_telegram(file_path, caption)` | Send a file to the user via Telegram bot. |
-
----
-
-## Coordinate System
-
-All screen tools use **logical** coordinates consistently — no manual Retina scaling needed:
-
-- `get_screen_size()` → `logical_width / logical_height` (e.g. 1280 × 832 on a 14" MacBook Pro)
-- `get_screen_text()` → OCR positions already in logical space
-- `mouse_action()` → accepts logical coords, calls `_scale()` internally
-
-Do not use `pixel_width / pixel_height` for mouse targeting. Use `logical_width / logical_height`.
-
----
-
-## Standardized Responses
-
-Every tool returns a consistent JSON envelope. Always check `status` before using other fields.
-
-```json
-{ "status": "success", "message": "...", ...tool_data }
-{ "status": "error",   "message": "...", "error_code": "PERMISSION" }
+```text
+~/Library/Logs/Mac Orchestrator/app.log
+~/Library/Logs/Mac Orchestrator/server.log
+~/Library/Logs/Mac Orchestrator/tunnel.log
+~/Library/Logs/Mac Orchestrator/launcher.log
 ```
 
-**Error codes:** `PERMISSION` · `TIMEOUT` · `NOT_FOUND` · `INVALID_PARAM` · `EXEC_ERROR` · `GENERIC`
+App, server, and tunnel logs rotate at approximately 2 MB with four backups.
+Secrets and connector paths are not intentionally logged.
 
----
+Owned-process state is stored with user-only permissions at:
 
-## Common Patterns
-
-**Type Unicode text into an app:**
-```python
-execute_macro([
-    {"action": "focus_app", "app": "Notes"},
-    {"action": "keystroke", "key": "n", "modifiers": ["command"]},
-    {"action": "delay", "ms": 500},
-    {"action": "type", "text": "café ñoño 你好"}
-])
+```text
+~/Library/Application Support/Mac Orchestrator/owned-processes.json
 ```
 
-**Click something on screen using OCR:**
-```python
-elements = get_screen_text()["text_elements"]
-btn = next(e for e in elements if "Submit" in e["text"])
-mouse_action(x=btn["position"]["center_x"], y=btn["position"]["center_y"])
-```
+Do not edit it while the app is running. Stale PIDs are harmless unless their
+current command line also contains this installation's ownership marker.
 
-**Run a shell command:**
-```python
-result = run_terminal_command("git log --oneline -10", timeout_seconds=10)
-print(result["stdout"])
-```
+## Lifecycle behavior
 
-**Take a timestamped screenshot:**
-```python
-result = get_screen_text(screenshot=True)
-# → {"screenshot_path": "~/Desktop/orchestrator_screenshot_20260101_120000.png", ...}
-```
-
-**Drag a file in Finder:**
-```python
-mouse_action(x=200, y=300, action="drag", end_x=500, end_y=300)
-```
-
----
-
-## Optional Setup
-
-### Telegram Notifications
-
-Send files back to yourself from the agent. On startup, enter:
-1. `TELEGRAM_BOT_TOKEN` — create a bot via [@BotFather](https://t.me/botfather)
-2. `TELEGRAM_CHAT_ID` — get it from [@userinfobot](https://t.me/userinfobot)
-
-Or persist them in `~/.config/mac-orchestrator/config.json`:
-```json
-{
-  "TELEGRAM_BOT_TOKEN": "...",
-  "TELEGRAM_CHAT_ID": "..."
-}
-```
-
-### Remote Access via ngrok
-
-Required for cloud AI agents that cannot reach `localhost`. On startup, provide your [ngrok authtoken](https://dashboard.ngrok.com). The server will print a public `https://...ngrok-free.app/mcp` URL to share with your agent.
-
----
-
-## Architecture & Safety
-
-Mac Orchestrator is built on [FastMCP](https://github.com/jlowin/fastmcp), which translates incoming MCP JSON-RPC calls over HTTP into native macOS system calls via `pyobjc`, `pyautogui`, and `osascript`.
-
-**Safety mechanisms:**
-- **Graceful failures** — every tool catches exceptions and returns a structured JSON error rather than crashing the server process.
-- **Strict timeouts** — AppleScript and subprocess calls have configurable timeouts; the server stays responsive even if a command hangs.
-- **Lazy OCR loading** — EasyOCR and its PyTorch weights are loaded on the first `get_screen_text` call, not at import time, keeping startup near-instant.
-- **Macro timing** — `execute_macro` inserts 750 ms delays between steps by default, preventing race conditions caused by firing actions faster than macOS can animate.
-- **pyautogui failsafe** — moving the mouse to the top-left corner of the screen aborts all pyautogui actions immediately.
-
----
+- **Server failure:** public ingress closes, then the server restarts with
+  bounded exponential backoff. The tunnel returns only after health succeeds.
+- **Tunnel failure/network loss:** the local server remains available and the
+  tunnel reconnects with bounded backoff.
+- **App crash:** launchd restarts the app. The new app validates and terminates
+  only the two stale owned children, then restores desired state.
+- **Duplicate launch:** the second app exits without changing the running
+  instance.
+- **Sleep/wake:** children remain quiescent during sleep; wake triggers an
+  immediate health/tunnel check.
+- **Logout/reboot:** macOS terminates the user LaunchAgent. `RunAtLoad` restores
+  the supervisor at the next login.
+- **Clean reinstall:** the installer requests clean app shutdown, updates the
+  runtime and bundle, then bootstraps one LaunchAgent.
 
 ## Troubleshooting
 
-| Symptom | Fix |
-|---|---|
-| Click / keyboard actions do nothing | Grant **Accessibility** permission for your terminal app in System Settings → Privacy & Security. |
-| `PERMISSION` error on screen tools | Grant **Screen Recording** permission for your terminal app. Restart the terminal after granting. |
-| Port 8000 already in use | Run `lsof -i :8000` to find the process, then `kill <PID>`. Or change the port in `automac_mcp.py`. |
-| First `get_screen_text` call is slow (~5 s) | EasyOCR downloads PyTorch model weights on first run. Subsequent calls are fast. |
-| ngrok tunnel not appearing | Ensure you provided a valid authtoken. Free ngrok accounts allow one simultaneous tunnel. |
+### Port 8000 is already in use
 
----
+Mac Orchestrator reports the conflict and leaves the listener untouched:
+
+```bash
+lsof -nP -iTCP:8000 -sTCP:LISTEN
+```
+
+Stop or reconfigure that application, then choose **Restart**.
+
+### Tunnel fails repeatedly
+
+Check `tunnel.log` and confirm the ngrok authtoken file exists:
+
+```bash
+ls -l ~/Library/Application\ Support/ngrok/ngrok.yml
+```
+
+The app stops after repeated failures rather than entering an unbounded restart
+loop. Fix the credential/network issue and choose **Restart**.
+
+### Connector returns 404
+
+The unauthenticated `/mcp` path is supposed to return 404. Use **Copy Connector
+URL** instead of constructing the URL manually.
+
+### Tools report permission errors
+
+Open System Settings → Privacy & Security and check Accessibility, Screen &
+System Audio Recording, and Automation. Restart the app afterward.
+
+### Verify the login job
+
+```bash
+launchctl print "gui/$(id -u)/com.jay.mac-orchestrator"
+```
+
+## Tests
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -B test_mcp_server.py
+swift build
+swift build -c release
+git diff --check
+```
+
+The Python suite verifies all 20 tools, representative tool behavior, managed
+capability-path configuration, and background-process cleanup. Installation
+acceptance additionally exercises local and public MCP initialization, duplicate
+prevention, owned server/tunnel crash recovery, app crash recovery, and clean
+quit cleanup.
 
 ## License
 
-[CC0 1.0 Universal](LICENSE) — public domain dedication. Use freely, no attribution required.
+[CC0 1.0 Universal](LICENSE).

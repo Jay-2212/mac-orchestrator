@@ -26,7 +26,6 @@ from rich.prompt import Prompt
 from rich.panel import Panel
 from typing import Any, Dict, List, Optional
 import pyautogui
-import numpy as np
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.server import TransportSecuritySettings
 try:
@@ -125,6 +124,12 @@ def get_ocr_reader():
         import easyocr
         _ocr_reader = easyocr.Reader(['en'])
     return _ocr_reader
+
+
+def screenshot_array(screenshot):
+    """Import NumPy only when OCR is actually requested."""
+    import numpy as np
+    return np.array(screenshot)
 
 # ── Response Helpers ──────────────────────────────────────────────────────────
 
@@ -798,7 +803,7 @@ def get_screen_text(screenshot: bool = False) -> Dict[str, Any]:
         lw, lh = pyautogui.size()
         scale_x = lw / ss.width
         scale_y = lh / ss.height
-        arr = np.array(ss)
+        arr = screenshot_array(ss)
         results = get_ocr_reader().readtext(arr)
         elements = []
         for (bbox, text, conf) in results:

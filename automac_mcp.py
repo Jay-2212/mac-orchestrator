@@ -32,10 +32,15 @@ try:
     from Cocoa import NSWorkspace
     from Quartz import (CGWindowListCopyWindowInfo, kCGWindowListOptionOnScreenOnly,
                         kCGNullWindowID, CGEventCreateScrollWheelEvent, CGEventPost,
-                        kCGScrollEventUnitPixel, kCGHIDEventTap)
+                        kCGScrollEventUnitPixel, kCGHIDEventTap,
+                        CGPreflightScreenCaptureAccess, CGSessionCopyCurrentDictionary)
     from ApplicationServices import (AXUIElementCreateApplication, AXUIElementCopyAttributeValue,
+                                     AXUIElementSetAttributeValue, AXUIElementPerformAction,
+                                     AXUIElementCopyActionNames, AXUIElementSetMessagingTimeout,
+                                     AXUIElementGetPid, AXValueGetValue, AXIsProcessTrusted,
                                      kAXWindowsAttribute, kAXTitleAttribute, kAXPositionAttribute,
-                                     kAXSizeAttribute, kAXRoleAttribute)
+                                     kAXSizeAttribute, kAXRoleAttribute, kAXChildrenAttribute,
+                                     kAXValueCGPointType, kAXValueCGSizeType)
     ACCESSIBILITY_AVAILABLE = True
 except ImportError:
     ACCESSIBILITY_AVAILABLE = False
@@ -58,12 +63,37 @@ transport_security = (
     if MANAGED_MODE
     else None
 )
+SERVER_PORT = int(os.getenv("MAC_ORCHESTRATOR_PORT", "8000"))
+
+SERVER_INSTRUCTIONS = """Mac Orchestrator gives you direct control of this macOS desktop.
+
+START HERE:
+- get_session_state() — call this first if you're about to do UI work. Tells you whether the
+  screen is unlocked/interactive, and whether Accessibility/Screen Recording permissions are
+  actually granted (not just theoretically available). Cheap, always safe to call.
+- describe(topic="overview") — full guide to macros, coordinate spaces, and UI inspection.
+  Tool descriptions below are intentionally short; call describe() for the deep version of any
+  of them before improvising.
+
+TWO WAYS TO FIND THINGS ON SCREEN:
+1. get_ui_tree(app=...) — structured accessibility tree (buttons, fields, labels, roles) with
+   stable "ref" ids. Prefer this: it's precise and gives you refs to act on directly.
+2. get_screen_text() — OCR fallback for content get_ui_tree can't see (images, canvases,
+   custom-drawn UI). Slower, fuzzier, coordinate-based only.
+
+ACTING ON THINGS: perform_ui_action(ref=...) resolves a ref from get_ui_tree and clicks/
+focuses/sets it, then reports what actually changed — prefer it over blind mouse_action()
+coordinate clicks when a ref is available.
+
+Batch related steps with execute_macro() instead of many separate round-trips."""
+
 mcp = FastMCP(
     "AutoMac MCP - macOS UI Automation",
     host="127.0.0.1",
-    port=8000,
+    port=SERVER_PORT,
     streamable_http_path=MCP_PATH,
     transport_security=transport_security,
+    instructions=SERVER_INSTRUCTIONS,
 )
 
 pyautogui.FAILSAFE = True
@@ -140,6 +170,24 @@ def _fail(message: str, error_code: str = "GENERIC", **data) -> Dict[str, Any]:
     # error_code values: PERMISSION, TIMEOUT, NOT_FOUND, INVALID_PARAM, EXEC_ERROR, GENERIC
     return {"status": "error", "error_code": error_code, "message": message, **data}
 
+# ── Permission Error Classification ───────────────────────────────────────────
+
+_PERMISSION_ERROR_PATTERNS = (
+    ("not authorized to send apple events", "Automation"),
+    ("not allowed assistive access", "Accessibility"),
+    ("assistive access", "Accessibility"),
+    ("-1743", "Automation"),
+    ("-25211", "Accessibility"),
+)
+
+def _classify_applescript_error(stderr: str) -> Optional[str]:
+    """Return the permission name a known TCC-denial error message maps to, else None."""
+    low = stderr.lower()
+    for pattern, permission in _PERMISSION_ERROR_PATTERNS:
+        if pattern in low:
+            return permission
+    return None
+
 # ── Coordinate Scaling (Retina) ───────────────────────────────────────────────
 
 _scale_cache: tuple[float, float] | None = None
@@ -211,7 +259,15 @@ def _run_applescript(body: str, timeout: int = 10) -> Dict[str, Any]:
     try:
         r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=timeout)
         if r.returncode != 0:
-            return _fail(f"AppleScript error: {r.stderr.strip()}", error_code="EXEC_ERROR")
+            stderr = r.stderr.strip()
+            missing_permission = _classify_applescript_error(stderr)
+            if missing_permission:
+                return _fail(
+                    f"{missing_permission} permission required: {stderr}. Grant it in "
+                    f"System Settings → Privacy & Security → {missing_permission}, then restart "
+                    "the server. Call get_session_state() to confirm current grant status.",
+                    error_code="PERMISSION", missing_permission=missing_permission)
+            return _fail(f"AppleScript error: {stderr}", error_code="EXEC_ERROR")
         return _ok(f"Executed: {body.strip()}")
     except subprocess.TimeoutExpired:
         return _fail(f"AppleScript timed out after {timeout}s", error_code="TIMEOUT")
@@ -332,15 +388,15 @@ def _do_focus_app(app_name: str, timeout: int = 30) -> Dict[str, Any]:
         try:
             if ACCESSIBILITY_AVAILABLE:
                 ws = NSWorkspace.sharedWorkspace()
-                aa = ws.activeApplication()
+                aa = ws.frontmostApplication()  # activeApplication() is deprecated/unreliable
                 if aa:
-                    an = aa.get("NSApplicationName", "")
+                    an = str(aa.localizedName() or "")
                     if an.lower() == app_name.lower():
                         el = round(time.time() - start, 2)
                         return _ok(f"Focused '{app_name}' ({el}s)", elapsed_time=el,
                                    active_app={"name": an,
-                                               "bundle_id": aa.get("NSApplicationBundleIdentifier", ""),
-                                               "pid": aa.get("NSApplicationProcessIdentifier", -1)})
+                                               "bundle_id": str(aa.bundleIdentifier() or ""),
+                                               "pid": int(aa.processIdentifier())})
                     last = an
             else:
                 cs = 'tell application "System Events" to get name of first application process whose frontmost is true'
@@ -361,6 +417,91 @@ def _do_focus_app(app_name: str, timeout: int = 30) -> Dict[str, Any]:
 # ═══════════════════════════════════════════════════════════════════════════════
 #  MCP TOOLS — The public API that AI agents see and call
 # ═══════════════════════════════════════════════════════════════════════════════
+
+# ── 0. Documentation on demand ────────────────────────────────────────────────
+#
+# Tool descriptions below are kept short by design so connecting doesn't cost a
+# lot of context. describe() holds the longer version of anything that got
+# trimmed — call it before improvising against an unfamiliar tool.
+
+_DESCRIBE_TOPICS: Dict[str, str] = {
+    "overview": SERVER_INSTRUCTIONS,
+    "macro_actions": """execute_macro() action dict reference — every supported "action" value:
+
+{"action": "keystroke", "key": "space", "modifiers": ["command"]}
+{"action": "type", "text": "Hello World"}
+{"action": "click", "x": 100, "y": 200}
+{"action": "double_click", "x": 100, "y": 200}
+{"action": "right_click", "x": 100, "y": 200}
+{"action": "move", "x": 100, "y": 200}
+{"action": "drag", "x": 200, "y": 300, "end_x": 800, "end_y": 400}
+{"action": "scroll", "dx": 0, "dy": -300}
+{"action": "focus_app", "app": "Notes"}
+{"action": "delay", "ms": 2000}
+{"action": "run_command", "command": "ls ~/Desktop", "timeout_seconds": 30}
+{"action": "write_file", "path": "~/Desktop/out.txt", "content": "hello", "mode": "overwrite"}
+{"action": "read_file", "path": "~/Desktop/in.txt", "max_chars": 4000}
+{"action": "set_clipboard", "content": "text to paste later"}
+
+x/y are logical screen coordinates (see describe(topic="coordinate_system")).
+The macro stops at the first failed step; partial progress and a recovery_hint
+are always returned so you know exactly where to resume.""",
+    "find_file_query_syntax": """find_file() uses Spotlight keyword matching (mdfind), NOT semantic search.
+
+Queries that WORK (filename keywords, content keywords, exact terms):
+   "automac_mcp"      -> finds files with this name
+   "Ambica Wooden"     -> finds files containing these words
+   "kind:pdf"          -> Spotlight metadata query
+   "date:today"        -> files modified today
+
+Queries that DON'T WORK (conceptual/semantic):
+   "python scripts"    -> will not match .py files
+   "study notes"       -> won't find your notebook unless it literally says "study notes"
+   "recent downloads"  -> use list_directory(sort_by="date_desc") instead
+
+For semantic/meaning-based search, use vector_search() (requires the indexer to be running).
+For regex-in-content search across a directory, use smart_search().
+For browsing by date or size without a query, use list_directory().""",
+    "ui_inspection": """Three ways to find something on screen, in order of preference:
+
+1. get_ui_tree(app=...) — the accessibility tree. Precise, gives you a "ref" you
+   can pass straight to perform_ui_action(). Use role_filter/actionable_only to
+   narrow a busy window down to just the buttons/fields you care about.
+2. get_screen_layout() — cheap top-level window list (title + bounds) with no
+   children. Good for "what windows are open" before deciding what to inspect.
+3. get_screen_text() — OCR fallback for content the accessibility tree can't see
+   (canvases, images, custom-drawn UI). Slower (~5s cold start), fuzzier, and
+   only gives you coordinates — no ref, no semantic action, no postcondition check.
+
+Once you have a ref from get_ui_tree(), prefer perform_ui_action(ref=...) over a
+blind mouse_action() coordinate click: it targets the exact element you saw
+(coordinates can drift if the window moves) and tells you what actually changed.
+
+If get_ui_tree() returns empty or errors, call get_session_state() before assuming
+the app has no UI — it may be a permission or locked-session issue instead.""",
+    "coordinate_system": """All screen tools agree on ONE coordinate space: logical points, not raw pixels.
+
+get_screen_size() returns logical_width/logical_height — pass these (not
+pixel_width/pixel_height) to mouse_action(). get_screen_text() and get_ui_tree()
+both already return positions in logical space. On a Retina display, logical
+values are about half the raw pixel values — mixing the two silently misplaces
+every click. If in doubt, get bounds from get_ui_tree()/get_screen_layout()/
+get_screen_text() and use them directly rather than computing coordinates by hand.""",
+}
+
+@mcp.tool()
+def describe(topic: str = "overview") -> Dict[str, Any]:
+    """Get the full-length guide for a topic that tool descriptions only summarize.
+
+    Args:
+        topic: One of "overview", "macro_actions", "find_file_query_syntax",
+              "ui_inspection", "coordinate_system". Unknown topics return the
+              available list instead of an error.
+    """
+    if topic not in _DESCRIBE_TOPICS:
+        return _ok(f"Unknown topic '{topic}'.", available_topics=sorted(_DESCRIBE_TOPICS.keys()))
+    return _ok(f"describe({topic!r})", topic=topic, text=_DESCRIBE_TOPICS[topic])
+
 
 # ── 1. Keyboard ───────────────────────────────────────────────────────────────
 
@@ -459,42 +600,27 @@ def scroll(dx: int = 0, dy: int = 0) -> Dict[str, Any]:
 
 @mcp.tool()
 def execute_macro(actions: list[dict], default_delay_ms: int = 750) -> Dict[str, Any]:
-    """Execute a sequence of UI actions as a single batch with realistic timing.
-
-    Instead of making separate tool calls (each needing an LLM round-trip),
-    send the whole recipe in one call. A delay is inserted between actions
-    so macOS UI has time to animate (Spotlight appearing, windows switching).
+    """Run a sequence of UI actions as one batch, instead of a separate round-trip per step.
 
     Args:
-        actions: List of action dicts. Each must have an "action" key:
+        actions: List of dicts, each with an "action" key. Common ones:
             {"action": "keystroke", "key": "space", "modifiers": ["command"]}
             {"action": "type", "text": "Hello World"}
             {"action": "click", "x": 100, "y": 200}
-            {"action": "double_click", "x": 100, "y": 200}
-            {"action": "right_click", "x": 100, "y": 200}
-            {"action": "move", "x": 100, "y": 200}
-            {"action": "drag", "x": 200, "y": 300, "end_x": 800, "end_y": 400}
-            {"action": "scroll", "dx": 0, "dy": -300}
             {"action": "focus_app", "app": "Notes"}
-            {"action": "delay", "ms": 2000}  ← explicit extra pause
-            {"action": "run_command", "command": "ls ~/Desktop", "timeout_seconds": 30}
-            {"action": "write_file", "path": "~/Desktop/out.txt", "content": "hello", "mode": "overwrite"}
-            {"action": "read_file", "path": "~/Desktop/in.txt", "max_chars": 4000}
-            {"action": "set_clipboard", "content": "text to paste later"}
-        default_delay_ms: Pause between actions in ms (default 750).
-                          Increase for slow UI transitions. The AI can also
-                          insert explicit delay actions for known-slow steps.
+            {"action": "delay", "ms": 2000}
+            Also supported: double_click, right_click, move, drag, scroll, run_command,
+            write_file, read_file, set_clipboard — call describe(topic="macro_actions")
+            for the full parameter list of each.
+        default_delay_ms: Pause between actions in ms (default 750) so macOS UI has
+                          time to animate. Increase for slow transitions.
 
-    On failure, returns status="partial_success" if some steps succeeded before
-    failure, or status="error" if the first step failed. Includes "recovery_hint"
-    and "steps" array for per-step debugging.
+    On failure: status="partial_success" if some steps ran first, "error" if the first
+    step failed. Check "steps" and "recovery_hint" in the response either way.
 
-    Example — Open Notes and type a message:
-        actions=[
-            {"action": "focus_app", "app": "Notes"},
-            {"action": "keystroke", "key": "n", "modifiers": ["command"]},
-            {"action": "type", "text": "Hello from AI!"}
-        ]
+    Example: [{"action": "focus_app", "app": "Notes"},
+              {"action": "keystroke", "key": "n", "modifiers": ["command"]},
+              {"action": "type", "text": "Hello from AI!"}]
     """
     if not actions:
         return _fail("actions list is empty")
@@ -640,7 +766,26 @@ def focus_app(app_name: str, timeout: int = 30) -> Dict[str, Any]:
 
 @mcp.tool()
 def get_available_apps() -> Dict[str, Any]:
-    """List all currently running (non-background) applications."""
+    """List all currently running (non-background) applications.
+
+    Returns the same app set as get_screen_layout() and get_ui_tree() — use the
+    "pid" from apps_detail as a stable target for those tools instead of name,
+    since names can collide across multiple running instances.
+
+    This includes many invisible menu-bar/system agents alongside ordinary apps.
+    Filter apps_detail to activation_policy == "regular" for Dock-visible apps
+    that are meaningful focus_app() targets.
+    """
+    if ACCESSIBILITY_AVAILABLE:
+        try:
+            apps_detail = _list_running_apps()
+            regular_count = sum(1 for a in apps_detail if a["activation_policy"] == "regular")
+            return _ok(f"Found {len(apps_detail)} running apps ({regular_count} regular, "
+                      f"{len(apps_detail) - regular_count} accessory/background)",
+                       apps=[a["name"] for a in apps_detail], apps_detail=apps_detail)
+        except Exception as e:
+            return _fail(f"Execution failed: {e}")
+    # Fallback when pyobjc is unavailable: AppleScript enumeration (names only).
     script = 'tell application "System Events"\nget name of (processes where background only is false)\nend tell'
     try:
         r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=30)
@@ -650,6 +795,83 @@ def get_available_apps() -> Dict[str, Any]:
         return _ok(f"Found {len(apps)} running apps", apps=apps)
     except Exception as e:
         return _fail(f"Execution failed: {e}")
+
+
+# ── 6.5 Session & Permission Diagnostics ──────────────────────────────────────
+
+@mcp.tool()
+def get_session_state() -> Dict[str, Any]:
+    """Check whether this Mac can currently do interactive GUI work, and whether the
+    permissions UI automation depends on are actually granted (not just theoretically
+    available). Cheap and safe — call this first when starting UI work, or whenever a
+    tool fails in a way that might be permission- or session-related.
+
+    Distinguishes cases agents otherwise can't tell apart from a generic failure:
+    - screen locked / at login window / on a background session → GUI actions will
+      silently no-op or fail even though the process itself is running fine.
+    - Accessibility or Screen Recording permission not granted → the specific tools
+      that need each one.
+
+    File I/O, terminal commands, and clipboard access do not require an unlocked
+    session or these permissions and remain available regardless.
+    """
+    session: Dict[str, Any] = {"on_console": None, "is_locked": None}
+    try:
+        info = CGSessionCopyCurrentDictionary()
+        if info:
+            d = dict(info)
+            session["on_console"] = bool(d.get("kCGSSessionOnConsoleKey", False))
+            # Absence of this key is Apple's documented convention for "not locked".
+            session["is_locked"] = bool(d.get("CGSSessionScreenIsLocked", False))
+        else:
+            session["note"] = "No session dictionary — likely at the login window (no user session)."
+    except Exception as e:
+        session["error"] = str(e)
+
+    accessibility_granted = None
+    try:
+        accessibility_granted = bool(AXIsProcessTrusted())
+    except Exception:
+        pass
+
+    screen_recording_granted = None
+    try:
+        screen_recording_granted = bool(CGPreflightScreenCaptureAccess())
+    except Exception:
+        pass
+
+    gui_available = bool(session.get("on_console")) and not bool(session.get("is_locked")) \
+        and accessibility_granted is not False
+
+    notes = []
+    if session.get("is_locked"):
+        notes.append("Screen is locked — mouse/keyboard/screen tools will fail or no-op. "
+                     "File, terminal, and clipboard tools still work.")
+    if session.get("on_console") is False:
+        notes.append("This session is not the active console session (fast user switch or "
+                     "remote/background session) — GUI actions target a session the user isn't "
+                     "looking at.")
+    if accessibility_granted is False:
+        notes.append("Accessibility permission not granted — press_keystroke, mouse_action, "
+                     "get_ui_tree, perform_ui_action, get_screen_layout, and focus_app polling "
+                     "will fail. Grant it to the running server process in System Settings → "
+                     "Privacy & Security → Accessibility, then restart the server.")
+    if screen_recording_granted is False:
+        notes.append("Screen Recording permission not granted — get_screen_text() "
+                     "(OCR/screenshot) will fail or return blank. Grant it in System Settings → "
+                     "Privacy & Security → Screen Recording, then restart the server.")
+
+    return _ok(
+        "GUI interaction available" if gui_available else "GUI interaction constrained — see notes",
+        gui_interaction_available=gui_available,
+        session=session,
+        permissions={
+            "accessibility": accessibility_granted,
+            "screen_recording": screen_recording_granted,
+        },
+        background_capabilities_available=True,
+        notes=notes,
+    )
 
 
 # ── 7. Screen Comprehension ──────────────────────────────────────────────────
@@ -681,6 +903,15 @@ def get_screen_size() -> Dict[str, Any]:
     except Exception as e:
         return _fail(f"Failed: {e}", error_code="EXEC_ERROR")
 
+AX_ELEMENT_TIMEOUT_SECONDS = 2.0
+
+def _ax_set_timeout(elem, seconds: float = AX_ELEMENT_TIMEOUT_SECONDS) -> None:
+    """Bound how long a single AX call can block on a wedged/beachballing app."""
+    try:
+        AXUIElementSetMessagingTimeout(elem, seconds)
+    except Exception:
+        pass
+
 def _ax_get(elem, attr: str):
     """Safely retrieve an AX attribute value. Returns None on any failure."""
     try:
@@ -689,64 +920,139 @@ def _ax_get(elem, attr: str):
     except Exception:
         return None
 
+def _ax_point(val) -> Optional[tuple]:
+    """Unwrap an AXValueRef of type CGPoint into (x, y). None on failure.
+
+    AXPosition/AXSize come back as opaque AXValueRef objects, not plain structs —
+    accessing .x/.y directly raises AttributeError. Must go through AXValueGetValue.
+    """
+    if val is None:
+        return None
+    try:
+        ok, point = AXValueGetValue(val, kAXValueCGPointType, None)
+        return (point.x, point.y) if ok else None
+    except Exception:
+        return None
+
+def _ax_size(val) -> Optional[tuple]:
+    """Unwrap an AXValueRef of type CGSize into (width, height). None on failure."""
+    if val is None:
+        return None
+    try:
+        ok, size = AXValueGetValue(val, kAXValueCGSizeType, None)
+        return (size.width, size.height) if ok else None
+    except Exception:
+        return None
+
+def _ax_json_safe(v):
+    """AXValue can be a string, number, bool, or an exotic pyobjc/CF object
+    (AXValueRef structs, NSArray, ...) depending on the control. Only pass
+    through JSON-native types; stringify anything else rather than letting an
+    unserializable object blow up the tool response."""
+    if v is None or isinstance(v, (str, int, float, bool)):
+        return v
+    try:
+        return str(v)
+    except Exception:
+        return None
+
+_ACTIVATION_POLICY_NAMES = {0: "regular", 1: "accessory"}  # 2 (prohibited) is excluded entirely
+
+def _list_running_apps() -> List[Dict[str, Any]]:
+    """Canonical app enumeration, keyed on pid. Used by get_available_apps,
+    get_screen_layout, and get_ui_tree so all three agree on what an 'app' is.
+
+    Includes menu-bar-only "accessory" apps (many system agents, some utilities)
+    alongside Dock-visible "regular" apps — activation_policy tells them apart,
+    since only "regular" apps are generally meaningful focus_app() targets.
+    """
+    ws = NSWorkspace.sharedWorkspace()
+    out = []
+    for app in ws.runningApplications():
+        try:
+            policy = app.activationPolicy()
+            if policy == 2:  # NSApplicationActivationPolicyProhibited
+                continue
+            out.append({
+                "name": str(app.localizedName() or "Unknown"),
+                "bundle_id": str(app.bundleIdentifier() or ""),
+                "pid": int(app.processIdentifier()),
+                "activation_policy": _ACTIVATION_POLICY_NAMES.get(policy, "unknown"),
+            })
+        except Exception:
+            continue
+    return out
+
+def _resolve_app_pid(app: str = "", pid: Optional[int] = None) -> Dict[str, Any]:
+    """Resolve an app target to a single pid. Returns {"pid": int} or a _fail() dict.
+
+    Disambiguates by pid when a name matches more than one running process, instead
+    of silently picking one — agents should pass the pid back for a stable target.
+    """
+    if pid is not None:
+        return {"pid": pid}
+    if not app:
+        return _fail("Provide either 'app' (name) or 'pid'.", error_code="INVALID_PARAM")
+    apps = _list_running_apps()
+    matches = [a for a in apps if a["name"].lower() == app.lower()]
+    if not matches:
+        return _fail(f"No running app named '{app}'. Call get_available_apps() for the current list.",
+                     error_code="NOT_FOUND")
+    if len(matches) > 1:
+        return _fail(f"'{app}' matches {len(matches)} running processes; pass pid= to disambiguate.",
+                     error_code="INVALID_PARAM", candidates=matches)
+    return {"pid": matches[0]["pid"]}
+
 @mcp.tool()
 def get_screen_layout() -> Dict[str, Any]:
-    """Get window titles and positions for all visible apps via Accessibility APIs.
+    """Get window titles and bounds for all visible apps via Accessibility APIs.
 
-    Returns accurate window information using the AX API, which works for all
-    modern macOS applications. Use this to understand what is on screen before
-    using mouse_action() or execute_macro() to interact with specific windows.
+    Cheap top-level survey: one row per window, no children. For buttons, fields,
+    and other interactive elements inside a window, use get_ui_tree(pid=...).
 
-    Note: Requires Accessibility permission granted to Terminal in
-    System Settings → Privacy & Security → Accessibility.
+    Note: Requires Accessibility permission — check get_session_state() first if
+    this returns empty results or a PERMISSION error.
     Passwords in secure text fields are automatically redacted by macOS.
     """
     if not ACCESSIBILITY_AVAILABLE:
         return _fail(
-            "macOS Accessibility frameworks not available. "
-            "Grant Accessibility permission to Terminal (or your terminal app) in "
-            "System Settings → Privacy & Security → Accessibility, then restart the terminal.",
+            "macOS Accessibility frameworks not available (pyobjc import failed). "
+            "This is a runtime install issue, not a permission issue.",
+            error_code="GENERIC"
+        )
+    if not AXIsProcessTrusted():
+        return _fail(
+            "Accessibility permission not granted to this process. Grant it in "
+            "System Settings → Privacy & Security → Accessibility, then restart the server. "
+            "Call get_session_state() for full permission detail.",
             error_code="PERMISSION"
         )
     try:
         ws = NSWorkspace.sharedWorkspace()
-        running_apps = ws.runningApplications()
         active_app_obj = ws.frontmostApplication()
 
         windows_out = []
 
-        for app in running_apps:
-            try:
-                if app.activationPolicy() == 2:
-                    continue
-            except Exception:
-                continue
-
-            pid = app.processIdentifier()
-            app_name = str(app.localizedName() or "Unknown")
-
+        for app_info in _list_running_apps():
+            pid, app_name = app_info["pid"], app_info["name"]
             try:
                 app_elem = AXUIElementCreateApplication(pid)
+                _ax_set_timeout(app_elem)
                 windows_raw = _ax_get(app_elem, "AXWindows")
                 if not windows_raw:
                     continue
 
                 for win in windows_raw:
                     title = str(_ax_get(win, "AXTitle") or "")
-                    pos   = _ax_get(win, "AXPosition")
-                    size  = _ax_get(win, "AXSize")
+                    point = _ax_point(_ax_get(win, "AXPosition"))
+                    size  = _ax_size(_ax_get(win, "AXSize"))
 
-                    win_data = {"app": app_name, "title": title}
-
-                    if pos is not None and size is not None:
-                        try:
-                            win_data["bounds"] = {
-                                "x": int(pos.x), "y": int(pos.y),
-                                "width": int(size.width), "height": int(size.height)
-                            }
-                        except Exception:
-                            pass
-
+                    win_data = {"app": app_name, "pid": pid, "title": title}
+                    if point is not None and size is not None:
+                        win_data["bounds"] = {
+                            "x": int(point[0]), "y": int(point[1]),
+                            "width": int(size[0]), "height": int(size[1])
+                        }
                     windows_out.append(win_data)
 
             except Exception:
@@ -766,6 +1072,395 @@ def get_screen_layout() -> Dict[str, Any]:
         )
     except Exception as e:
         return _fail(f"AX layout failed: {e}")
+
+
+# ── 7.5 UI Element Tree (progressive-disclosure accessibility inspection) ────
+#
+# Elements are opaque AXUIElementRef objects — they can't cross the JSON
+# boundary. get_ui_tree() hands back a small "ref" string per element and
+# keeps the real object in this in-process registry; perform_ui_action()
+# resolves a ref back to the retained object rather than re-walking a path,
+# so an action targets the exact element the agent saw, not whatever now
+# lives at the same tree position.
+
+AX_REGISTRY_CAP = 5000
+AX_DEFAULT_DEPTH = 3
+AX_MAX_DEPTH = 6
+AX_DEFAULT_LIMIT = 50
+AX_MAX_LIMIT = 200
+AX_DEFAULT_NODE_BUDGET = 800
+AX_MAX_NODE_BUDGET = 2000
+
+_ax_registry: "dict[str, Any]" = {}
+_ax_registry_order: "list[str]" = []
+_ax_registry_lock = threading.Lock()
+_ax_ref_seq = 0
+
+def _ax_register(elem, pid: int) -> str:
+    """Store an AXUIElementRef and hand back an opaque ref string for it."""
+    global _ax_ref_seq
+    with _ax_registry_lock:
+        _ax_ref_seq += 1
+        ref = f"el_{pid}_{_ax_ref_seq}"
+        _ax_registry[ref] = elem
+        _ax_registry_order.append(ref)
+        while len(_ax_registry_order) > AX_REGISTRY_CAP:
+            oldest = _ax_registry_order.pop(0)
+            _ax_registry.pop(oldest, None)
+        return ref
+
+def _ax_resolve(ref: str):
+    with _ax_registry_lock:
+        return _ax_registry.get(ref)
+
+def _ax_label(elem) -> str:
+    """Best available human-readable label: title, then description, then string value."""
+    for attr in ("AXTitle", "AXDescription"):
+        v = _ax_get(elem, attr)
+        if v:
+            return str(v)
+    v = _ax_get(elem, "AXValue")
+    if isinstance(v, str) and v:
+        return v
+    return ""
+
+def _ax_action_names(elem) -> List[str]:
+    try:
+        err, names = AXUIElementCopyActionNames(elem, None)
+        return list(names) if err == 0 and names else []
+    except Exception:
+        return []
+
+class _AXWalkState:
+    """Shared traversal budget/output for one get_ui_tree() call.
+
+    Two walk functions share this: _ax_walk_tree() (no filters — full nested
+    hierarchy) and _ax_walk_flat() (role_filter/actionable_only set — matches
+    can be nested arbitrarily deep under non-matching containers, so hierarchy
+    is dropped in favor of a flat list of everything that matched).
+    """
+    def __init__(self, role_filter, actionable_only, limit, node_budget, skip):
+        self.role_filter = set(r.lower() for r in role_filter) if role_filter else None
+        self.actionable_only = actionable_only
+        self.filtering = bool(self.role_filter or actionable_only)
+        self.limit = limit
+        self.node_budget = node_budget
+        self.skip = skip
+        self.visited = 0
+        self.emitted = 0
+        # `stop` is the internal recursion-control signal: true once EITHER the
+        # limit or node_budget boundary is crossed, and used everywhere traversal
+        # needs to halt. `node_budget_exhausted` is the public-facing field and
+        # means only "node_budget ran out" — hitting `limit` is normal, expected
+        # pagination, not something an agent should react to by raising node_budget.
+        # Conflating the two previously told agents to widen node_budget on every
+        # single full page, which was never the actual cause.
+        self.stop = False
+        self.node_budget_exhausted = False
+        self.more_available = False
+        self.flat_results: List[Dict[str, Any]] = []
+        # Visit-position of the last node actually emitted this call. The next
+        # continuation_token must resume here, NOT at the last *visited* position:
+        # a node can be visited-but-rejected (limit hit right as we reached it),
+        # and visited-position would then skip it forever — emitted-neither-page.
+        self.last_emitted_pos = 0
+
+    def visit(self) -> bool:
+        """Call once per element entered. False means stop — node_budget is spent."""
+        if self.visited >= self.node_budget:
+            self.node_budget_exhausted = True
+            self.stop = True
+            self.more_available = True
+            return False
+        self.visited += 1
+        return True
+
+    def want_more(self) -> bool:
+        return self.emitted < self.limit
+
+    def matches(self, role: str, actions: List[str]) -> bool:
+        if self.role_filter is not None and role.lower() not in self.role_filter:
+            return False
+        if self.actionable_only and not actions:
+            return False
+        return True
+
+    def try_emit(self, elem, pid: int, role: str, actions: List[str]) -> Optional[Dict[str, Any]]:
+        """Build+register a node dict for this element, honoring the pagination
+        skip window and the per-call limit. None means "don't include this one"."""
+        if self.visited <= self.skip:
+            return None
+        if not self.want_more():
+            self.stop = True  # page full — routine, NOT node_budget_exhausted
+            self.more_available = True
+            return None
+        node = {"ref": _ax_register(elem, pid), "role": role, "label": _ax_label(elem), "actions": actions}
+        enabled = _ax_get(elem, "AXEnabled")
+        if enabled is not None:
+            node["enabled"] = bool(enabled)
+        point = _ax_point(_ax_get(elem, "AXPosition"))
+        size = _ax_size(_ax_get(elem, "AXSize"))
+        if point is not None and size is not None:
+            node["bounds"] = {"x": int(point[0]), "y": int(point[1]),
+                              "width": int(size[0]), "height": int(size[1])}
+        self.emitted += 1
+        self.last_emitted_pos = self.visited
+        return node
+
+def _ax_walk_tree(elem, pid: int, depth_remaining: int, state: "_AXWalkState") -> List[Dict[str, Any]]:
+    """Unfiltered mode: returns a list (0 or 1 items unless a skipped ancestor's
+    matching descendants bubble up — see below), not a single node, so pagination
+    can skip a node's own emission while still descending into its children.
+
+    Without this, resuming with continuation_token would re-walk each top-level
+    window, immediately hit its own skip window, and stop — never reaching node
+    101 just because node 1 (its ancestor) was the one skipped.
+    """
+    if not state.visit():
+        return []
+    role = str(_ax_get(elem, "AXRole") or "Unknown")
+    actions = _ax_action_names(elem)
+    node = state.try_emit(elem, pid, role, actions)  # None: skipped-by-pagination OR over-limit
+    if state.stop and node is None:
+        return []  # over limit (or node_budget) — genuinely stop, don't descend
+
+    child_out: List[Dict[str, Any]] = []
+    children_raw = None
+    if depth_remaining > 0:
+        children_raw = _ax_get(elem, "AXChildren")
+        if children_raw:
+            for child in children_raw:
+                child_out.extend(_ax_walk_tree(child, pid, depth_remaining - 1, state))
+                if state.stop:
+                    break
+
+    if node is not None:
+        if child_out:
+            node["children"] = child_out
+        elif children_raw:
+            node["children_truncated"] = len(children_raw)
+        return [node]
+    else:
+        # This element was skipped by the pagination window (not emitted), but its
+        # matching descendants still need to surface — there's no parent dict to
+        # nest them under, so they bubble up to become their parent's siblings.
+        return child_out
+
+def _ax_walk_flat(elem, pid: int, depth_remaining: int, state: "_AXWalkState") -> None:
+    """Filtered mode: descend through every container regardless of whether it
+    matched (matches can be nested arbitrarily deep), collecting matches into
+    state.flat_results. No hierarchy in the output.
+
+    Deliberately does NOT gate recursion on want_more(): stopping the instant
+    emitted==limit means no node past the boundary is ever visited, so try_emit()
+    never gets a chance to flip state.stop — has_more silently comes back False
+    even when more matches exist. One extra node must be visited-and-rejected
+    past the limit to correctly detect "there's more" (bounded by node_budget
+    regardless, via state.visit()).
+    """
+    if not state.visit():
+        return
+    role = str(_ax_get(elem, "AXRole") or "Unknown")
+    actions = _ax_action_names(elem)
+    if state.matches(role, actions):
+        node = state.try_emit(elem, pid, role, actions)
+        if node is not None:
+            state.flat_results.append(node)
+    if depth_remaining > 0 and not state.stop:
+        children_raw = _ax_get(elem, "AXChildren")
+        if children_raw:
+            for child in children_raw:
+                _ax_walk_flat(child, pid, depth_remaining - 1, state)
+                if state.stop:
+                    break
+
+@mcp.tool()
+def get_ui_tree(app: str = "", pid: Optional[int] = None, ref: str = "",
+                depth: int = AX_DEFAULT_DEPTH, role_filter: list[str] = [],
+                actionable_only: bool = False, limit: int = AX_DEFAULT_LIMIT,
+                continuation_token: str = "", node_budget: int = AX_DEFAULT_NODE_BUDGET) -> Dict[str, Any]:
+    """Inspect the accessibility element tree — buttons, fields, labels — with a stable
+    "ref" per element you can pass to perform_ui_action(). Prefer this over OCR
+    (get_screen_text) for anything that isn't custom-drawn. Full guide, including
+    pagination and ref-lifetime detail: describe(topic="ui_inspection").
+
+    Args:
+        app / pid / ref: Target — pick one, or omit all three to inspect the frontmost
+                        app. "app" errors with candidates if the name is ambiguous;
+                        "ref" (from a prior call) inspects just that element's subtree.
+        depth: Levels of children to descend (default 3, max 6).
+        role_filter: Only these AX roles, e.g. ["AXButton", "AXTextField"] — matches
+                    nested anywhere in the subtree.
+        actionable_only: Only elements with at least one AX action (buttons, fields,
+                        links — not static text/containers).
+        limit: Max elements returned (default 50, max 200).
+        node_budget: Max elements *visited* while searching, independent of limit —
+                    bounds latency on huge/slow trees (default 800, max 2000). If
+                    "node_budget_exhausted" comes back true, narrow with role_filter /
+                    actionable_only (or use continuation_token) rather than raising this.
+        continuation_token: Pass back the value from a "has_more": true response to
+                           get the next page (best-effort — omit to refresh from the top
+                           if the UI changed; a resumed page's bubbled-up elements may
+                           appear without their original parent for context).
+    """
+    if not ACCESSIBILITY_AVAILABLE:
+        return _fail("macOS Accessibility frameworks not available (pyobjc import failed).",
+                     error_code="GENERIC")
+    if not AXIsProcessTrusted():
+        return _fail(
+            "Accessibility permission not granted to this process. Call get_session_state() "
+            "for detail, or grant it in System Settings → Privacy & Security → Accessibility.",
+            error_code="PERMISSION")
+
+    depth = max(0, min(depth, AX_MAX_DEPTH))
+    limit = max(1, min(limit, AX_MAX_LIMIT))
+    node_budget = max(1, min(node_budget, AX_MAX_NODE_BUDGET))
+    try:
+        skip = int(continuation_token) if continuation_token else 0
+    except ValueError:
+        return _fail("Invalid continuation_token.", error_code="INVALID_PARAM")
+
+    state = _AXWalkState(role_filter, actionable_only, limit, node_budget, skip)
+
+    try:
+        if ref:
+            elem = _ax_resolve(ref)
+            if elem is None:
+                return _fail(f"Unknown or expired ref '{ref}'. Call get_ui_tree(app=...) again for fresh refs.",
+                             error_code="NOT_FOUND")
+            _ax_set_timeout(elem)  # a ref's timeout isn't inherited from its app element
+            try:
+                _pid_err, _pid_val = AXUIElementGetPid(elem, None)
+                origin_pid = int(_pid_val) if _pid_err == 0 else 0
+            except Exception:
+                origin_pid = 0
+            if state.filtering:
+                _ax_walk_flat(elem, origin_pid, depth, state)
+                elements = state.flat_results
+            else:
+                elements = _ax_walk_tree(elem, origin_pid, depth, state)
+            target_desc = f"subtree of {ref}"
+        else:
+            resolved = _resolve_app_pid(app, pid)
+            if "pid" not in resolved:
+                if not app and pid is None:
+                    front = NSWorkspace.sharedWorkspace().frontmostApplication()
+                    if not front:
+                        return _fail("No frontmost app to inspect.", error_code="NOT_FOUND")
+                    target_pid = int(front.processIdentifier())
+                    target_desc = str(front.localizedName() or "frontmost app")
+                else:
+                    return resolved  # _fail(...) dict
+            else:
+                target_pid = resolved["pid"]
+                target_desc = app or f"pid {target_pid}"
+
+            app_elem = AXUIElementCreateApplication(target_pid)
+            _ax_set_timeout(app_elem)
+            windows_raw = _ax_get(app_elem, "AXWindows") or []
+            elements = []
+            if state.filtering:
+                for win in windows_raw:
+                    _ax_walk_flat(win, target_pid, depth, state)
+                    if state.stop:
+                        break
+                elements = state.flat_results
+            else:
+                for win in windows_raw:
+                    elements.extend(_ax_walk_tree(win, target_pid, depth, state))
+                    if state.stop:
+                        break
+
+        result = _ok(f"{state.emitted} elements ({target_desc})",
+                     elements=elements, node_budget_exhausted=state.node_budget_exhausted,
+                     visited=state.visited, has_more=state.more_available)
+        if state.more_available:
+            # Resume at the last *emitted* position, not the last *visited* one:
+            # a node can be visited-and-rejected right as the limit is hit, and
+            # resuming past it (at its visit-position) would drop it from every
+            # page. Fall back to min(skip, visited) if nothing emitted this call
+            # at all (e.g. node_budget ran out mid-skip-window) so we retry the
+            # same position instead of skipping unconfirmed nodes.
+            token_pos = state.last_emitted_pos if state.last_emitted_pos > 0 else min(skip, state.visited)
+            result["continuation_token"] = str(token_pos)
+        return result
+    except Exception as e:
+        return _fail(f"UI tree inspection failed: {e}")
+
+
+AX_ACTION_ALIASES = {
+    "click": "AXPress", "press": "AXPress",
+    "increment": "AXIncrement", "decrement": "AXDecrement",
+    "confirm": "AXConfirm", "cancel": "AXCancel",
+    "pick": "AXPick", "select": "AXPick",
+    "show_menu": "AXShowMenu",
+}
+
+@mcp.tool()
+def perform_ui_action(ref: str, action: str = "click", value: Optional[str] = None) -> Dict[str, Any]:
+    """Act on an element previously returned by get_ui_tree(), then report what changed.
+
+    Prefer this over mouse_action() when you have a ref — it targets the exact element
+    you inspected (not whatever is now at those coordinates), and confirms the result
+    instead of leaving you to guess.
+
+    Args:
+        ref: An element ref from get_ui_tree().
+        action: "click"/"press" (default — the element's primary action), "focus"
+               (move keyboard focus to it without activating), "set_value" (requires
+               value= — text fields, sliders), "select"/"pick" (menu items, list rows),
+               or a raw AX action name (e.g. "AXShowMenu") from the element's "actions" list.
+        value: Required for action="set_value". Ignored otherwise.
+
+    Returns whether the action ran, and a lightweight before/after comparison of the
+    element's label/value/focused state so you can tell if it actually took effect.
+    """
+    elem = _ax_resolve(ref)
+    if elem is None:
+        return _fail(f"Unknown or expired ref '{ref}'. Call get_ui_tree(...) again for a fresh ref.",
+                     error_code="NOT_FOUND")
+    if not AXIsProcessTrusted():
+        return _fail("Accessibility permission not granted. Call get_session_state() for detail.",
+                     error_code="PERMISSION")
+
+    before = {"label": _ax_label(elem), "value": _ax_json_safe(_ax_get(elem, "AXValue")),
+             "focused": _ax_json_safe(_ax_get(elem, "AXFocused"))}
+
+    try:
+        if action == "focus":
+            err = AXUIElementSetAttributeValue(elem, "AXFocused", True)
+            if err != 0:
+                return _fail(f"Focus failed (AXError {err}). Element may not be focusable.",
+                             error_code="EXEC_ERROR", ax_error=err)
+        elif action == "set_value":
+            if value is None:
+                return _fail("action='set_value' requires value=", error_code="INVALID_PARAM")
+            err = AXUIElementSetAttributeValue(elem, "AXValue", value)
+            if err != 0:
+                return _fail(f"Set value failed (AXError {err}). Element may be read-only.",
+                             error_code="EXEC_ERROR", ax_error=err)
+        else:
+            ax_action = AX_ACTION_ALIASES.get(action, action)
+            available = _ax_action_names(elem)
+            if ax_action not in available:
+                return _fail(
+                    f"'{ax_action}' is not available on this element. Available actions: {available or 'none'}.",
+                    error_code="INVALID_PARAM")
+            err = AXUIElementPerformAction(elem, ax_action)
+            if err != 0:
+                return _fail(f"Action '{ax_action}' failed (AXError {err}).",
+                             error_code="EXEC_ERROR", ax_error=err)
+    except Exception as e:
+        return _fail(f"Action failed: {e}", error_code="EXEC_ERROR")
+
+    time.sleep(0.1)  # let the app process the action before re-reading state
+    after = {"label": _ax_label(elem), "value": _ax_json_safe(_ax_get(elem, "AXValue")),
+             "focused": _ax_json_safe(_ax_get(elem, "AXFocused"))}
+    changed = {k: {"before": before[k], "after": after[k]}
+              for k in before if before[k] != after[k]}
+
+    return _ok(f"Performed '{action}' on {ref}", changed=changed, current_state=after)
+
 
 @mcp.tool()
 def get_screen_text(screenshot: bool = False) -> Dict[str, Any]:
@@ -887,38 +1582,17 @@ def run_terminal_command(command: str, timeout_seconds: int = 30,
 def find_file(query: str, search_dir: str = "", file_type: str = "", sort_by: str = "", limit: int = 50, include_source: bool = False) -> Dict[str, Any]:
     """Find files using macOS Spotlight (mdfind) — millisecond results across the whole drive.
 
-    NOTE: Returns a list of objects with metadata (path, name, last_modified, size_kb)
-    instead of raw strings.
-
-    QUERY STYLE — IMPORTANT:
-    This tool uses Spotlight keyword matching (mdfind), NOT semantic/AI search.
-
-    Queries that WORK (filename keywords, content keywords, exact terms):
-       "automac_mcp"      → finds files with this name
-       "Ambica Wooden"    → finds files containing these words
-       "kind:pdf"         → Spotlight metadata query
-       "date:today"       → files modified today
-
-    Queries that DON'T WORK (conceptual/semantic):
-       "python scripts"   → will not match .py files
-       "study notes"      → won't find your notebook unless it literally says "study notes"
-       "recent downloads" → use list_directory() with sort_by="date_desc" instead
-
-    For semantic/meaning-based search, use vector_search() if the indexer is running.
-    For regex-in-content search, use smart_search().
-    For browsing by date or size, use list_directory().
-
-    WARNING: Setting include_source to True will execute 'mdls' for each file found,
-    which can significantly slow down the search. Use this only with a low 'limit'
-    and for a small number of files when you need to find source URLs (e.g., origin domain).
+    Keyword matching only, NOT semantic (e.g. "python scripts" won't match .py files —
+    use vector_search() for meaning-based search, describe(topic="find_file_query_syntax")
+    for the full query-style guide including Spotlight metadata queries like "kind:pdf").
 
     Args:
-        query: Search query (filename, content keyword, etc.)
+        query: Filename or content keyword, or a Spotlight metadata query (e.g. "kind:pdf").
         search_dir: Optional directory to scope the search.
         file_type: Optional extension filter (e.g. "pdf", "zip").
         sort_by: Optional sort order ("date_desc", "date_asc", "size_desc", "size_asc", "name_asc", "name_desc").
         limit: Max number of results to return (default 50).
-        include_source: If True, fetches the source URL (kMDItemWhereFroms) for each file.
+        include_source: If True, fetches the source URL for each file. Slow — use with a low limit.
     """
     if not query:
         return _fail("query is required")
@@ -1506,7 +2180,7 @@ def setup_ngrok():
                     data = json.loads(response.read().decode('utf-8'))
                     for tunnel in data.get("tunnels", []):
                         addr = tunnel.get("config", {}).get("addr", "")
-                        if "8000" in addr:
+                        if str(SERVER_PORT) in addr:
                             url = tunnel.get("public_url")
                             console.print("[green]Detected existing ngrok tunnel![/green]")
                             return url
@@ -1546,7 +2220,7 @@ def setup_ngrok():
                 console.print("[red]No token provided. Skipping ngrok setup.[/red]")
                 return None
         console.print("[cyan]Starting ngrok tunnel...[/cyan]")
-        public_url = ngrok.connect(8000).public_url
+        public_url = ngrok.connect(SERVER_PORT).public_url
         return public_url
     except Exception as e:
         console.print(f"[bold red]Failed to setup ngrok:[/bold red] {e}")
@@ -1587,7 +2261,7 @@ def main():
         console.print("The authenticated connector URL is available from the menu-bar app.")
     else:
         console.print("\n[bold green]Mac Orchestrator is starting locally.[/bold green]")
-        console.print("🔗 [bold underline cyan]http://localhost:8000/mcp[/bold underline cyan]")
+        console.print(f"🔗 [bold underline cyan]http://localhost:{SERVER_PORT}/mcp[/bold underline cyan]")
     console.print("\n[dim]Press Ctrl+C to stop the server[/dim]\n")
     try:
         mcp.run(transport="streamable-http", mount_path="/mcp")

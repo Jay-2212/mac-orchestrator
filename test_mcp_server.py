@@ -3,6 +3,7 @@
 import subprocess
 import sys
 import os
+import json
 
 
 def test_mcp_server():
@@ -42,12 +43,12 @@ def test_mcp_server():
             print("✗ FastMCP instance not found")
             return False
             
-        # Check for the refactored v2 tool set (20 tools, down from 46)
+        # Check for the current tool set (24 tools)
         v2_tools = [
-            'press_keystroke', 'mouse_action', 'type_text', 'scroll',
-            'execute_macro', 'focus_app', 'get_available_apps',
-            'get_screen_size', 'get_screen_layout', 'get_screen_text',
-            'run_terminal_command', 'find_file', 'vector_search',
+            'describe', 'press_keystroke', 'mouse_action', 'type_text', 'scroll',
+            'execute_macro', 'focus_app', 'get_available_apps', 'get_session_state',
+            'get_screen_size', 'get_screen_layout', 'get_ui_tree', 'perform_ui_action',
+            'get_screen_text', 'run_terminal_command', 'find_file', 'vector_search',
             'read_file', 'write_file', 'list_directory', 'smart_search',
             'play_sound_for_user_prompt', 'clipboard', 'send_file_to_telegram'
         ]
@@ -117,7 +118,132 @@ def test_mcp_server():
             print(f"✓ get_screen_layout: {result.get('message')}")
         else:
             print(f"✗ get_screen_layout failed")
-            
+
+        # Regression test: AXPosition/AXSize are AXValueRef objects that need
+        # AXValueGetValue() to unwrap — a bare except previously swallowed this
+        # silently and "bounds" was never emitted for any window, ever.
+        if result.get("status") == "success":
+            windows = result.get("screen_info", {}).get("windows", [])
+            if windows and any("bounds" in w for w in windows):
+                print("✓ get_screen_layout: bounds populated (AXValueRef unwrap works)")
+            elif windows:
+                print(f"✗ get_screen_layout: no window has 'bounds' — AXValueRef unwrap regressed")
+            else:
+                print("  (get_screen_layout: no windows open, skipping bounds check)")
+
+        # Test get_session_state
+        result = automac_mcp.get_session_state()
+        if (result.get("status") == "success"
+                and "gui_interaction_available" in result
+                and "session" in result and "permissions" in result):
+            print(f"✓ get_session_state: {result.get('message')}")
+        else:
+            print(f"✗ get_session_state failed: {result}")
+
+        # Test describe()
+        r_overview = automac_mcp.describe("overview")
+        r_unknown = automac_mcp.describe("not-a-real-topic")
+        if (r_overview.get("status") == "success" and r_overview.get("text")
+                and r_unknown.get("status") == "success" and "available_topics" in r_unknown):
+            print("✓ describe: known topic returns text, unknown topic lists available_topics")
+        else:
+            print(f"✗ describe failed: overview={r_overview}, unknown={r_unknown}")
+
+        # Test get_available_apps includes apps_detail with activation_policy
+        result = automac_mcp.get_available_apps()
+        detail = result.get("apps_detail")
+        if (result.get("status") == "success" and detail
+                and all("pid" in a and "activation_policy" in a for a in detail)):
+            print(f"✓ get_available_apps: apps_detail has pid/activation_policy ({len(detail)} apps)")
+        else:
+            print(f"✗ get_available_apps apps_detail malformed: {result}")
+
+        # Test get_ui_tree — targets the frontmost app by default, no live-UI assumptions
+        result = automac_mcp.get_ui_tree(limit=5, depth=2)
+        if result.get("status") == "success" and "elements" in result and "has_more" in result:
+            print(f"✓ get_ui_tree: {result.get('message')}")
+            first_ref = result["elements"][0]["ref"] if result["elements"] else None
+        elif result.get("status") == "error" and result.get("error_code") == "PERMISSION":
+            print("  (get_ui_tree: Accessibility permission not granted in this environment, skipping)")
+            first_ref = None
+        else:
+            print(f"✗ get_ui_tree failed: {result}")
+            first_ref = None
+
+        # Regression test: get_ui_tree pagination previously had two distinct bugs —
+        # (1) the continuation_token double-counted the skip window, silently dropping
+        # exactly one element at each page boundary, and (2) flat/filtered mode gated
+        # recursion on the per-page limit, so hitting the limit exactly stopped
+        # traversal before it could discover (and report) that more matches existed.
+        # A ref-based diff can't catch either — refs are always distinct across calls
+        # even for the same element. Only a content comparison against an unpaginated
+        # baseline discriminates. Tree mode (no filter) and flat mode (role_filter/
+        # actionable_only) are two different code paths (_ax_walk_tree/_ax_walk_flat)
+        # with independent bugs found here, so both are checked.
+        def _flatten_ui_tree(nodes, out):
+            for n in nodes:
+                out.append((n["role"], n["label"], json.dumps(n.get("bounds"), sort_keys=True)))
+                _flatten_ui_tree(n.get("children", []), out)
+
+        def _check_ui_tree_pagination(label, base_kwargs):
+            baseline = automac_mcp.get_ui_tree(depth=6, limit=200, node_budget=2000, **base_kwargs)
+            if baseline.get("status") == "error" and baseline.get("error_code") == "PERMISSION":
+                print(f"  (get_ui_tree pagination [{label}]: Accessibility permission not granted, skipping)")
+                return
+            if not (baseline.get("status") == "success" and baseline.get("elements")):
+                print(f"  (get_ui_tree pagination [{label}]: no elements to paginate over, skipping)")
+                return
+            baseline_seq = []
+            _flatten_ui_tree(baseline["elements"], baseline_seq)
+
+            paginated_seq = []
+            token, pages, ok = None, 0, True
+            while True:
+                kwargs = dict(depth=6, limit=1, node_budget=2000, **base_kwargs)
+                if token:
+                    kwargs["continuation_token"] = token
+                page = automac_mcp.get_ui_tree(**kwargs)
+                pages += 1
+                if page.get("status") != "success":
+                    ok = False
+                    break
+                _flatten_ui_tree(page.get("elements", []), paginated_seq)
+                token = page.get("continuation_token")
+                if not page.get("has_more"):
+                    break
+                if pages > 50:  # a real regression should fail loudly, not hang
+                    ok = False
+                    break
+
+            if pages <= 1:
+                # limit=1 never crossed a page boundary — the one thing that was
+                # actually broken — so this environment can't confirm anything.
+                print(f"  (get_ui_tree pagination [{label}]: only {len(baseline_seq)} element(s), "
+                      f"no page boundary crossed — inconclusive, skipping)")
+            elif ok and paginated_seq == baseline_seq:
+                print(f"✓ get_ui_tree pagination [{label}]: {pages} pages reproduce the unpaginated "
+                      f"baseline exactly ({len(baseline_seq)} elements)")
+            else:
+                print(f"✗ get_ui_tree pagination [{label}] mismatch: baseline={len(baseline_seq)} elements, "
+                      f"paginated={len(paginated_seq)} elements over {pages} pages (ok={ok})")
+
+        _check_ui_tree_pagination("flat/actionable_only", {"app": "Finder", "actionable_only": True})
+        _check_ui_tree_pagination("tree/unfiltered", {"app": "Finder"})
+
+        # Test perform_ui_action error paths (no assumptions about live UI state)
+        r_bad_ref = automac_mcp.perform_ui_action(ref="el_0_999999999", action="click")
+        if r_bad_ref.get("status") == "error" and r_bad_ref.get("error_code") == "NOT_FOUND":
+            print("✓ perform_ui_action: unknown ref returns NOT_FOUND")
+        else:
+            print(f"✗ perform_ui_action bad-ref handling failed: {r_bad_ref}")
+
+        if first_ref:
+            r_bad_action = automac_mcp.perform_ui_action(ref=first_ref, action="AXTotallyBogusAction")
+            if r_bad_action.get("status") == "error" and r_bad_action.get("error_code") == "INVALID_PARAM":
+                print("✓ perform_ui_action: unsupported action returns INVALID_PARAM")
+            else:
+                print(f"✗ perform_ui_action bad-action handling failed: {r_bad_action}")
+
         # Test run_terminal_command with structured output
         result = automac_mcp.run_terminal_command("echo hello", timeout_seconds=5)
         if result and result.get("status") == "success":
@@ -221,6 +347,20 @@ def test_mcp_server():
             print("✓ managed connector capability path configured")
         else:
             print(f"✗ managed connector path failed: {managed.stderr or managed.stdout}")
+            return False
+
+        # Dev-only port override (lets a local test server run without colliding
+        # with an already-running managed instance on the default port).
+        port_env = os.environ.copy()
+        port_env.update({"MAC_ORCHESTRATOR_PORT": "8791", "PYTHONDONTWRITEBYTECODE": "1"})
+        port_check = subprocess.run(
+            [sys.executable, "-B", "-c", "import automac_mcp; print(automac_mcp.SERVER_PORT)"],
+            capture_output=True, text=True, env=port_env, timeout=15,
+        )
+        if port_check.returncode == 0 and port_check.stdout.strip() == "8791":
+            print("✓ MAC_ORCHESTRATOR_PORT override works")
+        else:
+            print(f"✗ port override failed: {port_check.stderr or port_check.stdout}")
             return False
 
         # Background commands are registered and terminated by server cleanup.

@@ -3,11 +3,11 @@
 ## What this is
 
 Mac Orchestrator combines a Python FastMCP server (`automac_mcp.py`) with a
-native Swift menu-bar supervisor. The server gives trusted AI agents 20 tools
+native Swift menu-bar supervisor. The server gives trusted AI agents 24 tools
 to control a macOS desktop. The installed supervisor owns the Python and ngrok
 processes, while direct Python execution remains available for development.
 
-**The file you will almost always be editing:** `automac_mcp.py` (~1340 lines).
+**The file you will almost always be editing:** `automac_mcp.py` (~2250 lines).
 
 ---
 
@@ -15,7 +15,7 @@ processes, while direct Python execution remains available for development.
 
 | File | Purpose |
 |------|---------|
-| `automac_mcp.py` | The server: 20 MCP tools + internal helpers + startup (~1340 lines) |
+| `automac_mcp.py` | The server: 24 MCP tools + internal helpers + startup (~2250 lines) |
 | `indexer.py` | Standalone crawler — indexes local files into Cloudflare RAG for `vector_search` |
 | `Sources/MacOrchestrator/` | Native menu-bar supervisor, Keychain, process lifecycle, and rotating logs |
 | `script/distribute.sh` | Personal install/update flow for this Mac |
@@ -31,17 +31,25 @@ processes, while direct Python execution remains available for development.
 
 The file has **four distinct layers**. Don't mix them up.
 
-### Layer 1 — Helpers and constants (lines 1–140)
-Setup, imports, global flags, response builders, the KEY_MAP/MODIFIER_MAP tables, and the AppleScript runner.
+### Layer 1 — Helpers and constants (lines 1–~255)
+Setup, imports, global flags, response builders, permission-error classification,
+the KEY_MAP/MODIFIER_MAP tables, and the AppleScript runner.
 
 Key items:
-- `ACCESSIBILITY_AVAILABLE` (line 37) — `False` if pyobjc import failed; several tools fail gracefully when this is False.
-- `_ok(msg, **data)` (line 63) — builds `{"status": "success", "message": msg, ...data}`
-- `_fail(msg, error_code, **data)` (line 66) — builds `{"status": "error", "error_code": ..., "message": msg, ...data}`
-- `_scale(x, y)` (line 71) — converts raw Retina pixel coords → logical coords for pyautogui
-- `_run_applescript(body, timeout)` (line 128) — wraps body in `tell application "System Events"` and runs via osascript
+- `ACCESSIBILITY_AVAILABLE` (~line 44) — `False` only if the pyobjc *import itself*
+  failed. It does NOT mean Accessibility permission is granted — for the real,
+  live grant status use `AXIsProcessTrusted()` (or call `get_session_state()`).
+- `SERVER_PORT` (~line 66) — reads `MAC_ORCHESTRATOR_PORT` env var (default 8000).
+  Use this to run a local dev server without colliding with an already-running
+  managed instance.
+- `_ok(msg, **data)` / `_fail(msg, error_code, **data)` — standard response builders.
+- `_classify_applescript_error(stderr)` — maps known TCC-denial stderr substrings
+  to a permission name; wired into `_run_applescript()` so denied AppleScript
+  calls surface as `error_code="PERMISSION"` instead of generic `EXEC_ERROR`.
+- `_scale(x, y)` — converts raw Retina pixel coords → logical coords for pyautogui.
+- `_run_applescript(body, timeout)` — wraps body in `tell application "System Events"`.
 
-### Layer 2 — Internal implementations (`_do_*`, lines 144–260)
+### Layer 2 — Internal implementations (`_do_*`)
 Private Python functions. Called by MCP tools AND by `execute_macro`. Changing behavior here affects both.
 
 | Function | Does |
@@ -50,11 +58,22 @@ Private Python functions. Called by MCP tools AND by `execute_macro`. Changing b
 | `_do_mouse(x, y, action, hold_keys, end_x, end_y)` | Calls `_scale` then pyautogui; handles modifier key hold and drag |
 | `_do_type(text, use_clipboard)` | Auto-detects ASCII vs Unicode; uses clipboard for non-ASCII |
 | `_do_scroll(dx, dy)` | CGEvent for both axes — consistent pixel units |
-| `_do_focus_app(app_name, timeout)` | osascript activate + polls NSWorkspace until active |
-| `_ax_get(elem, attr)` | Helper: safely reads an AX attribute from an accessibility element |
+| `_do_focus_app(app_name, timeout)` | osascript activate + polls `NSWorkspace.frontmostApplication()` until active |
 
-### Layer 3 — MCP Tools (public API, lines 270–1060)
-All `@mcp.tool()` decorated functions. These are what agent clients call.
+### Layer 3 — MCP Tools (public API)
+All `@mcp.tool()` decorated functions, plus the AX-tree helpers colocated with
+the tools that use them (accessibility code is tightly coupled to its call
+sites, so it lives near `get_ui_tree`/`perform_ui_action`/`get_screen_layout`
+rather than up in Layer 1):
+
+| Helper | Does |
+|--------|------|
+| `_ax_get(elem, attr)` | Safely reads an AX attribute; `None` on any failure |
+| `_ax_point(val)` / `_ax_size(val)` | Unwrap an `AXValueRef` via `AXValueGetValue()` — accessing `.x`/`.y`/`.width`/`.height` directly on the raw value raises `AttributeError` |
+| `_ax_set_timeout(elem)` | Calls `AXUIElementSetMessagingTimeout` so one wedged app can't block a whole traversal |
+| `_list_running_apps()` / `_resolve_app_pid(app, pid)` | Canonical, pid-keyed app enumeration shared by `get_available_apps`, `get_screen_layout`, `get_ui_tree` |
+| `_ax_register(elem, pid)` / `_ax_resolve(ref)` | The `ref` registry backing `get_ui_tree`/`perform_ui_action` — stores the actual `AXUIElementRef`, not a re-walkable path, so a stale ref fails cleanly instead of silently acting on the wrong element |
+| `_AXWalkState`, `_ax_walk_tree`, `_ax_walk_flat` | Traversal: unfiltered calls build a nested tree; `role_filter`/`actionable_only` switch to a flat "collect every match, ignore hierarchy" walk. Both share one node-visit budget independent of the emitted-node `limit`. |
 
 ### Layer 4 — Server startup
 `setup_telegram()`, `setup_ngrok()`, `main()` — interactive local development
@@ -63,7 +82,13 @@ passes a Keychain-backed capability path to the server.
 
 ---
 
-## All 20 MCP tools (fast reference)
+## All 24 MCP tools (fast reference)
+
+### Orientation
+| Tool | Key params | Returns |
+|------|-----------|---------|
+| `describe` | `topic: str = "overview"` | `text: str` — full-length docs for topics trimmed out of tool descriptions to keep connect-time context small: "overview", "macro_actions", "find_file_query_syntax", "ui_inspection", "coordinate_system". Unknown topic returns `available_topics` instead of erroring. |
+| `get_session_state` | — | `gui_interaction_available: bool`, `session: {on_console, is_locked}`, `permissions: {accessibility, screen_recording}`, `notes: list[str]`. Call this first for UI work, or after any tool fails in a way that might be permission/session-related. |
 
 ### Keyboard / Input
 | Tool | Key params | Returns |
@@ -86,14 +111,16 @@ passes a Keychain-backed capability path to the server.
 | Tool | Key params | Returns |
 |------|-----------|---------|
 | `focus_app` | `app_name: str`, `timeout: int` | status + active_app dict |
-| `get_available_apps` | — | `apps: list[str]` |
+| `get_available_apps` | — | `apps: list[str]`, `apps_detail: list[{name, bundle_id, pid, activation_policy}]`. `activation_policy` is `"regular"` (Dock-visible, meaningful `focus_app()` target) or `"accessory"` (menu-bar/background agent) — filter on it, since the raw list includes ~40 invisible system agents alongside real apps. |
 
 ### Screen
 | Tool | Key params | Returns |
 |------|-----------|---------|
 | `get_screen_size` | — | `logical_width/height`, `pixel_width/height`, `scale_factor` |
-| `get_screen_layout` | — | `windows: list` — uses AX API, works for all modern apps |
-| `get_screen_text` | `screenshot: bool = False` | OCR mode: `text_elements: list`, `full_text: str` in **logical** coords. Screenshot mode: `screenshot_path`, `logical_width/height`, `pixel_width/height` |
+| `get_screen_layout` | — | `windows: list[{app, pid, title, bounds?}]` — cheap top-level window survey, one row per window, no children. `bounds` is populated (was silently dropped before the `AXValueGetValue()` fix — see below). |
+| `get_ui_tree` | `app/pid/ref`, `depth`, `role_filter: list[str]`, `actionable_only: bool`, `limit`, `node_budget`, `continuation_token` | `elements: list` with a stable `ref` per element (buttons, fields, labels — nested tree, or flat list when `role_filter`/`actionable_only` is set), `has_more`, `continuation_token`, `node_budget_exhausted` (true only when `node_budget` — not the routine per-page `limit` — was the reason traversal stopped). The accessibility-tree equivalent of `get_screen_layout` — prefer this over OCR for anything that isn't custom-drawn. |
+| `perform_ui_action` | `ref: str`, `action: str = "click"`, `value: Optional[str]` | `changed: dict` (before/after diff), `current_state: dict`. Resolves a `ref` from `get_ui_tree()` and acts on the exact retained element, then reports whether anything actually changed. |
+| `get_screen_text` | `screenshot: bool = False` | OCR mode: `text_elements: list`, `full_text: str` in **logical** coords. Screenshot mode: `screenshot_path`, `logical_width/height`, `pixel_width/height`. Fallback for content `get_ui_tree` can't see (canvases, images, custom-drawn UI) — slower and coordinate-only. |
 
 ### File system
 | Tool | Key params | Returns |
@@ -171,9 +198,12 @@ path = result["files"][0]["path"]
 content = read_file(path)["content"]
 ```
 
-**Click something visible on screen:**
+**Click something visible on screen (prefer get_ui_tree over OCR):**
 ```python
-# OCR coords are in logical space — pass directly to mouse_action
+tree = get_ui_tree(app="Notes", role_filter=["AXButton"], actionable_only=True)
+target = next(e for e in tree["elements"] if "Submit" in e["label"])
+perform_ui_action(ref=target["ref"], action="click")
+# Falls back to OCR + mouse_action only for custom-drawn UI get_ui_tree can't see:
 elements = get_screen_text()["text_elements"]
 target = next(e for e in elements if "Submit" in e["text"])
 mouse_action(x=target["position"]["center_x"], y=target["position"]["center_y"])
@@ -228,10 +258,13 @@ execute_macro([
 ## What NOT to change without care
 
 - **`pyautogui.FAILSAFE = True`** — moving mouse to screen corner aborts execution. Do not set to False.
-- **`ACCESSIBILITY_AVAILABLE` guard** — many tools silently degrade when pyobjc is missing. Don't assume it's always True.
+- **`ACCESSIBILITY_AVAILABLE` guard** — many tools silently degrade when pyobjc is missing. Don't assume it's always True, and don't confuse it with actual permission grant status (`AXIsProcessTrusted()`).
 - **`get_ocr_reader()`** — EasyOCR lazy-loads on first call (~5s delay). Don't eagerly initialize at module load.
 - **`execute_macro` dispatch table** — if you add a new `_do_*` function, add the corresponding case here or it won't work in macros.
 - **`_run_applescript` wraps in `System Events` tell block** — don't add another tell block inside the body argument, it will nest incorrectly.
+- **`AXPosition`/`AXSize` are `AXValueRef` objects, not structs** — `AXUIElementCopyAttributeValue` returns them opaque; accessing `.x`/`.y`/`.width`/`.height` directly raises `AttributeError`. Always go through `_ax_point()`/`_ax_size()` (which call `AXValueGetValue()`). This was silently broken for the entire lifetime of `get_screen_layout()` before the fix — a bare `except Exception: pass` swallowed the `AttributeError` and `bounds` was never emitted, on any Mac, regardless of permissions.
+- **AX ref registry (`_ax_registry`)** — `get_ui_tree()` refs hold live `AXUIElementRef` objects, not paths. Don't "optimize" `perform_ui_action` to re-resolve a ref by re-walking the tree by position — that can silently act on a different element than the one the agent inspected if the UI changed in between. A stale/evicted ref must fail with `NOT_FOUND`, never silently resolve to something else.
+- **AX traversal budget (`node_budget` vs `limit`)** — `limit` bounds what's *returned*; `node_budget` bounds what's *visited*. Don't remove `node_budget` or the per-app `_ax_set_timeout()` call — without them, a single wedged/beachballing app or a huge element tree can block a `get_ui_tree()` call indefinitely.
 
 ---
 
@@ -252,6 +285,10 @@ PYTHONDONTWRITEBYTECODE=1 uv run python -B test_mcp_server.py
 
 # Start server (interactive — prompts for Telegram + ngrok)
 uv run python automac_mcp.py
+
+# Run a local dev server on an alt port (won't collide with a running managed
+# instance on 8000) — bypasses main()'s interactive prompts:
+MAC_ORCHESTRATOR_PORT=8791 uv run python -c "import automac_mcp; automac_mcp.mcp.run(transport='streamable-http', mount_path='/mcp')"
 
 # Build the native app
 swift build

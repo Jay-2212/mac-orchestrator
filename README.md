@@ -183,6 +183,15 @@ Direct development listens on `http://127.0.0.1:8000/mcp` and retains the
 interactive Telegram/ngrok setup. It never kills an existing port-8000
 listener; startup fails normally and leaves that process untouched.
 
+To run a local dev server on a different port — e.g. to test changes without
+colliding with an already-running managed instance — set
+`MAC_ORCHESTRATOR_PORT`:
+
+```bash
+MAC_ORCHESTRATOR_PORT=8791 uv run python -c \
+  "import automac_mcp; automac_mcp.mcp.run(transport='streamable-http', mount_path='/mcp')"
+```
+
 For the native development bundle:
 
 ```bash
@@ -194,14 +203,53 @@ For the native development bundle:
 
 | Area | Tools |
 |---|---|
+| Orientation | `describe`, `get_session_state` |
 | Keyboard and pointer | `press_keystroke`, `type_text`, `mouse_action`, `scroll` |
 | Macros and apps | `execute_macro`, `focus_app`, `get_available_apps` |
-| Screen | `get_screen_size`, `get_screen_layout`, `get_screen_text` |
+| Screen | `get_screen_size`, `get_screen_layout`, `get_ui_tree`, `perform_ui_action`, `get_screen_text` |
 | Terminal | `run_terminal_command` |
 | Files | `find_file`, `vector_search`, `read_file`, `write_file`, `list_directory`, `smart_search` |
 | Utility | `clipboard`, `play_sound_for_user_prompt`, `send_file_to_telegram` |
 
-All 20 existing tool names and normal arguments remain unchanged.
+24 tools total (up from 20). All prior tool names and arguments remain unchanged
+— existing clients keep working without modification.
+
+### New in this release
+
+- **`get_ui_tree(app/pid/ref, depth, role_filter, actionable_only, limit,
+  node_budget, continuation_token)`** — a real macOS accessibility tree (buttons,
+  fields, labels, roles) with a stable `ref` per element, instead of relying on
+  OCR-coordinate clicking for everything. Supports depth limits, role/actionable
+  filtering, and pagination for large trees, with a `node_budget` that bounds how
+  many elements are *visited* (not just returned) so one slow or wedged app can't
+  block a call.
+- **`perform_ui_action(ref, action, value)`** — acts on an element previously
+  returned by `get_ui_tree` (click, focus, set value, or a named AX action) and
+  reports an honest before/after diff, so the agent knows whether the action
+  actually took effect rather than assuming success.
+- **`get_session_state()`** — reports whether the screen is locked, whether this
+  is the active console session, and whether Accessibility/Screen Recording
+  permissions are genuinely granted (not just theoretically available). Lets an
+  agent recognize "the session is locked" or "permission isn't granted" instead
+  of retrying a doomed UI action and reporting a generic failure.
+- **`describe(topic)`** — on-demand deep documentation (macro action catalog,
+  `find_file` query syntax, UI-inspection guide, coordinate system) for anything
+  trimmed out of the shorter tool descriptions, so connecting doesn't cost a lot
+  of context up front.
+- **`get_screen_layout()` now actually returns window `bounds`.** Previously,
+  `AXPosition`/`AXSize` came back as opaque `AXValueRef` objects that raised
+  `AttributeError` when read directly; a bare exception handler silently
+  swallowed this, so no window ever had a `bounds` field. Fixed via
+  `AXValueGetValue()`.
+- **`get_available_apps()` now enumerates the same app set as `get_screen_layout`/
+  `get_ui_tree`** (previously a narrower, inconsistent list from a different
+  AppleScript query). This means `apps`/`apps_detail` now include roughly 40
+  additional background/menu-bar-only agents alongside ordinary apps — filter
+  `apps_detail` on `activation_policy == "regular"` for Dock-visible apps that
+  are meaningful `focus_app()` targets.
+- AppleScript permission failures (e.g. Automation/Accessibility denial) now
+  surface as `error_code="PERMISSION"` with a specific recovery hint, instead of
+  a generic `EXEC_ERROR`.
 
 Background terminal commands are still supported, but the server now registers
 them and terminates them during managed shutdown. Synchronous commands remain
@@ -295,8 +343,10 @@ swift build -c release
 git diff --check
 ```
 
-The Python suite verifies all 20 tools, representative tool behavior, managed
-capability-path configuration, and background-process cleanup. Installation
+The Python suite verifies all 24 tools, representative tool behavior, managed
+capability-path configuration, background-process cleanup, and a durable
+`get_ui_tree` pagination regression test (compares a paginated walk against an
+unpaginated baseline in both tree and flat/filtered mode). Installation
 acceptance additionally exercises local and public MCP initialization, duplicate
 prevention, owned server/tunnel crash recovery, app crash recovery, and clean
 quit cleanup.

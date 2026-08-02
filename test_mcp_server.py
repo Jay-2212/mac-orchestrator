@@ -329,6 +329,46 @@ def test_mcp_server():
         else:
             print(f"✗ execute_macro first-step failure wrong: {macro_first_fail}")
 
+        # Test AppleScript permission-error classification — pure function, no
+        # live permission denial needed to exercise it.
+        classify_cases = [
+            ("Not authorized to send Apple events to Finder.", "Automation"),
+            ("osascript is not allowed assistive access.", "Accessibility"),
+            ("some app doesn't have assistive access enabled", "Accessibility"),
+            ("execution error: An error of type -1743 has occurred.", "Automation"),
+            ("execution error: -25211", "Accessibility"),
+            ("NOT AUTHORIZED TO SEND APPLE EVENTS", "Automation"),  # case-insensitive
+            ("syntax error near unexpected token", None),
+            ("", None),
+        ]
+        classify_ok = True
+        for stderr_sample, expected in classify_cases:
+            got = automac_mcp._classify_applescript_error(stderr_sample)
+            if got != expected:
+                classify_ok = False
+                print(f"✗ _classify_applescript_error({stderr_sample!r}) = {got!r}, expected {expected!r}")
+        if classify_ok:
+            print(f"✓ _classify_applescript_error: {len(classify_cases)} cases classified correctly")
+        else:
+            return False
+
+        # Test AX ref registry FIFO eviction at AX_REGISTRY_CAP — registers
+        # plain strings as fake elements since _ax_register doesn't type-check
+        # its argument, so this needs no live accessibility tree.
+        cap = automac_mcp.AX_REGISTRY_CAP
+        first_ref = automac_mcp._ax_register("sentinel-0", pid=999999)
+        last_ref = None
+        for i in range(1, cap + 5):
+            last_ref = automac_mcp._ax_register(f"sentinel-{i}", pid=999999)
+        if (automac_mcp._ax_resolve(first_ref) is None
+                and automac_mcp._ax_resolve(last_ref) == f"sentinel-{cap + 4}"
+                and len(automac_mcp._ax_registry_order) == cap):
+            print(f"✓ AX ref registry eviction: oldest ref evicted, cap={cap} enforced, latest ref still resolvable")
+        else:
+            print(f"✗ AX ref registry eviction failed: first_ref resolves={automac_mcp._ax_resolve(first_ref)!r}, "
+                  f"registry size={len(automac_mcp._ax_registry_order)}")
+            return False
+
         # Managed connector paths are high-entropy and URL-safe.
         managed_env = os.environ.copy()
         managed_env.update({

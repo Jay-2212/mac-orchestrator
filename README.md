@@ -87,7 +87,9 @@ From this checkout:
 The script:
 
 1. builds the Swift app in release mode;
-2. ad-hoc signs the personal app and bundled ngrok executable;
+2. signs the personal app and bundled ngrok executable — ad-hoc by default,
+   or with `$CODESIGN_IDENTITY` if set (see
+   [Avoiding repeated permission grants after every rebuild](#avoiding-repeated-permission-grants-after-every-rebuild));
 3. installs the app at `/Applications/Mac Orchestrator.app`;
 4. installs a self-contained Python environment under
    `~/Library/Application Support/Mac Orchestrator/runtime`;
@@ -115,6 +117,72 @@ The automation tools need:
 Grant the permission to the installed Mac Orchestrator/Python helper shown by
 System Settings, then use **Restart** from the menu. Existing Terminal
 permissions do not necessarily transfer to the installed helper.
+
+## Avoiding repeated permission grants after every rebuild
+
+By default `package_app.sh` signs the app **ad-hoc** (`codesign --sign -`).
+An ad-hoc signature's designated requirement is just a hash of the binary's
+contents (`cdhash`). Every rebuild produces different contents, so that hash
+changes — and TCC (Screen Recording especially) treats the rebuilt app as an
+unrecognized app, silently dropping the grant. That's why Screen Recording
+has to be re-granted after every `./script/distribute.sh`, even though the
+Python side (the venv interpreter) never changes: the grant is attributed to
+the Swift app bundle that spawns it, not to Python.
+
+The fix is a *persistent* signing identity. As long as the same certificate
+signs every build, the designated requirement is based on that certificate
+rather than the binary's hash, so it stays identical across rebuilds — and
+the TCC grant survives with it. This does not require a paid Apple Developer
+account.
+
+One-time setup:
+
+1. Open **Keychain Access** → menu bar **Keychain Access → Certificate
+   Assistant → Create a Certificate…**
+2. Name: anything memorable, e.g. `Mac Orchestrator Local Signing`. Identity
+   Type: **Self Signed Root**. Certificate Type: **Code Signing**. Keychain:
+   **login**.
+3. Click **Create**, then **Done**.
+4. Prove the fix *before* spending a permission grant on it — build twice
+   with the identity set, touching a Swift source file in between, and diff
+   the designated requirement:
+   ```bash
+   CODESIGN_IDENTITY="Mac Orchestrator Local Signing" ./script/package_app.sh
+   codesign -d -r- "dist/Mac Orchestrator.app" > /tmp/req1.txt
+   touch Sources/MacOrchestrator/main.swift   # force a real rebuild
+   CODESIGN_IDENTITY="Mac Orchestrator Local Signing" ./script/package_app.sh
+   codesign -d -r- "dist/Mac Orchestrator.app" > /tmp/req2.txt
+   diff /tmp/req1.txt /tmp/req2.txt && echo "IDENTICAL — safe to install"
+   ```
+   The requirement must show `certificate leaf = H"..."` and must **not**
+   contain `cdhash`. If `diff` reports no difference, the same TCC grant will
+   survive both builds. (`security find-identity -v -p codesigning` may
+   report 0 "valid" identities for a self-signed cert with no trusted root —
+   that's expected and unrelated; `codesign --sign "<name>"` still uses it by
+   name, and it's `codesign -d -r-`, not `find-identity`, that actually
+   proves this works.)
+5. Remove the stale permission entry before granting against the newly
+   signed build — the old ad-hoc entry in System Settings still carries the
+   old cdhash-based rule, so leaving it can make the toggle read as ON while
+   access is actually denied:
+   ```bash
+   tccutil reset ScreenCapture com.jay.mac-orchestrator
+   tccutil reset Accessibility com.jay.mac-orchestrator
+   ```
+6. Install with the identity set, and keep using it for every future
+   install/update:
+   ```bash
+   CODESIGN_IDENTITY="Mac Orchestrator Local Signing" ./script/distribute.sh
+   ```
+   Grant Accessibility/Screen Recording once after this install. Consider
+   exporting the identity in your shell profile so you don't have to repeat
+   it:
+   ```bash
+   export CODESIGN_IDENTITY="Mac Orchestrator Local Signing"
+   ```
+
+Without `CODESIGN_IDENTITY` set, `package_app.sh` falls back to ad-hoc
+signing and prints a warning.
 
 ## Menu-bar controls
 

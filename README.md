@@ -1,266 +1,152 @@
 # Mac Orchestrator
 
-Mac Orchestrator is a personal macOS MCP server that lets trusted AI clients
-control this Mac through one authenticated connector URL. It combines native
-macOS UI automation, screen reading, file access, clipboard control, terminal
-commands, and macros in one FastMCP server.
+[![License: CC0 1.0](https://img.shields.io/badge/License-CC0%201.0-lightgrey.svg)](LICENSE)
+[![Platform: macOS](https://img.shields.io/badge/platform-macOS-black.svg)](https://www.apple.com/macos/)
 
-> **Personal installation only.** This repository is configured for Jay's Mac.
-> It is not a public installer, App Store product, or multi-user service.
+Mac Orchestrator is a local-first, self-hosted macOS MCP server for trusted AI
+clients. It brings macOS UI automation, screen inspection, file access,
+clipboard control, terminal commands, application control, and macros behind a
+single MCP connector.
+
+The current architecture is deliberately single-user by design: one trusted
+agent connects to one Mac through a capability URL. This is a public community
+source project, but it is not a hosted service, a multi-tenant server, or an
+OAuth provider. The code originated as Jay Prakash Bharti's personal tool and
+is now documented for people who want to inspect, adapt, and self-host it.
+
+## Status and scope
+
+The current main branch exposes 24 MCP tools and includes a native menu-bar
+supervisor, managed local processes, authenticated public ingress, permission
+diagnostics, and Python tests. There is no tagged binary release in the GitHub
+repository at the time of writing. The included installer builds a local app;
+it does not perform Developer ID signing, notarisation, App Store packaging, or
+hosted deployment.
+
+This project is intended for technically capable users who understand the
+permissions and trust required to let an AI client operate their Mac. It should
+not be treated as a security boundary between mutually untrusted users.
+
+## What it does
+
+- Runs a Python FastMCP server for macOS automation and local retrieval.
+- Provides keyboard, pointer, application, window, screen, UI-tree, clipboard,
+  file, terminal, macro, and utility tools.
+- Supervises the Python server and ngrok from a Swift menu-bar application.
+- Starts public ingress only after the local server is healthy.
+- Tracks and cleans up only processes created by this installation.
+- Restarts owned children with bounded backoff and checks health after wake.
+- Reports lock state, active-console state, and actual Accessibility and Screen
+  Recording permission state through `get_session_state`.
+- Optionally sends a file to Telegram through the existing connector setup.
 
 ## Architecture
 
 ```text
 macOS LaunchAgent
-  └── Mac Orchestrator menu-bar app (Swift supervisor)
+  └── Swift menu-bar supervisor
         ├── Python FastMCP server → 127.0.0.1:8000
         └── ngrok agent → authenticated capability URL → local server
 ```
 
-The native menu-bar app owns both child processes. The Python server no longer
-kills whatever happens to use port 8000, and it does not own ngrok in managed
-mode. The app records only the PIDs it launches, adds a per-installation
-ownership marker, and validates that marker before cleaning stale processes.
+The supervisor owns both child processes. It starts ngrok only after a local
+health check, closes ingress before stopping the server, applies bounded restart
+backoff, and refuses to clean processes that do not carry this installation's
+ownership marker.
 
-The Swift supervisor:
+## Trust and security model
 
-- prevents duplicate app instances with an exclusive local lock;
-- starts the Python server in its own process group;
-- starts ngrok only after the local MCP health check passes;
-- stops public ingress before stopping the server;
-- uses bounded restart backoff and a crash-loop circuit breaker;
-- cleans owned stale processes after an app crash;
-- terminates MCP-launched background command processes on stop or quit;
-- reconnects and rechecks health after wake;
-- writes small rotating diagnostic logs.
-
-## Authentication model
-
-Managed installations use a 256-bit random capability token stored in macOS
-Keychain. The token is part of the MCP endpoint path:
+Managed installations generate a random 256-bit capability token and store it
+in the macOS Keychain. The token is part of the connector path:
 
 ```text
 https://<current-ngrok-host>/<keychain-token>/mcp
 ```
 
-Requests to the ordinary public `/mcp` path return `404`. The exact connector
-URL is available only from **Copy Connector URL** in the menu-bar app.
+The ordinary public `/mcp` path intentionally returns `404`. The exact URL is
+available from **Copy Connector URL** in the menu-bar app.
 
-Treat that URL like a password. Anyone who obtains it can invoke the enabled
-Mac tools without per-action approval. Do not paste it into documents, issues,
-logs, screenshots, or chat messages other than the trusted MCP connector
-configuration in ChatGPT or Claude.
+Treat the connector URL like a password. Anyone who obtains it can invoke the
+enabled tools without a separate approval prompt for each action. In particular,
+`run_terminal_command`, file writes, UI actions, and application control can
+change the Mac or its data. Do not put the URL in issues, screenshots, logs,
+documents, or chat messages beyond the trusted MCP client configuration.
 
-The supervisor redacts the capability token from captured server output and
-discards its own health-probe access lines so the capability path is not written
-to local logs. ngrok provides TLS for the public connection.
-This intentionally simple capability-URL boundary is optimized for maximum MCP
-client compatibility on a single-user personal system; it is not a substitute
-for multi-user OAuth authorization.
+The URL is the trust boundary in the current release. Authentication is
+capability-URL based, not OAuth-based, and there are no user accounts, roles, or
+per-action authorization rules. ngrok provides the public TLS connection, but
+enabling public ingress still exposes a powerful local system to whoever has
+the URL. Keep the connector disabled when it is not needed and review the ngrok
+account and endpoint configuration yourself.
 
-To rotate a leaked connector token:
+The optional indexer can read local files and upload their extracted contents
+to the configured Meridian backend. The repository does not guarantee that
+those contents are private once they leave the Mac; review the backend,
+provider, and retention policies before indexing sensitive material.
+
+### Permissions
+
+Depending on the tools you use, macOS may request:
+
+- **Accessibility** for keystrokes, clicks, application focus, and UI data;
+- **Screen & System Audio Recording** for screenshots and OCR;
+- **Automation** for Apple Events sent to System Events or another app.
+
+Permissions are granted to the installed app/helper shown by macOS. Existing
+Terminal permissions do not necessarily transfer to the installed helper.
+
+### Session and lock-screen limitation
+
+`get_session_state` can report that a session is locked or that a required
+permission is missing. It does not unlock the Mac or make UI automation work at
+the lock screen. UI tools require a usable, unlocked console session and the
+appropriate macOS permissions; this project does not claim unattended lock-screen
+operation.
+
+## Requirements
+
+- Apple Silicon Mac running macOS 13 or newer.
+- A Swift toolchain from Xcode or the Apple Command Line Tools.
+- Python 3.10 or newer and [`uv`](https://docs.astral.sh/uv/).
+- An ngrok account and authtoken configured at
+  `~/Library/Application Support/ngrok/ngrok.yml` for managed public ingress.
+
+## Install the managed app
 
 ```bash
-security delete-generic-password \
-  -s com.jay.mac-orchestrator \
-  -a connector-capability-token
-```
-
-Then quit and relaunch Mac Orchestrator. Copy the new connector URL into each
-trusted client.
-
-## Personal install or update
-
-Prerequisites:
-
-- macOS on Apple Silicon;
-- `uv`;
-- an ngrok account and authtoken already configured at
-  `~/Library/Application Support/ngrok/ngrok.yml`.
-
-From this checkout:
-
-```bash
+git clone https://github.com/Jay-2212/mac-orchestrator.git
+cd mac-orchestrator
 ./script/distribute.sh
 ```
 
-The script:
+The script builds a release app, bundles the ngrok executable from the local
+ngrok installation, creates a Python environment under
+`~/Library/Application Support/Mac Orchestrator/runtime`, installs the app at
+`/Applications/Mac Orchestrator.app`, installs a user LaunchAgent, and launches
+the menu-bar supervisor.
 
-1. builds the Swift app in release mode;
-2. signs the personal app and bundled ngrok executable — ad-hoc by default,
-   or with `$CODESIGN_IDENTITY` if set (see
-   [Avoiding repeated permission grants after every rebuild](#avoiding-repeated-permission-grants-after-every-rebuild));
-3. installs the app at `/Applications/Mac Orchestrator.app`;
-4. installs a self-contained Python environment under
-   `~/Library/Application Support/Mac Orchestrator/runtime`;
-5. installs `~/Library/LaunchAgents/com.jay.mac-orchestrator.plist`;
-6. launches the menu-bar app.
+The default code signature is ad hoc. Set `CODESIGN_IDENTITY` to a persistent
+local signing identity or a suitable Apple signing identity if you want TCC
+permissions to survive rebuilds. The packaging script does not notarise the
+app. See the signing notes in the script and the issue tracker before making a
+distribution decision.
 
-Run the same command to update the installation. It asks the running app to
-quit cleanly before replacing files. No Developer ID, notarization, App Store,
-or public-distribution packaging is performed.
-
-After installation, startup and login recovery do not require Terminal.
-
-## First launch and permissions
-
-The server starts automatically. Public ingress is disabled until you choose
-**Enable Public Connector** in the menu.
-
-The automation tools need:
-
-- **Accessibility** for keystrokes, clicks, app focus, and window information;
-- **Screen & System Audio Recording** for screenshots and OCR;
-- **Automation** permission when macOS asks to control System Events or another
-  application.
-
-Grant the permission to the installed Mac Orchestrator/Python helper shown by
-System Settings, then use **Restart** from the menu. Existing Terminal
-permissions do not necessarily transfer to the installed helper.
-
-## Avoiding repeated permission grants after every rebuild
-
-By default `package_app.sh` signs the app **ad-hoc** (`codesign --sign -`).
-An ad-hoc signature's designated requirement is just a hash of the binary's
-contents (`cdhash`). Every rebuild produces different contents, so that hash
-changes — and TCC (Screen Recording especially) treats the rebuilt app as an
-unrecognized app, silently dropping the grant. That's why Screen Recording
-has to be re-granted after every `./script/distribute.sh`, even though the
-Python side (the venv interpreter) never changes: the grant is attributed to
-the Swift app bundle that spawns it, not to Python.
-
-The fix is a *persistent* signing identity. As long as the same certificate
-signs every build, the designated requirement is based on that certificate
-rather than the binary's hash, so it stays identical across rebuilds — and
-the TCC grant survives with it. This does not require a paid Apple Developer
-account.
-
-One-time setup:
-
-1. Open **Keychain Access** → menu bar **Keychain Access → Certificate
-   Assistant → Create a Certificate…**
-2. Name: anything memorable, e.g. `Mac Orchestrator Local Signing`. Identity
-   Type: **Self Signed Root**. Certificate Type: **Code Signing**. Keychain:
-   **login**.
-3. Click **Create**, then **Done**.
-4. Prove the fix *before* spending a permission grant on it — build twice
-   with the identity set, touching a Swift source file in between, and diff
-   the designated requirement:
-   ```bash
-   CODESIGN_IDENTITY="Mac Orchestrator Local Signing" ./script/package_app.sh
-   codesign -d -r- "dist/Mac Orchestrator.app" > /tmp/req1.txt
-   touch Sources/MacOrchestrator/main.swift   # force a real rebuild
-   CODESIGN_IDENTITY="Mac Orchestrator Local Signing" ./script/package_app.sh
-   codesign -d -r- "dist/Mac Orchestrator.app" > /tmp/req2.txt
-   diff /tmp/req1.txt /tmp/req2.txt && echo "IDENTICAL — safe to install"
-   ```
-   The requirement must show `certificate leaf = H"..."` and must **not**
-   contain `cdhash`. If `diff` reports no difference, the same TCC grant will
-   survive both builds. (`security find-identity -v -p codesigning` may
-   report 0 "valid" identities for a self-signed cert with no trusted root —
-   that's expected and unrelated; `codesign --sign "<name>"` still uses it by
-   name, and it's `codesign -d -r-`, not `find-identity`, that actually
-   proves this works.)
-5. Remove the stale permission entry before granting against the newly
-   signed build — the old ad-hoc entry in System Settings still carries the
-   old cdhash-based rule, so leaving it can make the toggle read as ON while
-   access is actually denied:
-   ```bash
-   tccutil reset ScreenCapture com.jay.mac-orchestrator
-   tccutil reset Accessibility com.jay.mac-orchestrator
-   ```
-6. Install with the identity set, and keep using it for every future
-   install/update:
-   ```bash
-   CODESIGN_IDENTITY="Mac Orchestrator Local Signing" ./script/distribute.sh
-   ```
-   Grant Accessibility/Screen Recording once after this install. Consider
-   exporting the identity in your shell profile so you don't have to repeat
-   it:
-   ```bash
-   export CODESIGN_IDENTITY="Mac Orchestrator Local Signing"
-   ```
-
-Without `CODESIGN_IDENTITY` set, `package_app.sh` falls back to ad-hoc
-signing and prints a warning.
-
-## Menu-bar controls
-
-The status dot summarizes the product state:
-
-- green: server and public connector running;
-- blue: local server running, public connector disabled;
-- yellow: starting, stopping, or reconnecting;
-- red: failure that needs attention;
-- gray: stopped.
-
-The menu shows:
-
-- server status;
-- tunnel status;
-- current connector host;
-- **Copy Connector URL**;
-- **Start Server** / **Stop Server**;
-- **Enable Public Connector** / **Disable Public Connector**;
-- **Restart**;
-- **Open Logs**;
-- login-launch status;
-- **Quit Mac Orchestrator**.
-
-Quit always closes ngrok first, stops the Python process group, removes owned
-background jobs, and exits cleanly. Because the LaunchAgent records a successful
-exit, it does not immediately reopen the app. It starts again at the next login;
-you can also open `/Applications/Mac Orchestrator.app` manually.
-
-The public-connector preference persists. A fresh install defaults to disabled.
-After you explicitly enable it, login/crash recovery restores it automatically.
-
-## Connect ChatGPT or Claude
-
-1. Choose **Enable Public Connector**.
-2. Wait until the status dot is green.
-3. Choose **Copy Connector URL**.
-4. Paste the URL as a custom remote MCP connector in ChatGPT or Claude.
-5. Complete the client's one-time connector setup.
-
-Normal tool use does not show Mac Orchestrator per-action approval prompts. The
-connector capability URL is the trust boundary.
-
-The installer tightens existing mac-orchestrator and ngrok configuration files
-to owner-only permissions when those files are present. The connector token is
-stored in Keychain and redacted from managed server logs.
-
-The optional vector-search ingest credential is also read from the
-`com.jay.mac-orchestrator.ingest-token` Keychain item, with the existing local
-config retained as a development fallback. It is never stored in this
-repository.
-
-Free ngrok endpoints may change if the account loses its assigned endpoint.
-When that happens, use **Copy Connector URL** again and update the client.
+After installation, use **Enable Public Connector**, wait for a healthy status,
+and choose **Copy Connector URL**. Paste that URL into the trusted MCP client;
+do not construct a URL manually.
 
 ## Local development
 
-The existing Python workflow remains available:
+The Python server can be run without the menu-bar supervisor:
 
 ```bash
 uv sync
 uv run python automac_mcp.py
 ```
 
-Direct development listens on `http://127.0.0.1:8000/mcp` and retains the
-interactive Telegram/ngrok setup. It never kills an existing port-8000
-listener; startup fails normally and leaves that process untouched.
-
-To run a local dev server on a different port — e.g. to test changes without
-colliding with an already-running managed instance — set
-`MAC_ORCHESTRATOR_PORT`:
-
-```bash
-MAC_ORCHESTRATOR_PORT=8791 uv run python -c \
-  "import automac_mcp; automac_mcp.mcp.run(transport='streamable-http', mount_path='/mcp')"
-```
-
-For the native development bundle:
+It listens on `http://127.0.0.1:8000/mcp` by default. Set
+`MAC_ORCHESTRATOR_PORT` when testing on another local port. The native bundle
+can be exercised with:
 
 ```bash
 ./script/build_and_run.sh
@@ -274,135 +160,18 @@ For the native development bundle:
 | Orientation | `describe`, `get_session_state` |
 | Keyboard and pointer | `press_keystroke`, `type_text`, `mouse_action`, `scroll` |
 | Macros and apps | `execute_macro`, `focus_app`, `get_available_apps` |
-| Screen | `get_screen_size`, `get_screen_layout`, `get_ui_tree`, `perform_ui_action`, `get_screen_text` |
+| Screen and UI | `get_screen_size`, `get_screen_layout`, `get_ui_tree`, `perform_ui_action`, `get_screen_text` |
 | Terminal | `run_terminal_command` |
 | Files | `find_file`, `vector_search`, `read_file`, `write_file`, `list_directory`, `smart_search` |
 | Utility | `clipboard`, `play_sound_for_user_prompt`, `send_file_to_telegram` |
 
-24 tools total (up from 20). All prior tool names and arguments remain unchanged
-— existing clients keep working without modification.
-
-### New in this release
-
-- **`get_ui_tree(app/pid/ref, depth, role_filter, actionable_only, limit,
-  node_budget, continuation_token)`** — a real macOS accessibility tree (buttons,
-  fields, labels, roles) with a stable `ref` per element, instead of relying on
-  OCR-coordinate clicking for everything. Supports depth limits, role/actionable
-  filtering, and pagination for large trees, with a `node_budget` that bounds how
-  many elements are *visited* (not just returned) so one slow or wedged app can't
-  block a call.
-- **`perform_ui_action(ref, action, value)`** — acts on an element previously
-  returned by `get_ui_tree` (click, focus, set value, or a named AX action) and
-  reports an honest before/after diff, so the agent knows whether the action
-  actually took effect rather than assuming success.
-- **`get_session_state()`** — reports whether the screen is locked, whether this
-  is the active console session, and whether Accessibility/Screen Recording
-  permissions are genuinely granted (not just theoretically available). Lets an
-  agent recognize "the session is locked" or "permission isn't granted" instead
-  of retrying a doomed UI action and reporting a generic failure.
-- **`describe(topic)`** — on-demand deep documentation (macro action catalog,
-  `find_file` query syntax, UI-inspection guide, coordinate system) for anything
-  trimmed out of the shorter tool descriptions, so connecting doesn't cost a lot
-  of context up front.
-- **`get_screen_layout()` now actually returns window `bounds`.** Previously,
-  `AXPosition`/`AXSize` came back as opaque `AXValueRef` objects that raised
-  `AttributeError` when read directly; a bare exception handler silently
-  swallowed this, so no window ever had a `bounds` field. Fixed via
-  `AXValueGetValue()`.
-- **`get_available_apps()` now enumerates the same app set as `get_screen_layout`/
-  `get_ui_tree`** (previously a narrower, inconsistent list from a different
-  AppleScript query). This means `apps`/`apps_detail` now include roughly 40
-  additional background/menu-bar-only agents alongside ordinary apps — filter
-  `apps_detail` on `activation_policy == "regular"` for Dock-visible apps that
-  are meaningful `focus_app()` targets.
-- AppleScript permission failures (e.g. Automation/Accessibility denial) now
-  surface as `error_code="PERMISSION"` with a specific recovery hint, instead of
-  a generic `EXEC_ERROR`.
-
-Background terminal commands are still supported, but the server now registers
-them and terminates them during managed shutdown. Synchronous commands remain
-bounded to a maximum 300-second timeout and output is capped.
-
-## Logs and state
-
-Open the log folder from the menu, or inspect:
-
-```text
-~/Library/Logs/Mac Orchestrator/app.log
-~/Library/Logs/Mac Orchestrator/server.log
-~/Library/Logs/Mac Orchestrator/tunnel.log
-~/Library/Logs/Mac Orchestrator/launcher.log
-```
-
-App, server, and tunnel logs rotate at approximately 2 MB with four backups.
-Secrets and connector paths are not intentionally logged.
-
-Owned-process state is stored with user-only permissions at:
-
-```text
-~/Library/Application Support/Mac Orchestrator/owned-processes.json
-```
-
-Do not edit it while the app is running. Stale PIDs are harmless unless their
-current command line also contains this installation's ownership marker.
-
-## Lifecycle behavior
-
-- **Server failure:** public ingress closes, then the server restarts with
-  bounded exponential backoff. The tunnel returns only after health succeeds.
-- **Tunnel failure/network loss:** the local server remains available and the
-  tunnel reconnects with bounded backoff.
-- **App crash:** launchd restarts the app. The new app validates and terminates
-  only the two stale owned children, then restores desired state.
-- **Duplicate launch:** the second app exits without changing the running
-  instance.
-- **Sleep/wake:** children remain quiescent during sleep; wake triggers an
-  immediate health/tunnel check.
-- **Logout/reboot:** macOS terminates the user LaunchAgent. `RunAtLoad` restores
-  the supervisor at the next login.
-- **Clean reinstall:** the installer requests clean app shutdown, updates the
-  runtime and bundle, then bootstraps one LaunchAgent.
-
-## Troubleshooting
-
-### Port 8000 is already in use
-
-Mac Orchestrator reports the conflict and leaves the listener untouched:
-
-```bash
-lsof -nP -iTCP:8000 -sTCP:LISTEN
-```
-
-Stop or reconfigure that application, then choose **Restart**.
-
-### Tunnel fails repeatedly
-
-Check `tunnel.log` and confirm the ngrok authtoken file exists:
-
-```bash
-ls -l ~/Library/Application\ Support/ngrok/ngrok.yml
-```
-
-The app stops after repeated failures rather than entering an unbounded restart
-loop. Fix the credential/network issue and choose **Restart**.
-
-### Connector returns 404
-
-The unauthenticated `/mcp` path is supposed to return 404. Use **Copy Connector
-URL** instead of constructing the URL manually.
-
-### Tools report permission errors
-
-Open System Settings → Privacy & Security and check Accessibility, Screen &
-System Audio Recording, and Automation. Restart the app afterward.
-
-### Verify the login job
-
-```bash
-launchctl print "gui/$(id -u)/com.jay.mac-orchestrator"
-```
+The UI-tree tools support depth, role, actionable-element, pagination, and
+node-budget controls. `perform_ui_action` acts on a previously returned element
+reference and reports a before/after result rather than assuming success.
 
 ## Tests
+
+Run the Python suite and Swift package checks on macOS:
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -B test_mcp_server.py
@@ -411,14 +180,53 @@ swift build -c release
 git diff --check
 ```
 
-The Python suite verifies all 24 tools, representative tool behavior, managed
-capability-path configuration, background-process cleanup, and a durable
-`get_ui_tree` pagination regression test (compares a paginated walk against an
-unpaginated baseline in both tree and flat/filtered mode). Installation
-acceptance additionally exercises local and public MCP initialization, duplicate
-prevention, owned server/tunnel crash recovery, app crash recovery, and clean
-quit cleanup.
+The Python test suite covers the 24-tool surface, representative behavior,
+capability-path configuration, process cleanup, and UI-tree pagination. The
+native build and the installation acceptance checks require macOS services and
+are not expected to run on Linux.
 
-## License
+## Lifecycle and diagnostics
 
-[CC0 1.0 Universal](LICENSE).
+The supervisor handles server failure, tunnel failure, duplicate launches,
+sleep/wake, login recovery, and clean shutdown for processes it owns. Logs are
+written under `~/Library/Logs/Mac Orchestrator/` and rotate locally. The
+capability token is stored in Keychain and is redacted from managed logs.
+
+To rotate a leaked connector token:
+
+```bash
+security delete-generic-password \
+  -s com.jay.mac-orchestrator \
+  -a connector-capability-token
+```
+
+Then quit and relaunch the app and copy the replacement URL into each trusted
+client.
+
+## Limitations
+
+- Single-user and single-Mac architecture in the current release.
+- No OAuth, user accounts, roles, hosted service, or enterprise device
+  management integration.
+- No guarantee of operation at the lock screen or without an active user
+  session.
+- Terminal and file tools are powerful; the connector holder is trusted with
+  the resulting actions.
+- Public ngrok endpoints may change, and the endpoint is an external service
+  with its own limits and terms.
+- The distributed app is ad hoc signed and not notarised.
+
+## Contributing and support
+
+Issues and pull requests are welcome for reproducible bugs, documentation
+corrections, safer defaults, and macOS compatibility work. Include macOS and
+Apple Silicon details, the command or tool involved, and a redacted diagnostic
+description. Never include connector URLs, tokens, private file contents, or
+personal logs in an issue.
+
+## Licence
+
+The original source in this repository is dedicated to the public domain under
+[CC0 1.0 Universal](LICENSE). Third-party dependencies and external services
+remain subject to their own terms. CC0 does not add an express patent grant;
+review the repository contents and dependencies before redistributing a build.

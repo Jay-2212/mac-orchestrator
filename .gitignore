@@ -5,3 +5,5 @@ __pycache__/
 .swiftpm/
 .uv/
 dist/
+indexer.log
+sync_state.db

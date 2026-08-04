@@ -11,8 +11,17 @@ single MCP connector.
 The current architecture is deliberately single-user by design: one trusted
 agent connects to one Mac through a capability URL. This is a public community
 source project, but it is not a hosted service, a multi-tenant server, or an
-OAuth provider. The code originated as Jay Prakash Bharti's personal tool and
-is now documented for people who want to inspect, adapt, and self-host it.
+OAuth provider.
+
+This project started as a fork of [digithree/automac-mcp](https://github.com/digithree/automac-mcp),
+an experimental macOS UI-automation MCP server. Since forking, it has been
+substantially rewritten and extended: terminal/shell command execution, a
+Telegram file-send connector, a local retrieval index (`indexer.py`), a native
+Swift menu-bar supervisor app that owns and health-checks the Python server and
+ngrok as managed child processes, capability-URL authentication, and permission
+diagnostics were all added after the fork, and the tool surface was curated
+down from the original ~40 tools to 24. See [Acknowledgments](#acknowledgments)
+for the full attribution.
 
 ## Status and scope
 
@@ -230,3 +239,12 @@ The original source in this repository is dedicated to the public domain under
 [CC0 1.0 Universal](LICENSE). Third-party dependencies and external services
 remain subject to their own terms. CC0 does not add an express patent grant;
 review the repository contents and dependencies before redistributing a build.
+
+## Acknowledgments
+
+This project began as a fork of [digithree/automac-mcp](https://github.com/digithree/automac-mcp)
+by [digithree](https://github.com/digithree), which established the original
+FastMCP-based macOS UI-automation tool set. Everything under "What it does"
+beyond core UI automation — the Swift menu-bar supervisor, terminal/shell
+tools, the Telegram connector, the local retrieval index, capability-URL auth,
+and process supervision — was added after the fork.

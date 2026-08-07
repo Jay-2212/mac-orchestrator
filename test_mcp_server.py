@@ -4,6 +4,7 @@ import subprocess
 import sys
 import os
 import json
+import time
 
 
 def test_mcp_server():
@@ -252,21 +253,30 @@ def test_mcp_server():
             print(f"✗ run_terminal_command failed: {result}")
             
         # Test find_file
-        result = automac_mcp.find_file("automac_mcp", search_dir="~/Documents/mac-orchestrator")
+        repo_dir = os.path.dirname(os.path.abspath(__file__))
+        result = automac_mcp.find_file("automac_mcp", search_dir=repo_dir)
         if result and result.get("status") == "success":
             print(f"✓ find_file: {result.get('message')}")
         else:
             print(f"✗ find_file failed: {result}")
             
-        # Test vector_search
+        # Test vector_search — no MAC_ORCHESTRATOR_WORKER_URL is configured in this
+        # test environment (there's no built-in default backend), so the correct,
+        # testable behavior is a clean INVALID_PARAM failure, not a network call.
         result = automac_mcp.vector_search("test")
-        if result and result.get("status") == "success":
-            print(f"✓ vector_search: {result.get('message')} (Found {len(result.get('results', []))} matches)")
+        if os.getenv("MAC_ORCHESTRATOR_WORKER_URL"):
+            if result and result.get("status") == "success":
+                print(f"✓ vector_search: {result.get('message')} (Found {len(result.get('results', []))} matches)")
+            else:
+                print(f"✗ vector_search failed: {result}")
+        elif result.get("status") == "error" and result.get("error_code") == "INVALID_PARAM":
+            print("✓ vector_search: fails cleanly with INVALID_PARAM when MAC_ORCHESTRATOR_WORKER_URL is unset")
         else:
-            print(f"✗ vector_search failed: {result}")
+            print(f"✗ vector_search unconfigured-backend handling failed: {result}")
+            return False
 
         # Test write_file append mode
-        import tempfile, os
+        import tempfile
         with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as tf:
             tmp_path = tf.name
         try:
@@ -388,6 +398,134 @@ def test_mcp_server():
         else:
             print(f"✗ managed connector path failed: {managed.stderr or managed.stdout}")
             return False
+
+        # Malformed/short/wrong-charset tokens must fail closed at startup, not
+        # silently fall back to an unauthenticated path.
+        bad_tokens = ["short", "a" * 129, "not a url safe token!!", "../../etc/passwd"]
+        for bad in bad_tokens:
+            bad_env = os.environ.copy()
+            bad_env.update({
+                "MAC_ORCHESTRATOR_CONNECTOR_TOKEN": bad,
+                "PYTHONDONTWRITEBYTECODE": "1",
+            })
+            bad_run = subprocess.run(
+                [sys.executable, "-B", "-c", "import automac_mcp"],
+                capture_output=True, text=True, env=bad_env, timeout=15,
+            )
+            if bad_run.returncode == 0:
+                print(f"✗ malformed token {bad!r} was accepted instead of rejected")
+                return False
+        print(f"✓ malformed connector tokens ({len(bad_tokens)} cases) rejected at startup")
+
+        # No token configured (plain local dev) mounts the bare /mcp path —
+        # confirms unmanaged dev mode never silently inherits a stale token.
+        no_token_env = os.environ.copy()
+        no_token_env.pop("MAC_ORCHESTRATOR_CONNECTOR_TOKEN", None)
+        no_token_env["PYTHONDONTWRITEBYTECODE"] = "1"
+        no_token = subprocess.run(
+            [sys.executable, "-B", "-c", "import automac_mcp; print(automac_mcp.MCP_PATH)"],
+            capture_output=True, text=True, env=no_token_env, timeout=15,
+        )
+        if no_token.returncode == 0 and no_token.stdout.strip() == "/mcp":
+            print("✓ unmanaged/no-token mode mounts plain /mcp (loopback-only, see SECURITY.md)")
+        else:
+            print(f"✗ no-token path check failed: {no_token.stderr or no_token.stdout}")
+            return False
+
+        # The supervisor's health probe must be registered outside the
+        # capability path — it carries no token and no state, but if it were
+        # ever accidentally merged into the same route as the MCP endpoint,
+        # that endpoint would stop requiring the token to be assembled correctly.
+        health_paths = [r.path for r in automac_mcp.mcp._custom_starlette_routes]
+        if "/__mac_orchestrator_health" in health_paths and "/__mac_orchestrator_health" != automac_mcp.MCP_PATH:
+            print("✓ health check route registered outside the capability path")
+        else:
+            print(f"✗ health check route missing or overlapping MCP_PATH: {health_paths}")
+            return False
+
+        # Live HTTP proof of the capability path — every check above only
+        # confirms MCP_PATH is computed correctly in-process. This actually
+        # binds a socket and asks it: with a token configured, the plain
+        # /mcp path must 404 and the capability path must not; with no token
+        # configured, /mcp itself must not 404. This is the property
+        # README/SECURITY.md advertise, so it's tested at the HTTP layer,
+        # not just as a string comparison.
+        import urllib.request
+        import urllib.error
+
+        def _http_status(port, path, timeout=2):
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=timeout) as r:
+                    return r.status
+            except urllib.error.HTTPError as e:
+                return e.code
+
+        def _wait_for_server(port, timeout=10):
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                try:
+                    urllib.request.urlopen(f"http://127.0.0.1:{port}/__mac_orchestrator_health", timeout=1)
+                    return True
+                except Exception:
+                    time.sleep(0.2)
+            return False
+
+        live_token = "k" * 64
+        live_env = os.environ.copy()
+        live_env.update({
+            "MAC_ORCHESTRATOR_PORT": "8794",
+            "MAC_ORCHESTRATOR_MANAGED": "1",
+            "MAC_ORCHESTRATOR_CONNECTOR_TOKEN": live_token,
+            "PYTHONDONTWRITEBYTECODE": "1",
+        })
+        live_proc = subprocess.Popen(
+            [sys.executable, "-B", "-c", "import automac_mcp; automac_mcp.mcp.run(transport='streamable-http')"],
+            env=live_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        try:
+            if not _wait_for_server(8794):
+                print("✗ live capability-path server did not come up in time")
+                return False
+            bare_status = _http_status(8794, "/mcp")
+            token_status = _http_status(8794, f"/{live_token}/mcp")
+            if bare_status == 404 and token_status is not None and token_status != 404:
+                print(f"✓ live HTTP: /mcp -> 404, /<token>/mcp -> {token_status} (route exists)")
+            else:
+                print(f"✗ live capability path check failed: /mcp={bare_status}, /<token>/mcp={token_status}")
+                return False
+        finally:
+            live_proc.terminate()
+            try:
+                live_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                live_proc.kill()
+                live_proc.wait(timeout=5)
+
+        no_token_live_env = os.environ.copy()
+        no_token_live_env.pop("MAC_ORCHESTRATOR_CONNECTOR_TOKEN", None)
+        no_token_live_env.pop("MAC_ORCHESTRATOR_MANAGED", None)
+        no_token_live_env.update({"MAC_ORCHESTRATOR_PORT": "8795", "PYTHONDONTWRITEBYTECODE": "1"})
+        no_token_live_proc = subprocess.Popen(
+            [sys.executable, "-B", "-c", "import automac_mcp; automac_mcp.mcp.run(transport='streamable-http')"],
+            env=no_token_live_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        try:
+            if not _wait_for_server(8795):
+                print("✗ live no-token server did not come up in time")
+                return False
+            unmanaged_status = _http_status(8795, "/mcp")
+            if unmanaged_status is not None and unmanaged_status != 404:
+                print(f"✓ live HTTP: unmanaged /mcp -> {unmanaged_status} (route exists, no 404)")
+            else:
+                print(f"✗ unmanaged live /mcp check failed: status={unmanaged_status}")
+                return False
+        finally:
+            no_token_live_proc.terminate()
+            try:
+                no_token_live_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                no_token_live_proc.kill()
+                no_token_live_proc.wait(timeout=5)
 
         # Dev-only port override (lets a local test server run without colliding
         # with an already-running managed instance on the default port).

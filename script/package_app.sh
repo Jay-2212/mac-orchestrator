@@ -25,7 +25,7 @@ BUILD_BINARY="$BUILD_DIR/$EXECUTABLE_NAME"
 NGROK_SOURCE="$HOME/Library/Application Support/ngrok/ngrok"
 if [[ ! -x "$NGROK_SOURCE" ]]; then
   echo "ngrok binary not found at: $NGROK_SOURCE" >&2
-  echo "Run the existing Python setup once so pyngrok installs it." >&2
+  echo "Run ./script/bootstrap_ngrok.sh once to download it, then retry." >&2
   exit 1
 fi
 /usr/bin/ditto "$NGROK_SOURCE" "$RESOURCES_DIR/ngrok"

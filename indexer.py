@@ -37,24 +37,72 @@ except ImportError:
     pptx = None
 
 # --- CONFIGURATION ---
+# Directories to crawl. Override with MAC_ORCHESTRATOR_INDEX_DIRS, a
+# ":"-separated list of paths (~ is expanded). Defaults are generic — no
+# assumptions about any particular user's cloud-storage mounts or org.
+_DEFAULT_INDEX_DIRS = "~/Documents:~/Downloads:~/Desktop"
 DIRECTORIES_TO_INDEX = [
-    os.path.expanduser("~/Documents"),
-    os.path.expanduser("~/Downloads"),
-    os.path.expanduser("~/Desktop"),
-    os.path.expanduser("~/OneDrive - Manipal Academy of Higher Education")
+    os.path.expanduser(p)
+    for p in os.getenv("MAC_ORCHESTRATOR_INDEX_DIRS", _DEFAULT_INDEX_DIRS).split(":")
+    if p.strip()
 ]
 
+# Directory-name substrings to skip during the walk (matched against the
+# lowercased directory name). Extend with MAC_ORCHESTRATOR_INDEX_IGNORE, a
+# comma-separated list merged into these generic defaults.
 IGNORE_PATTERNS = {
     "node_modules", ".git", "library", ".venv", "venv", "__pycache__",
-    "build", "dist", "target", "bin", "obj", "out", 
-    ".gradle", ".idea", ".vscode", ".wrangler", "system-cache", 
+    "build", "dist", "target", "bin", "obj", "out",
+    ".gradle", ".idea", ".vscode", ".wrangler", "system-cache",
     "processed", "cache", "buildinfo",
-    "rss feed", "aeon-reading", "aeon reading", "varc", "asptor"
+}
+IGNORE_PATTERNS |= {
+    p.strip().lower()
+    for p in os.getenv("MAC_ORCHESTRATOR_INDEX_IGNORE", "").split(",")
+    if p.strip()
 }
 SUPPORTED_EXTENSIONS = {".txt", ".md", ".json", ".pdf", ".docx", ".xlsx", ".csv", ".pptx"}
 
-# REPLACE THIS with your deployed Cloudflare Worker URL or localhost for testing
-WORKER_URL = "https://mac-brain-worker.jb-brain.workers.dev"
+# The Cloudflare Worker (or any HTTP backend) that receives extracted chunks
+# for embedding/storage. There is no built-in default — this is a private
+# backend endpoint, not a hosted service this project provides, and shipping
+# a real one as a fallback would silently point every checkout at one
+# person's infrastructure. Required; validated in validate_config().
+WORKER_URL = os.getenv("MAC_ORCHESTRATOR_WORKER_URL", "").strip()
+
+# Where local sync state / logs live. Defaults live under the same
+# per-user Application Support / Logs directories the Swift supervisor
+# uses, not inside the repo checkout, so indexing works regardless of
+# where the repo happens to be cloned.
+_APP_SUPPORT = os.path.expanduser("~/Library/Application Support/Mac Orchestrator")
+_APP_LOGS = os.path.expanduser("~/Library/Logs/Mac Orchestrator")
+DB_PATH = os.path.expanduser(
+    os.getenv("MAC_ORCHESTRATOR_INDEX_DB", os.path.join(_APP_SUPPORT, "sync_state.db"))
+)
+INDEX_LOG_PATH = os.path.expanduser(
+    os.getenv("MAC_ORCHESTRATOR_INDEX_LOG", os.path.join(_APP_LOGS, "indexer.log"))
+)
+
+
+def validate_config():
+    """Return a list of actionable config error strings; empty if config is usable."""
+    errors = []
+    if not WORKER_URL:
+        errors.append(
+            "MAC_ORCHESTRATOR_WORKER_URL is not set. Point it at your ingest "
+            "backend, e.g. MAC_ORCHESTRATOR_WORKER_URL=https://your-worker.example.workers.dev"
+        )
+    elif not (WORKER_URL.startswith("https://") or WORKER_URL.startswith("http://")):
+        errors.append(f"MAC_ORCHESTRATOR_WORKER_URL must start with http:// or https://, got: {WORKER_URL!r}")
+    if not DIRECTORIES_TO_INDEX:
+        errors.append("MAC_ORCHESTRATOR_INDEX_DIRS resolved to an empty list of directories.")
+    if MAX_FILE_SIZE <= 0:
+        errors.append("MAX_FILE_SIZE must be positive.")
+    if MAX_WORKERS <= 0:
+        errors.append("MAX_WORKERS must be positive.")
+    return errors
+
+
 def load_ingest_token():
     token = os.getenv("INGEST_TOKEN", "")
     if token:
@@ -91,7 +139,6 @@ def load_ingest_token():
 
 INGEST_TOKEN = load_ingest_token()
 
-DB_PATH = os.path.expanduser("~/Documents/mac-orchestrator/sync_state.db")
 CHUNK_SIZE = 500
 OVERLAP = 50
 BATCH_SIZE = 100
@@ -112,12 +159,19 @@ def log_msg(msg):
 
 # --- DATABASE SETUP ---
 def init_db():
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS file_state 
+    c.execute('''CREATE TABLE IF NOT EXISTS file_state
                  (path TEXT PRIMARY KEY, last_modified REAL)''')
     conn.commit()
     return conn
+
+
+def append_index_log(line):
+    os.makedirs(os.path.dirname(INDEX_LOG_PATH), exist_ok=True)
+    with open(INDEX_LOG_PATH, "a") as log_file:
+        log_file.write(line)
 
 # --- TEXT EXTRACTION & CHUNKING ---
 def is_header_cell(val):
@@ -351,9 +405,9 @@ def run_indexer():
                     except Exception as e:
                         pass
 
-    # Prioritize spreadsheets (.xlsx, .csv) at the beginning of the queue, with HOSPICE at the absolute top
+    # Prioritize spreadsheets (.xlsx, .csv) at the beginning of the queue — they're
+    # typically smaller and faster to embed than long-form documents.
     files_to_process.sort(key=lambda x: (
-        "HOSPICE" not in os.path.basename(x[0]).upper(),
         Path(x[0]).suffix.lower() not in {".xlsx", ".csv"},
         Path(x[0]).suffix.lower(),
         x[0]
@@ -369,8 +423,7 @@ def run_indexer():
     if not files_to_process:
         conn.close()
         log_msg("No changes detected. Exiting without loading model.")
-        with open(os.path.expanduser("~/Documents/mac-orchestrator/indexer.log"), "a") as log_file:
-            log_file.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - SUCCESS: 0 files, model not loaded.\n")
+        append_index_log(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - SUCCESS: 0 files, model not loaded.\n")
         return
     
     # 2. Load model ONLY when files need processing (lazy loading)
@@ -456,8 +509,7 @@ def run_indexer():
     conn.close()
     status = f"{len(files_to_process)} files, {failed_files_count} failed files"
     log_msg(f"[{'SUCCESS' if failed_files_count == 0 else 'PARTIAL'}] Indexing complete: {status}")
-    with open(os.path.expanduser("~/Documents/mac-orchestrator/indexer.log"), "a") as log_file:
-        log_file.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {'SUCCESS' if failed_files_count == 0 else 'PARTIAL'}: {status}\n")
+    append_index_log(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {'SUCCESS' if failed_files_count == 0 else 'PARTIAL'}: {status}\n")
 
 def delete_file_chunks(file_path):
     """Delete all existing chunks for a file from D1 and Vectorize before uploading new ones."""
@@ -510,4 +562,7 @@ if __name__ == "__main__":
             "INGEST_TOKEN is required. Configure it in the local config or "
             "the com.jay.mac-orchestrator.ingest-token Keychain item."
         )
+    config_errors = validate_config()
+    if config_errors:
+        raise SystemExit("Invalid indexer configuration:\n" + "\n".join(f"  - {e}" for e in config_errors))
     run_indexer()

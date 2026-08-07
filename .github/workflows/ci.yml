@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  swift-build:
+    name: Swift build (macos)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: swift build (debug)
+        run: swift build
+      - name: swift build (release)
+        run: swift build -c release
+
+  python-lint:
+    name: Python syntax + hygiene (portable)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile-check all tracked Python files
+        run: |
+          git ls-files '*.py' | xargs -I{} python3 -B -m py_compile {}
+      - name: Secret / personal-data scan (heuristic)
+        run: |
+          set -euo pipefail
+          # Fails the build if obvious secret-shaped strings or this machine's
+          # home-directory path show up in tracked files. Best-effort, not a
+          # substitute for the manual review in SECURITY.md.
+          if git grep -InE "(ghp_[A-Za-z0-9]{36}|sk-[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,})" -- . ':!*.lock'; then
+            echo "Possible committed secret found." >&2
+            exit 1
+          fi
+          if git grep -InE "/Users/[a-z0-9_-]+/(Documents|Desktop|Downloads)" -- . ':!*.lock' ':!.github/workflows/ci.yml'; then
+            echo "Possible hardcoded personal absolute path found." >&2
+            exit 1
+          fi
+
+  python-full-suite:
+    name: Python behavioral tests (best-effort, informational)
+    runs-on: macos-14
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+      - name: uv sync
+        run: uv sync
+      - name: Run test suite
+        run: PYTHONDONTWRITEBYTECODE=1 uv run python -B test_mcp_server.py
+        # Informational only: GitHub-hosted macOS runners do not have
+        # Accessibility/Screen Recording permissions granted to an
+        # interactive console session, so UI-automation tests are expected
+        # to report PERMISSION/skip rather than pass. See README's Tests
+        # section — the authoritative run of this suite is local, on a Mac
+        # with the permissions actually granted.

@@ -16,12 +16,12 @@ processes, while direct Python execution remains available for development.
 | File | Purpose |
 |------|---------|
 | `automac_mcp.py` | The server: 24 MCP tools + internal helpers + startup (~2250 lines) |
-| `indexer.py` | Standalone crawler — indexes local files into Cloudflare RAG for `vector_search` |
+| `indexer.py` | Standalone crawler — indexes local files into whatever backend `MAC_ORCHESTRATOR_WORKER_URL` points at (no built-in default), for `vector_search` |
 | `Sources/MacOrchestrator/` | Native menu-bar supervisor, Keychain, process lifecycle, and rotating logs |
 | `script/distribute.sh` | Personal install/update flow for this Mac |
 | `test_mcp_server.py` | Imports, tool inventory, representative behavior, managed auth path, and cleanup tests |
 | `pyproject.toml` | uv dependencies, entry point `automac-mcp` → `automac_mcp:main` |
-| `sync_state.db` | SQLite used by `indexer.py` for incremental sync state |
+| `sync_state.db` | SQLite used by `indexer.py` for incremental sync state — under `~/Library/Application Support/Mac Orchestrator/` by default, overridable via `MAC_ORCHESTRATOR_INDEX_DB` |
 | Keychain | Managed connector capability token |
 | `~/.config/mac-orchestrator/config.json` | Legacy Telegram and ingestion configuration |
 
@@ -76,9 +76,11 @@ rather than up in Layer 1):
 | `_AXWalkState`, `_ax_walk_tree`, `_ax_walk_flat` | Traversal: unfiltered calls build a nested tree; `role_filter`/`actionable_only` switch to a flat "collect every match, ignore hierarchy" walk. Both share one node-visit budget independent of the emitted-node `limit`. |
 
 ### Layer 4 — Server startup
-`setup_telegram()`, `setup_ngrok()`, `main()` — interactive local development
-or noninteractive managed launch. In managed mode the Swift app owns ngrok and
-passes a Keychain-backed capability path to the server.
+`setup_telegram()`, `main()` — interactive local development or
+noninteractive managed launch. There is no interactive "expose via ngrok?"
+flow in this file; public ingress is wired up entirely by the Swift
+supervisor's managed mode, which owns ngrok and passes a Keychain-backed
+capability path to the server. See `SECURITY.md`.
 
 ---
 
@@ -126,7 +128,7 @@ passes a Keychain-backed capability path to the server.
 | Tool | Key params | Returns |
 |------|-----------|---------|
 | `find_file` | `query`, `search_dir`, `file_type`, `sort_by`, `limit` | `files: list[{path, name, last_modified, size_kb}]` |
-| `vector_search` | `query: str` | `results: list` (from Cloudflare RAG) |
+| `vector_search` | `query: str` | `results: list` (from the configured `MAC_ORCHESTRATOR_WORKER_URL` backend; `INVALID_PARAM` if unset) |
 | `read_file` | `path`, `preview`, `preview_size_kb`, `preview_lines` | `content: str` |
 | `write_file` | `path`, `content`, `mode: str = "overwrite"` | status — `mode="append"` adds to end of file |
 | `list_directory` | `path`, `limit`, `sort_by`, `summary_only`, `offset` | `folders: list`, `files: list` |
@@ -283,12 +285,15 @@ uv run python -m py_compile automac_mcp.py && echo "Syntax OK"
 # Run behavioral tests without writing bytecode
 PYTHONDONTWRITEBYTECODE=1 uv run python -B test_mcp_server.py
 
-# Start server (interactive — prompts for Telegram + ngrok)
+# Start server (interactive — prompts for Telegram only; no ngrok flow here,
+# see SECURITY.md)
 uv run python automac_mcp.py
 
 # Run a local dev server on an alt port (won't collide with a running managed
-# instance on 8000) — bypasses main()'s interactive prompts:
-MAC_ORCHESTRATOR_PORT=8791 uv run python -c "import automac_mcp; automac_mcp.mcp.run(transport='streamable-http', mount_path='/mcp')"
+# instance on 8000) — bypasses main()'s interactive prompts. Mount path is
+# MCP_PATH, fixed at import time from MAC_ORCHESTRATOR_CONNECTOR_TOKEN, not a
+# mcp.run() argument:
+MAC_ORCHESTRATOR_PORT=8791 uv run python -c "import automac_mcp; automac_mcp.mcp.run(transport='streamable-http')"
 
 # Build the native app
 swift build

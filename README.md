@@ -36,6 +36,11 @@ This project is intended for technically capable users who understand the
 permissions and trust required to let an AI client operate their Mac. It should
 not be treated as a security boundary between mutually untrusted users.
 
+More documentation: [`SECURITY.md`](SECURITY.md) (threat model),
+[`CONTRIBUTING.md`](CONTRIBUTING.md) (dev setup),
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) (component map), and
+[`CHANGELOG.md`](CHANGELOG.md).
+
 ## What it does
 
 - Runs a Python FastMCP server for macOS automation and local retrieval.
@@ -72,8 +77,11 @@ in the macOS Keychain. The token is part of the connector path:
 https://<current-ngrok-host>/<keychain-token>/mcp
 ```
 
-The ordinary public `/mcp` path intentionally returns `404`. The exact URL is
-available from **Copy Connector URL** in the menu-bar app.
+In managed mode, the ordinary public `/mcp` path is never registered — it
+returns `404`. (Unmanaged/local-dev mode without a configured token mounts
+plain `/mcp` too, but only on loopback; see [Local development](#local-development)
+and `SECURITY.md`.) The exact URL is available from **Copy Connector URL**
+in the menu-bar app.
 
 Treat the connector URL like a password. Anyone who obtains it can invoke the
 enabled tools without a separate approval prompt for each action. In particular,
@@ -86,12 +94,26 @@ capability-URL based, not OAuth-based, and there are no user accounts, roles, or
 per-action authorization rules. ngrok provides the public TLS connection, but
 enabling public ingress still exposes a powerful local system to whoever has
 the URL. Keep the connector disabled when it is not needed and review the ngrok
-account and endpoint configuration yourself.
+account and endpoint configuration yourself. See `SECURITY.md` for the full
+threat model, including why the token is matched via URL routing rather than
+a compared string, and the one endpoint (`/__mac_orchestrator_health`) that
+deliberately sits outside the capability path.
 
-The optional indexer can read local files and upload their extracted contents
-to the configured Meridian backend. The repository does not guarantee that
-those contents are private once they leave the Mac; review the backend,
-provider, and retention policies before indexing sensitive material.
+The optional indexer (`indexer.py`) can read local files and upload their
+extracted contents to whatever HTTP backend you configure via
+`MAC_ORCHESTRATOR_WORKER_URL` — there is no built-in default backend. The
+repository does not guarantee that those contents are private once they
+leave the Mac; review whatever backend you point it at, and its retention
+policy, before indexing sensitive material.
+
+`indexer.py` requires `sentence-transformers` to build local embeddings before
+upload. It's a regular (non-optional) dependency because `script/distribute.sh`
+copies `indexer.py` into the managed runtime venv so it works out of the box
+from a `cron` job pointed at that venv (see [Architecture](docs/ARCHITECTURE.md)),
+and a partially-installed runtime is worse than a larger one. It adds real
+download weight — `transformers`, `tokenizers`, `scikit-learn`, and friends —
+but not `torch` itself, which `easyocr` already requires for the core server's
+OCR tools.
 
 ### Permissions
 
@@ -125,11 +147,14 @@ operation.
 ```bash
 git clone https://github.com/Jay-2212/mac-orchestrator.git
 cd mac-orchestrator
+./script/bootstrap_ngrok.sh   # one-time: downloads the ngrok binary to bundle
 ./script/distribute.sh
 ```
 
-The script builds a release app, bundles the ngrok executable from the local
-ngrok installation, creates a Python environment under
+`bootstrap_ngrok.sh` only downloads the ngrok binary (via `pyngrok`) so it
+can be bundled into the app — it does not start a tunnel or expose
+anything. The distribute script builds a release app, bundles that ngrok
+executable, creates a Python environment under
 `~/Library/Application Support/Mac Orchestrator/runtime`, installs the app at
 `/Applications/Mac Orchestrator.app`, installs a user LaunchAgent, and launches
 the menu-bar supervisor.
@@ -153,9 +178,17 @@ uv sync
 uv run python automac_mcp.py
 ```
 
-It listens on `http://127.0.0.1:8000/mcp` by default. Set
-`MAC_ORCHESTRATOR_PORT` when testing on another local port. The native bundle
-can be exercised with:
+It listens on `http://127.0.0.1:8000/mcp` by default, loopback only. Set
+`MAC_ORCHESTRATOR_PORT` when testing on another local port. This mode does
+**not** create a tunnel or expose the server publicly — public ingress is
+exclusively wired up by the managed app's menu-bar controls. If you need to
+run a tunnel by hand against an unmanaged server for testing, see the
+"advanced manual exposure" note in `SECURITY.md`; it requires setting both
+`MAC_ORCHESTRATOR_CONNECTOR_TOKEN` and `MAC_ORCHESTRATOR_MANAGED=1`
+yourself and understanding that the token becomes your entire security
+boundary at that point.
+
+The native bundle can be exercised with:
 
 ```bash
 ./script/build_and_run.sh
@@ -190,9 +223,19 @@ git diff --check
 ```
 
 The Python test suite covers the 24-tool surface, representative behavior,
-capability-path configuration, process cleanup, and UI-tree pagination. The
-native build and the installation acceptance checks require macOS services and
-are not expected to run on Linux.
+capability-path configuration (including malformed/missing-token rejection
+and the health-check route's isolation from the capability path), process
+cleanup, and UI-tree pagination. It needs Accessibility and Screen Recording
+permission granted to the Python binary running it, plus an active unlocked
+console session, so it is authoritative only when run locally on a Mac with
+those grants — not in CI.
+
+`.github/workflows/ci.yml` runs on `macos-14` runners: a required job builds
+the Swift package (debug and release) and does a portable Python
+syntax/secret-scan pass; a separate best-effort job attempts the full
+Python suite but is expected to report permission-related skips rather than
+full passes, since GitHub-hosted runners don't have an interactive console
+session with Accessibility/Screen Recording granted.
 
 ## Lifecycle and diagnostics
 
@@ -228,10 +271,13 @@ client.
 ## Contributing and support
 
 Issues and pull requests are welcome for reproducible bugs, documentation
-corrections, safer defaults, and macOS compatibility work. Include macOS and
-Apple Silicon details, the command or tool involved, and a redacted diagnostic
-description. Never include connector URLs, tokens, private file contents, or
-personal logs in an issue.
+corrections, safer defaults, and macOS compatibility work. See
+[`CONTRIBUTING.md`](CONTRIBUTING.md) for dev setup and the pre-PR checklist.
+Include macOS and Apple Silicon details, the command or tool involved, and a
+redacted diagnostic description. Never include connector URLs, tokens,
+private file contents, or personal logs in an issue. For anything sensitive
+enough that public disclosure before a fix would be harmful, see
+[`SECURITY.md`](SECURITY.md).
 
 ## Licence
 

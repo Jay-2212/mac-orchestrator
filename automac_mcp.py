@@ -20,7 +20,6 @@ import threading
 import requests
 from datetime import datetime
 from pathlib import Path
-from pyngrok import ngrok, conf
 from rich.console import Console
 from rich.prompt import Prompt
 from rich.panel import Panel
@@ -28,6 +27,8 @@ from typing import Any, Dict, List, Optional
 import pyautogui
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.server import TransportSecuritySettings
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 try:
     from Cocoa import NSWorkspace
     from Quartz import (CGWindowListCopyWindowInfo, kCGWindowListOptionOnScreenOnly,
@@ -95,6 +96,17 @@ mcp = FastMCP(
     transport_security=transport_security,
     instructions=SERVER_INSTRUCTIONS,
 )
+
+
+@mcp.custom_route("/__mac_orchestrator_health", methods=["GET"])
+async def _health_check(request: Request) -> JSONResponse:
+    """Liveness probe for the native supervisor. Deliberately outside the
+    capability path (FastMCP's custom_route bypasses it by design) and
+    deliberately minimal: no token, no MCP path, no process state — just
+    confirmation that this server, not merely something on the port, is up.
+    """
+    return JSONResponse({"status": "ok"})
+
 
 pyautogui.FAILSAFE = True
 _ocr_reader = None
@@ -1683,17 +1695,26 @@ def find_file(query: str, search_dir: str = "", file_type: str = "", sort_by: st
 @mcp.tool()
 def vector_search(query: str) -> Dict[str, Any]:
     """Perform a semantic/vector search across indexed files.
-    
-    This queries the Cloudflare RAG database for files matching the meaning of the query,
-    even if the exact keywords are not present.
-    
+
+    This queries the configured indexing backend (see MAC_ORCHESTRATOR_WORKER_URL)
+    for files matching the meaning of the query, even if the exact keywords are not
+    present. Requires indexer.py to have been run first, and MAC_ORCHESTRATOR_WORKER_URL
+    to be set; otherwise this returns an INVALID_PARAM error.
+
     Args:
         query: The search query or question.
     """
     if not query:
         return _fail("query is required")
     try:
-        url = "https://mac-brain-worker.jb-brain.workers.dev/search"
+        worker_url = os.getenv("MAC_ORCHESTRATOR_WORKER_URL", "").strip()
+        if not worker_url:
+            return _fail(
+                "Vector search is not configured. Set MAC_ORCHESTRATOR_WORKER_URL "
+                "to the same backend indexer.py uploads to (see docs/ARCHITECTURE.md).",
+                error_code="INVALID_PARAM",
+            )
+        url = f"{worker_url.rstrip('/')}/search"
         token = os.getenv("INGEST_TOKEN", "")
         config_path = os.path.expanduser("~/.config/mac-orchestrator/config.json")
         if os.path.exists(config_path):
@@ -2169,62 +2190,22 @@ def setup_telegram(interactive: bool = True):
         else:
             console.print("[yellow]Skipping Telegram setup.[/yellow]")
 
-def setup_ngrok():
-    """Sets up ngrok tunnel, prompting for auth token if not configured."""
-    try:
-        import urllib.request
-        try:
-            req = urllib.request.Request("http://127.0.0.1:4040/api/tunnels")
-            with urllib.request.urlopen(req, timeout=1) as response:
-                if response.status == 200:
-                    data = json.loads(response.read().decode('utf-8'))
-                    for tunnel in data.get("tunnels", []):
-                        addr = tunnel.get("config", {}).get("addr", "")
-                        if str(SERVER_PORT) in addr:
-                            url = tunnel.get("public_url")
-                            console.print("[green]Detected existing ngrok tunnel![/green]")
-                            return url
-        except Exception:
-            pass
-        expose = Prompt.ask("\n[bold cyan]Do you want to expose Mac Orchestrator publicly via ngrok?[/bold cyan] (Allows cloud bots to connect)", choices=["y", "n"], default="y")
-        if expose.lower() != 'y':
-            console.print("[yellow]Skipping ngrok. Server will only be available locally.[/yellow]")
-            return None
-        ngrok_config_paths = [
-            os.path.expanduser("~/Library/Application Support/ngrok/ngrok.yml"),
-            os.path.expanduser("~/.ngrok2/ngrok.yml"),
-            os.path.expanduser("~/.config/ngrok/ngrok.yml")
-        ]
-        has_token = False
-        for path in ngrok_config_paths:
-            if os.path.exists(path):
-                try:
-                    with open(path, "r") as f:
-                        if "authtoken" in f.read():
-                            has_token = True
-                            break
-                except Exception:
-                    pass
-        if not has_token:
-            console.print(Panel.fit(
-                "To expose your local server, you need an ngrok authtoken.\n"
-                "1. Sign up / Log in at [link=https://dashboard.ngrok.com]https://dashboard.ngrok.com[/link]\n"
-                "2. Copy your Auth Token and paste it below.",
-                title="[bold blue]ngrok Setup[/bold blue]", border_style="blue"
-            ))
-            token = Prompt.ask("[bold green]Enter your ngrok authtoken[/bold green]")
-            if token.strip():
-                ngrok.set_auth_token(token.strip())
-                console.print("[green]✓ ngrok auth token saved![/green]")
-            else:
-                console.print("[red]No token provided. Skipping ngrok setup.[/red]")
-                return None
-        console.print("[cyan]Starting ngrok tunnel...[/cyan]")
-        public_url = ngrok.connect(SERVER_PORT).public_url
-        return public_url
-    except Exception as e:
-        console.print(f"[bold red]Failed to setup ngrok:[/bold red] {e}")
-        return None
+# NOTE: there is deliberately no interactive "expose via ngrok" flow here.
+# That used to live in a setup_ngrok() function called from main() for
+# unmanaged/interactive runs, defaulting the exposure prompt to "yes" and
+# mounting the plain, tokenless /mcp path. FastMCP's own loopback default
+# (transport_security=None -> Host/Origin allowlist restricted to
+# 127.0.0.1/localhost) meant that path never actually worked end-to-end
+# through a tunnel (see SECURITY.md), but it was misleading and an easy
+# thing to accidentally fix into a real hole later. Public ingress is only
+# wired through the Swift supervisor's managed mode, which always mounts a
+# random capability token. Advanced users who want to run a tunnel by hand
+# against an unmanaged server must opt in to both things that make that
+# safe-ish themselves: export MAC_ORCHESTRATOR_CONNECTOR_TOKEN (mounts
+# /<token>/mcp instead of plain /mcp) *and* MAC_ORCHESTRATOR_MANAGED=1
+# (disables the loopback-only Host/Origin allowlist that would otherwise
+# reject tunnelled requests — see SECURITY.md), then run their own tunnel
+# tool pointed at the port. This file does neither implicitly.
 
 def main():
     owner = ""
@@ -2250,28 +2231,26 @@ def main():
         border_style="magenta"
     ))
     setup_telegram(interactive=not MANAGED_MODE)
-    public_url = None if MANAGED_MODE else setup_ngrok()
-    if public_url:
-        mcp_url = f"{public_url}/mcp"
-        console.print("\n[bold green]SUCCESS! Mac Orchestrator is now live.[/bold green]")
-        console.print(f"🔗 [bold underline cyan]{mcp_url}[/bold underline cyan]")
-        console.print("\nPaste this link into your cloud-hosted chatbots to give them access to this Mac.")
-    elif MANAGED_MODE:
+    if MANAGED_MODE:
         console.print("\n[bold green]Mac Orchestrator is starting in managed mode.[/bold green]")
         console.print("The authenticated connector URL is available from the menu-bar app.")
     else:
         console.print("\n[bold green]Mac Orchestrator is starting locally.[/bold green]")
-        console.print(f"🔗 [bold underline cyan]http://localhost:{SERVER_PORT}/mcp[/bold underline cyan]")
+        console.print(f"🔗 [bold underline cyan]http://localhost:{SERVER_PORT}{MCP_PATH}[/bold underline cyan]")
+        if not CONNECTOR_TOKEN:
+            console.print(
+                "[dim]Loopback only — this process does not expose itself to the "
+                "public internet. See SECURITY.md for the managed-mode connector "
+                "flow if you need remote access.[/dim]"
+            )
     console.print("\n[dim]Press Ctrl+C to stop the server[/dim]\n")
     try:
-        mcp.run(transport="streamable-http", mount_path="/mcp")
+        mcp.run(transport="streamable-http")
     except KeyboardInterrupt:
         pass
     finally:
         console.print("\n[yellow]Shutting down...[/yellow]")
         cleanup_background_processes()
-        if public_url:
-            ngrok.kill()
 
 if __name__ == "__main__":
     main()

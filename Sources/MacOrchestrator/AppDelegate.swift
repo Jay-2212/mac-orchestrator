@@ -5,6 +5,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var supervisor: ProcessSupervisor?
     private var menuController: MenuController?
     private var lockDescriptor: Int32 = -1
+    private var sigtermSource: DispatchSourceSignal?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -22,6 +23,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 name: NSWorkspace.didWakeNotification,
                 object: nil
             )
+            // A raw SIGTERM (launchctl bootout/stop, `kill <pid>`) does not go
+            // through AppKit's normal quit path, so applicationWillTerminate
+            // would never fire and owned children (server, tunnel) would be
+            // orphaned instead of cleaned up. Route SIGTERM through
+            // NSApp.terminate so shutdown is always graceful regardless of how
+            // it's requested.
+            let source = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+            source.setEventHandler { NSApp.terminate(nil) }
+            source.resume()
+            signal(SIGTERM, SIG_IGN)
+            sigtermSource = source
             supervisor.launch()
         } catch {
             let alert = NSAlert(error: error)

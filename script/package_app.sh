@@ -37,7 +37,7 @@ fi
 /usr/bin/plutil -insert CFBundleName -string "$APP_NAME" "$INFO_PLIST"
 /usr/bin/plutil -insert CFBundleDisplayName -string "$APP_NAME" "$INFO_PLIST"
 /usr/bin/plutil -insert CFBundlePackageType -string APPL "$INFO_PLIST"
-/usr/bin/plutil -insert CFBundleShortVersionString -string 0.2.0 "$INFO_PLIST"
+/usr/bin/plutil -insert CFBundleShortVersionString -string 0.2.1 "$INFO_PLIST"
 /usr/bin/plutil -insert CFBundleVersion -string 1 "$INFO_PLIST"
 /usr/bin/plutil -insert LSMinimumSystemVersion -string "$MIN_SYSTEM_VERSION" "$INFO_PLIST"
 /usr/bin/plutil -insert LSUIElement -bool true "$INFO_PLIST"

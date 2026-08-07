@@ -27,10 +27,13 @@ for the full attribution.
 
 The current main branch exposes 24 MCP tools and includes a native menu-bar
 supervisor, managed local processes, authenticated public ingress, permission
-diagnostics, and Python tests. There is no tagged binary release in the GitHub
-repository at the time of writing. The included installer builds a local app;
-it does not perform Developer ID signing, notarisation, App Store packaging, or
-hosted deployment.
+diagnostics, and Python tests. Tagged
+[GitHub Releases](https://github.com/Jay-2212/mac-orchestrator/releases)
+ship a source archive, not a prebuilt app — see
+[Install the managed app](#install-the-managed-app) for why, and
+[Upgrading](#upgrading) for the upgrade path. The included installer builds a
+local app; it does not perform Developer ID signing, notarisation, App Store
+packaging, or hosted deployment.
 
 This project is intended for technically capable users who understand the
 permissions and trust required to let an AI client operate their Mac. It should
@@ -144,9 +147,27 @@ operation.
 
 ## Install the managed app
 
+Tagged releases ship a **source archive**, not a prebuilt `.app`. Two
+reasons: the app is not standalone — it looks for a Python runtime under
+`~/Library/Application Support/Mac Orchestrator/runtime`, which only
+`distribute.sh` creates, so a bare `.app` downloaded on its own would launch
+and immediately report "Installed Python runtime is missing"; and the bundle
+embeds ngrok's proprietary binary, which this project doesn't redistribute
+outside of a build you produce yourself from your own bootstrapped copy. Build
+locally instead — it takes under a minute on Apple Silicon:
+
 ```bash
+# From a tagged release:
+curl -LO https://github.com/Jay-2212/mac-orchestrator/releases/download/vX.Y.Z/mac-orchestrator-X.Y.Z.tar.gz
+curl -LO https://github.com/Jay-2212/mac-orchestrator/releases/download/vX.Y.Z/mac-orchestrator-X.Y.Z.tar.gz.sha256
+shasum -a 256 -c mac-orchestrator-X.Y.Z.tar.gz.sha256   # verify before extracting
+tar xzf mac-orchestrator-X.Y.Z.tar.gz
+cd mac-orchestrator-X.Y.Z
+
+# Or from source directly:
 git clone https://github.com/Jay-2212/mac-orchestrator.git
 cd mac-orchestrator
+
 ./script/bootstrap_ngrok.sh   # one-time: downloads the ngrok binary to bundle
 ./script/distribute.sh
 ```
@@ -162,12 +183,125 @@ the menu-bar supervisor.
 The default code signature is ad hoc. Set `CODESIGN_IDENTITY` to a persistent
 local signing identity or a suitable Apple signing identity if you want TCC
 permissions to survive rebuilds. The packaging script does not notarise the
-app. See the signing notes in the script and the issue tracker before making a
-distribution decision.
+app — see [Signing and notarisation](#signing-and-notarisation).
+
+On first launch, ad hoc–signed apps and downloaded scripts trigger Gatekeeper.
+If macOS blocks the app ("cannot be opened because the developer cannot be
+verified"), open **System Settings → Privacy & Security**, scroll to the
+blocked-app notice, and click **Open Anyway** — or run
+`xattr -d com.apple.quarantine "/Applications/Mac Orchestrator.app"` once,
+from Terminal, if you built it yourself and trust what you built.
 
 After installation, use **Enable Public Connector**, wait for a healthy status,
 and choose **Copy Connector URL**. Paste that URL into the trusted MCP client;
-do not construct a URL manually.
+do not construct a URL manually. The connector token is generated once (on
+first launch, ever) and stored in Keychain — see
+[Connector configuration](#connector-configuration).
+
+### Signing and notarisation
+
+There is no paid Apple Developer ID behind this project, so releases are not
+notarised and the default build is ad hoc signed (`codesign --sign -`). Ad hoc
+signing embeds a cdhash-only designated requirement that changes on every
+rebuild, so **Accessibility and Screen Recording grants do not survive a
+rebuild** unless you set `CODESIGN_IDENTITY` to a signing identity backed by a
+persistent certificate (a self-signed Keychain certificate works, and does not
+require a paid account — see Apple's Keychain Access documentation for
+"Create a Certificate"). Set it once, before running `distribute.sh`:
+
+```bash
+CODESIGN_IDENTITY="Your Cert Name" ./script/distribute.sh
+```
+
+Whichever way you sign it, expect a Gatekeeper prompt on first launch (see
+above). This is expected for a locally built, non-notarised app and is not a
+sign of a broken build.
+
+### Upgrading
+
+```bash
+git pull   # or download and extract a newer release archive over the old checkout
+./script/bootstrap_ngrok.sh   # only if the bundled ngrok version needs refreshing
+./script/distribute.sh
+```
+
+`distribute.sh` asks the running app to quit via AppleScript, polls for up to
+8 seconds, and then runs `launchctl bootout` regardless of whether the poll
+saw it exit — which sends `SIGTERM` if the app is still running. As of 0.2.1,
+both paths (AppleScript quit and a raw `SIGTERM`) go through the same graceful
+shutdown, so either way the outgoing version's server and tunnel are stopped
+cleanly rather than left running under the new install. `distribute.sh` then
+rebuilds and re-installs to the same `/Applications` path and relaunches. It
+does **not** touch Keychain, so the existing connector token — and therefore
+the existing connector URL's token portion — is preserved across upgrades; no
+client reconfiguration is required. `serverDesired` and `tunnelDesired`
+(whether the connector was left on or off) are also preserved, so a Mac that
+had the connector enabled before an upgrade will have it enabled again after.
+
+### Uninstalling
+
+```bash
+osascript -e 'tell application id "com.jay.mac-orchestrator" to quit'
+launchctl bootout "gui/$(id -u)/com.jay.mac-orchestrator" 2>/dev/null || true
+rm -f ~/Library/LaunchAgents/com.jay.mac-orchestrator.plist
+rm -rf "/Applications/Mac Orchestrator.app"
+rm -rf ~/Library/Application\ Support/Mac\ Orchestrator
+rm -rf ~/Library/Logs/Mac\ Orchestrator
+```
+
+Quit the app (via the command above, or the menu bar's **Quit Mac
+Orchestrator**) *before* removing the LaunchAgent or app bundle — quitting
+first lets the supervisor shut down its owned server/tunnel children
+gracefully rather than leaving them orphaned.
+
+This intentionally leaves the Keychain item
+(`com.jay.mac-orchestrator` / `connector-capability-token`) in place, so a
+future reinstall gets the same connector URL rather than forcing every
+configured client to be updated. If you want a clean break — a genuinely new
+identity, not just removed files — also run:
+
+```bash
+security delete-generic-password -s com.jay.mac-orchestrator -a connector-capability-token
+```
+
+Only do this if you actually want a new connector URL (a new random token is
+generated on the next launch); it is irreversible for the old URL, which
+becomes permanently invalid.
+
+## Connector configuration
+
+The connector URL has the shape:
+
+```text
+https://<current-ngrok-host>/<keychain-token>/mcp
+```
+
+To configure a trusted MCP client:
+
+1. In the menu-bar app, choose **Enable Public Connector** and wait for the
+   status to show healthy.
+2. Choose **Copy Connector URL** and paste it, unmodified, into the client's
+   MCP server URL field. Don't retype or reconstruct it by hand — the token
+   is 64 hex characters and a single mistyped character produces a
+   permanent 404, not a helpful error.
+3. Treat the URL exactly like a password: don't paste it into issues,
+   screenshots, chat messages, or committed config files. See
+   [Trust and security model](#trust-and-security-model).
+
+Two parts of that URL behave differently:
+
+- **The token** (`<keychain-token>`) is stable. It's generated once, on
+  first launch ever, and stored in Keychain — see [Upgrading](#upgrading)
+  and [Uninstalling](#uninstalling) for exactly when it does and doesn't
+  change.
+- **The ngrok hostname** (`<current-ngrok-host>`) is only as stable as your
+  ngrok plan. A free ngrok account gets a new random hostname on every
+  tunnel restart (app relaunch, sleep/wake recovery, network change); the
+  full URL will change even though the token doesn't. A paid ngrok plan
+  with a reserved domain keeps the hostname fixed too, giving you a fully
+  stable URL. Either way, **Copy Connector URL** always gives you the
+  currently-correct full URL — reconfigure the client with it if the
+  hostname portion has changed.
 
 ## Local development
 
@@ -240,20 +374,53 @@ session with Accessibility/Screen Recording granted.
 ## Lifecycle and diagnostics
 
 The supervisor handles server failure, tunnel failure, duplicate launches,
-sleep/wake, login recovery, and clean shutdown for processes it owns. Logs are
-written under `~/Library/Logs/Mac Orchestrator/` and rotate locally. The
-capability token is stored in Keychain and is redacted from managed logs.
+sleep/wake, login recovery, and clean shutdown for processes it owns — whether
+shutdown is requested through the menu bar, `osascript ... quit`, or a direct
+`SIGTERM` (e.g. `launchctl bootout`/`kill`); all three route through the same
+graceful shutdown path as of 0.2.1, so an owned server or tunnel is never left
+orphaned holding its port. Logs are written under
+`~/Library/Logs/Mac Orchestrator/` and rotate locally. The capability token is
+stored in Keychain and is redacted from managed logs.
 
-To rotate a leaked connector token:
-
-```bash
-security delete-generic-password \
-  -s com.jay.mac-orchestrator \
-  -a connector-capability-token
-```
-
-Then quit and relaunch the app and copy the replacement URL into each trusted
+To rotate a leaked connector token, see
+[Uninstalling](#uninstalling)'s `security delete-generic-password` step —
+the same command works without uninstalling anything else; just quit and
+relaunch the app afterward and copy the replacement URL into each trusted
 client.
+
+## Troubleshooting
+
+- **"Installed Python runtime is missing. Run script/distribute.sh."** — the
+  app was launched without `distribute.sh` ever having run (e.g. a bare
+  `.app` copied from somewhere other than a full install). Run
+  `./script/distribute.sh` from a checkout.
+- **"Port 8000 is already used by another process."** — something else on
+  the Mac is bound to 8000, or an unmanaged `uv run python automac_mcp.py`
+  dev server is still running. Stop it, or set `MAC_ORCHESTRATOR_PORT` for
+  the dev server so it doesn't collide with the managed instance.
+- **Gatekeeper blocks the app on first launch** — expected for an
+  ad hoc–signed, non-notarised build; see
+  [Signing and notarisation](#signing-and-notarisation).
+- **Accessibility/Screen Recording grants disappear after every rebuild** —
+  expected with the default ad hoc signature; set `CODESIGN_IDENTITY` to a
+  persistent identity (same section).
+- **`get_session_state()` reports the session as locked or not on console,
+  and UI tools fail or no-op** — this is accurate, not a bug: UI automation
+  requires an unlocked, active console session. File, terminal, and
+  clipboard tools remain available regardless. See
+  [Session and lock-screen limitation](#session-and-lock-screen-limitation).
+- **The connector URL stopped working after a Mac restart or network
+  change** — if you're on a free ngrok plan, the hostname portion of the
+  URL rotates on tunnel restart even though the token doesn't; copy the
+  current URL again from **Copy Connector URL**. See
+  [Connector configuration](#connector-configuration).
+- **`vector_search` returns `INVALID_PARAM`** — `MAC_ORCHESTRATOR_WORKER_URL`
+  is not set; this tool has no built-in default backend. See
+  [Trust and security model](#trust-and-security-model).
+- **Something else** — check `~/Library/Logs/Mac Orchestrator/app.log`,
+  `server.log`, and `tunnel.log` first (the connector token is redacted from
+  them); then see [Contributing and support](#contributing-and-support) or
+  [`SECURITY.md`](SECURITY.md) for anything sensitive.
 
 ## Limitations
 

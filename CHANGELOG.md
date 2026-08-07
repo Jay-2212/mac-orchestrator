@@ -1,13 +1,38 @@
 # Changelog
 
-This project does not yet have tagged GitHub releases. Versions below refer
-to `pyproject.toml`'s `version` field and the native app's
-`CFBundleShortVersionString`, which this entry brings back in sync (they
-had drifted to `0.1.0` / `0.2.0` respectively).
+Versions below refer to `pyproject.toml`'s `version` field and the native
+app's `CFBundleShortVersionString`, which are kept in sync and match the
+GitHub Release tag (`vX.Y.Z`).
 
-All notable changes are recorded here going forward. Format is loosely
+All notable changes are recorded here. Format is loosely
 [Keep a Changelog](https://keepachangelog.com/); dates are when the change
-was made, not a release cut.
+was made, not necessarily the release cut date.
+
+## [0.2.1] - 2026-08-07
+
+### Fixed
+
+- A raw `SIGTERM` sent directly to the Swift supervisor process (e.g.
+  `launchctl bootout`/`launchctl stop`, or `kill <pid>` without `-9`) did
+  not go through AppKit's normal quit path, so
+  `applicationWillTerminate()` never ran and the owned Python server (and
+  ngrok tunnel, if running) were orphaned instead of cleaned up — silently
+  leaving a fully capable automation server running and holding port 8000.
+  This is reachable through the documented upgrade path: `distribute.sh`
+  asks the app to quit via AppleScript first, but falls through to
+  `launchctl bootout` (which sends `SIGTERM`) if the app doesn't exit
+  within its poll window, so a slow shutdown during an upgrade could hit
+  this. Fixed by installing a `SIGTERM` handler
+  (`AppDelegate.swift`) that routes the signal through `NSApp.terminate`,
+  so shutdown is always graceful regardless of how it's requested. A
+  subsequent `startServer()` no longer fails with "Port 8000 is already
+  used" because of a leftover orphan from a prior shutdown.
+  Verified live: launched the packaged app, confirmed the Python child was
+  running and bound to port 8000, sent a plain `kill <pid>` (not `-9`),
+  and confirmed the app log recorded "Stopping owned server" /
+  "Supervisor quit cleanly", all owned processes exited within 1 second,
+  and port 8000 was free — before the fix, the same sequence left the
+  Python child running and the port held.
 
 ## [0.2.0] - 2026-08-06
 

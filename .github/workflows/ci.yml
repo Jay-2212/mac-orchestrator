@@ -126,6 +126,9 @@ jobs:
       - name: Run deterministic Python tests (required)
         run: PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -B test_pagination.py
 
+      - name: Run capability and policy tests (required)
+        run: PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -B test_capabilities.py
+
       - name: Verify locked native dependencies import
         run: |
           set -euo pipefail

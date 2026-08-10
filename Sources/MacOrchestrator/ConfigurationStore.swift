@@ -134,10 +134,18 @@ final class ConfigurationStore {
         }
 
         let primaryExists = fileManager.fileExists(atPath: configurationURL.path)
+        let comparisonURL: URL?
         if primaryExists {
+            comparisonURL = configurationURL
+        } else if fileManager.fileExists(atPath: backupURL.path) {
+            comparisonURL = backupURL
+        } else {
+            comparisonURL = nil
+        }
+        if let comparisonURL {
             let existingData: Data
             do {
-                existingData = try Data(contentsOf: configurationURL)
+                existingData = try Data(contentsOf: comparisonURL)
             } catch {
                 throw ConfigurationStoreError.readFailed
             }

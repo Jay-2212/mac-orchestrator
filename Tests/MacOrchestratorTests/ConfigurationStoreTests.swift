@@ -40,6 +40,26 @@ final class ConfigurationStoreTests: XCTestCase {
         XCTAssertEqual(try store.load().localMCPPort, 9123)
     }
 
+    func testSaveKeepsGenerationMonotonicWhenOnlyBackupExists() throws {
+        let store = try makeStore()
+        let initial = try store.loadOrCreate()
+        var persisted = initial
+        persisted.localMCPPort = 8123
+        let saved = try store.save(persisted)
+
+        try FileManager.default.removeItem(at: store.configurationURL)
+
+        let replacement = try store.save(initial)
+        let backup = try JSONDecoder().decode(
+            AppConfiguration.self,
+            from: Data(contentsOf: store.backupURL)
+        )
+
+        XCTAssertEqual(saved.generation, backup.generation + 1)
+        XCTAssertEqual(replacement.generation, backup.generation + 1)
+        XCTAssertEqual(try store.load().generation, replacement.generation)
+    }
+
     func testCorruptPrimaryIsPreservedAndKnownGoodBackupIsRecovered() throws {
         let store = try makeStore()
         var configuration = try store.loadOrCreate()

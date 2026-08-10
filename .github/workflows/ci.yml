@@ -5,56 +5,184 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_call:
+    inputs:
+      checkout_ref:
+        description: Immutable commit SHA to validate when called by release automation.
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.13.14"
 
 jobs:
-  swift-build:
-    name: Swift build (macos)
+  swift-build-gate:
+    name: Swift build gate (macOS 14)
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
-      - name: swift build (debug)
+      - name: Check out exact workflow commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.checkout_ref || github.sha }}
+          fetch-depth: 1
+
+      - name: Show Swift toolchain
+        run: swift --version
+
+      - name: Swift debug build
         run: swift build
-      - name: swift build (release)
+
+      - name: Swift release build
         run: swift build -c release
 
-  python-lint:
-    name: Python syntax + hygiene (portable)
+  python-hygiene-gate:
+    name: Python hygiene gate (required)
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
-      - name: Compile-check all tracked Python files
-        run: |
-          git ls-files '*.py' | xargs -I{} python3 -B -m py_compile {}
-      - name: Secret / personal-data scan (heuristic)
+      - name: Check out exact workflow commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.checkout_ref || github.sha }}
+          fetch-depth: 1
+
+      - name: Set up pinned uv and Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.12.3"
+          python-version: "3.13.14"
+          enable-cache: false
+
+      - name: Install and select exact Python interpreter
         run: |
           set -euo pipefail
-          # Fails the build if obvious secret-shaped strings or this machine's
-          # home-directory path show up in tracked files. Best-effort, not a
-          # substitute for the manual review in SECURITY.md.
-          if git grep -InE "(ghp_[A-Za-z0-9]{36}|sk-[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,})" -- . ':!*.lock'; then
+          uv python install --managed-python "$PYTHON_VERSION"
+          uv venv --managed-python --python "$PYTHON_VERSION" .venv
+          actual_version="$(.venv/bin/python -c 'import platform; print(platform.python_version())')"
+          printf 'Selected Python: %s\n' "$actual_version"
+          test "$actual_version" = "$PYTHON_VERSION"
+
+      - name: Compile-check all tracked Python files
+        run: |
+          set -euo pipefail
+          python_files="$(git ls-files '*.py')"
+          if [[ -z "$python_files" ]]; then
+            echo "No tracked Python files found."
+            exit 0
+          fi
+          while IFS= read -r path; do
+            [[ -z "$path" ]] || .venv/bin/python -B -m py_compile "$path"
+          done <<< "$python_files"
+
+      - name: Secret / personal-data scan (required)
+        run: |
+          set -euo pipefail
+          if git grep -InE '(ghp_[A-Za-z0-9]{36}|sk-[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,})' -- . ':!*.lock'; then
             echo "Possible committed secret found." >&2
             exit 1
           fi
-          if git grep -InE "/Users/[a-z0-9_-]+/(Documents|Desktop|Downloads)" -- . ':!*.lock' ':!.github/workflows/ci.yml'; then
+          if git grep -InE '/Users/[a-z0-9_-]+/(Documents|Desktop|Downloads)' -- . ':!*.lock' ':!.github/workflows/ci.yml'; then
             echo "Possible hardcoded personal absolute path found." >&2
             exit 1
           fi
 
-  python-full-suite:
-    name: Python behavioral tests (best-effort, informational)
+  python-dependency-gate:
+    name: Python dependency gate (required)
+    runs-on: macos-14
+    steps:
+      - name: Check out exact workflow commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.checkout_ref || github.sha }}
+          fetch-depth: 1
+
+      - name: Set up pinned uv and Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.12.3"
+          python-version: "3.13.14"
+          enable-cache: false
+
+      - name: Install and select exact Python interpreter
+        run: |
+          set -euo pipefail
+          uv python install --managed-python "$PYTHON_VERSION"
+          uv venv --managed-python --python "$PYTHON_VERSION" .venv
+          actual_version="$(.venv/bin/python -c 'import platform; print(platform.python_version())')"
+          printf 'Selected Python: %s\n' "$actual_version"
+          test "$actual_version" = "$PYTHON_VERSION"
+
+      - name: Sync the locked dependency set with the exact interpreter
+        run: |
+          set -euo pipefail
+          uv sync --managed-python --frozen --python .venv/bin/python
+
+      # Session 1 integration point: after its deterministic/offline test
+      # entry point is merged, add that exact command here as a required step.
+      # Keep it on .venv/bin/python and do not add continue-on-error.
+      - name: Verify locked native dependencies import
+        run: |
+          set -euo pipefail
+          .venv/bin/python -B -c 'import easyocr, torch, torchvision; print("easyocr", easyocr.__version__); print("torch", torch.__version__); print("torchvision", torchvision.__version__)'
+
+  python-ui-informational:
+    name: Python UI checks (informational; TCC-dependent)
     runs-on: macos-14
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
-      - name: Install uv
-        uses: astral-sh/setup-uv@v3
-      - name: uv sync
-        run: uv sync
-      - name: Run test suite
-        run: PYTHONDONTWRITEBYTECODE=1 uv run python -B test_mcp_server.py
-        # Informational only: GitHub-hosted macOS runners do not have
-        # Accessibility/Screen Recording permissions granted to an
-        # interactive console session, so UI-automation tests are expected
-        # to report PERMISSION/skip rather than pass. See README's Tests
-        # section — the authoritative run of this suite is local, on a Mac
-        # with the permissions actually granted.
+      - name: Check out exact workflow commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.checkout_ref || github.sha }}
+          fetch-depth: 1
+
+      - name: Set up pinned uv and Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.12.3"
+          python-version: "3.13.14"
+          enable-cache: false
+
+      - name: Install and select exact Python interpreter
+        run: |
+          set -euo pipefail
+          uv python install --managed-python "$PYTHON_VERSION"
+          uv venv --managed-python --python "$PYTHON_VERSION" .venv
+          actual_version="$(.venv/bin/python -c 'import platform; print(platform.python_version())')"
+          printf 'Selected Python: %s\n' "$actual_version"
+          test "$actual_version" = "$PYTHON_VERSION"
+
+      - name: Sync the locked dependency set
+        run: uv sync --managed-python --frozen --python .venv/bin/python
+
+      - name: Run full Python behavioral suite (informational)
+        run: PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -B test_mcp_server.py
+        # Hosted macOS does not grant Accessibility, Screen Recording, or an
+        # interactive console session to this job. Its result is evidence only.
+
+  required-gates:
+    name: All required release gates
+    if: ${{ always() }}
+    needs:
+      - swift-build-gate
+      - python-hygiene-gate
+      - python-dependency-gate
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Fail closed unless every required gate succeeded
+        env:
+          SWIFT_RESULT: ${{ needs.swift-build-gate.result }}
+          PYTHON_HYGIENE_RESULT: ${{ needs.python-hygiene-gate.result }}
+          PYTHON_DEPENDENCY_RESULT: ${{ needs.python-dependency-gate.result }}
+        run: |
+          set -euo pipefail
+          printf 'swift-build-gate=%s\n' "$SWIFT_RESULT"
+          printf 'python-hygiene-gate=%s\n' "$PYTHON_HYGIENE_RESULT"
+          printf 'python-dependency-gate=%s\n' "$PYTHON_DEPENDENCY_RESULT"
+          if [[ "$SWIFT_RESULT" != success || "$PYTHON_HYGIENE_RESULT" != success || "$PYTHON_DEPENDENCY_RESULT" != success ]]; then
+            echo "One or more required release gates did not succeed." >&2
+            exit 1
+          fi

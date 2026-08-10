@@ -18,6 +18,8 @@ concurrency:
 jobs:
   validate-release:
     name: Validate release target SHA
+    outputs:
+      release_sha: ${{ steps.validate-target.outputs.release_sha }}
     runs-on: ubuntu-24.04
     steps:
       - name: Check out dispatch commit
@@ -27,6 +29,7 @@ jobs:
           fetch-depth: 0
 
       - name: Validate main ref, immutable SHA, and unused tag
+        id: validate-target
         env:
           RELEASE_SHA: ${{ github.sha }}
           RELEASE_TAG: ${{ inputs.tag }}
@@ -40,13 +43,14 @@ jobs:
           [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
           tag_ref="$(git ls-remote --refs origin "refs/tags/$RELEASE_TAG")"
           test -z "$tag_ref"
+          printf 'release_sha=%s\n' "$RELEASE_SHA" >> "$GITHUB_OUTPUT"
 
   required-ci-at-release-sha:
     name: Required CI at release SHA
     needs: validate-release
     uses: ./.github/workflows/ci.yml
     with:
-      checkout_ref: ${{ github.sha }}
+      checkout_ref: ${{ needs.validate-release.outputs.release_sha }}
     permissions:
       contents: read
 
@@ -63,12 +67,12 @@ jobs:
       - name: Check out exact release SHA
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ needs.validate-release.outputs.release_sha }}
           fetch-depth: 0
 
       - name: Recheck target SHA, current main, and tag absence
         env:
-          RELEASE_SHA: ${{ github.sha }}
+          RELEASE_SHA: ${{ needs.validate-release.outputs.release_sha }}
           RELEASE_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
@@ -83,7 +87,7 @@ jobs:
       - name: Create GitHub release and tag after all gates
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_SHA: ${{ github.sha }}
+          RELEASE_SHA: ${{ needs.validate-release.outputs.release_sha }}
           RELEASE_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail

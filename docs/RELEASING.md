@@ -96,14 +96,16 @@ tag first and rely on a later push workflow to discover a failure.
 3. The workflow captures `github.sha` as `RELEASE_SHA`. Validation checks that
    the dispatch ref is exactly `refs/heads/main`, the checked-out `HEAD` is
    that SHA, the SHA is the current remote `main` commit, the tag matches the
-   semantic `vMAJOR.MINOR.PATCH` form, and the tag is absent.
-4. Only after validation succeeds does the workflow call the reusable CI
-   workflow with `checkout_ref: ${{ github.sha }}`. Every source checkout in
-   that workflow therefore tests the same immutable commit.
+   semantic `vMAJOR.MINOR.PATCH` form, and the tag is absent. It writes the
+   validated SHA to the `validate-release` job output `release_sha`.
+4. Only after validation succeeds does the workflow pass
+   `needs.validate-release.outputs.release_sha` as `checkout_ref` to the
+   reusable CI workflow. Every source checkout in that workflow therefore
+   tests the same immutable commit.
 5. The publication job depends on validation and the reusable CI caller job.
-   It rechecks the exact SHA, current remote `main`, and tag absence. If `main`
-   moved or any required gate failed, publication is skipped or fails before
-   the release command.
+   It checks out and rechecks that same output SHA, current remote `main`, and
+   tag absence. If `main` moved or any required gate failed, publication is
+   skipped or fails before the release command.
 6. Only after those checks does the job run `gh release create` with
    `--target "$RELEASE_SHA"`. This creates the tag/release at the verified
    commit; it does not retarget a mutable branch.

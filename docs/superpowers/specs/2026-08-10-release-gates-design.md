@@ -89,11 +89,13 @@ Swift/Xcode patch version, which the workflow prints for evidence.
 manual-only. The operator must dispatch it from `main` with a new `vMAJOR.MINOR.PATCH`
 tag input.
 
-1. The workflow captures `github.sha` as the release SHA. Validation checks
+1. The workflow captures `github.sha` as the release SHA and publishes it as
+   the validation job's `release_sha` output. Validation checks
    that the dispatch ref is exactly `refs/heads/main`, `HEAD` equals that SHA,
    the SHA is the current remote `main` commit, the tag is valid and unused,
    and the tag has not already been created remotely.
-2. The reusable CI workflow is called with that same SHA as `checkout_ref`.
+2. The reusable CI workflow is called with
+   `needs.validate-release.outputs.release_sha` as `checkout_ref`.
    Every required CI checkout therefore tests the exact source that the
    release job will target. No mutable branch ref is used for the gate.
 3. The publication job depends on target validation and the reusable workflow.

@@ -118,7 +118,7 @@ Use environment variables rather than interpolating untrusted input into shell s
 
 - [ ] **Step 3: Call reusable CI at the fixed SHA.**
 
-Add a reusable-workflow job that calls `./.github/workflows/ci.yml` and passes `checkout_ref: ${{ github.sha }}`. Give the caller job a clear name such as `required-ci-at-release-sha`. Do not call CI on `main`, `HEAD`, or a tag ref without the explicit SHA input.
+Add a reusable-workflow job that calls `./.github/workflows/ci.yml` and passes the `validate-release` job's `release_sha` output as `checkout_ref`. Give the caller job a clear name such as `required-ci-at-release-sha`. Do not call CI on `main`, `HEAD`, or a tag ref without the explicit SHA input.
 
 - [ ] **Step 4: Gate publication on validation and reusable CI.**
 

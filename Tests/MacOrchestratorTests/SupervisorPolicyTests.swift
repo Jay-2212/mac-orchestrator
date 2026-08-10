@@ -1,31 +1,30 @@
 import Foundation
-import Testing
+import XCTest
 @testable import MacOrchestrator
 
-struct SupervisorPolicyTests {
-    @Test
-    func firstFiveFailuresUseExistingExponentialRetryDelays() {
+final class SupervisorPolicyTests: XCTestCase {
+    func testFirstFiveFailuresUseExistingExponentialRetryDelays() {
         let now = Date(timeIntervalSince1970: 1_000_000)
 
-        #expect(
+        XCTAssertTrue(
             SupervisorRetryPolicy.decision(failures: [], now: now)
                 == .retry(failures: [now], delay: 1)
         )
-        #expect(
+        XCTAssertTrue(
             SupervisorRetryPolicy.decision(failures: [now], now: now)
                 == .retry(failures: [now, now], delay: 2)
         )
-        #expect(
+        XCTAssertTrue(
             SupervisorRetryPolicy.decision(failures: [now, now], now: now)
                 == .retry(failures: [now, now, now], delay: 4)
         )
-        #expect(
+        XCTAssertTrue(
             SupervisorRetryPolicy.decision(
                 failures: [now, now, now],
                 now: now
             ) == .retry(failures: [now, now, now, now], delay: 8)
         )
-        #expect(
+        XCTAssertTrue(
             SupervisorRetryPolicy.decision(
                 failures: [now, now, now, now],
                 now: now
@@ -33,100 +32,95 @@ struct SupervisorPolicyTests {
         )
     }
 
-    @Test
-    func sixthFailureWithinWindowStopsRetrying() {
+    func testSixthFailureWithinWindowStopsRetrying() {
         let now = Date(timeIntervalSince1970: 1_000_000)
         let failures = Array(repeating: now, count: 5)
 
-        #expect(
+        XCTAssertTrue(
             SupervisorRetryPolicy.decision(failures: failures, now: now)
                 == .circuitOpen(failures: Array(repeating: now, count: 6))
         )
     }
 
-    @Test
-    func failuresOlderThanWindowDoNotTripCircuit() {
+    func testFailuresOlderThanWindowDoNotTripCircuit() {
         let now = Date(timeIntervalSince1970: 1_000_000)
         let oldFailures = Array(
             repeating: now.addingTimeInterval(-SupervisorRetryPolicy.failureWindow - 1),
             count: 5
         )
 
-        #expect(
+        XCTAssertTrue(
             SupervisorRetryPolicy.decision(failures: oldFailures, now: now)
                 == .retry(failures: [now], delay: 1)
         )
     }
 
-    @Test
-    func ownershipMarkersMatchOnlyTheirComponentAndOwner() {
-        #expect(
-            ProcessOwnership.marker(for: .server, ownerID: "owner-123")
-                == "--managed-owner owner-123"
+    func testOwnershipMarkersMatchOnlyTheirComponentAndOwner() {
+        XCTAssertEqual(
+            ProcessOwnership.marker(for: .server, ownerID: "owner-123"),
+            "--managed-owner owner-123"
         )
-        #expect(
-            ProcessOwnership.marker(for: .tunnel, ownerID: "owner-123")
-                == "mac-orchestrator-owner=owner-123"
+        XCTAssertEqual(
+            ProcessOwnership.marker(for: .tunnel, ownerID: "owner-123"),
+            "mac-orchestrator-owner=owner-123"
         )
-        #expect(
+        XCTAssertTrue(
             ProcessOwnership.matches(
                 commandLine: "python automac_mcp.py --managed-owner owner-123",
                 component: .server,
                 ownerID: "owner-123"
             )
         )
-        #expect(
+        XCTAssertTrue(
             ProcessOwnership.matches(
                 commandLine: "ngrok http --metadata mac-orchestrator-owner=owner-123",
                 component: .tunnel,
                 ownerID: "owner-123"
             )
         )
-        #expect(!ProcessOwnership.matches(
+        XCTAssertFalse(ProcessOwnership.matches(
             commandLine: "python automac_mcp.py --managed-owner owner-456",
             component: .server,
             ownerID: "owner-123"
         ))
-        #expect(!ProcessOwnership.matches(
+        XCTAssertFalse(ProcessOwnership.matches(
             commandLine: "ngrok http --metadata mac-orchestrator-owner=owner-123",
             component: .server,
             ownerID: "owner-123"
         ))
     }
 
-    @Test
-    func connectorURLUsesOnlyHTTPSAndAppendsCapabilityPath() {
-        #expect(
+    func testConnectorURLUsesOnlyHTTPSAndAppendsCapabilityPath() {
+        XCTAssertEqual(
             ConnectorURLBuilder.make(
                 publicURL: "https://example.ngrok.app",
                 capabilityToken: "test-token"
-            )?.absoluteString == "https://example.ngrok.app/test-token/mcp"
+            )?.absoluteString,
+            "https://example.ngrok.app/test-token/mcp"
         )
-        #expect(
+        XCTAssertNil(
             ConnectorURLBuilder.make(
                 publicURL: "http://example.ngrok.app",
                 capabilityToken: "test-token"
-            ) == nil
+            )
         )
     }
 
-    @Test
-    func healthySnapshotRequiresRunningServerAndAllowsStoppedTunnel() {
+    func testHealthySnapshotRequiresRunningServerAndAllowsStoppedTunnel() {
         var snapshot = ServiceSnapshot(server: .running, tunnel: .stopped)
-        #expect(snapshot.isHealthy)
+        XCTAssertTrue(snapshot.isHealthy)
 
         snapshot.tunnel = .starting
-        #expect(!snapshot.isHealthy)
+        XCTAssertFalse(snapshot.isHealthy)
     }
 
-    @Test
-    func ownedProcessStateRoundTripsWithoutKeychainOrFilesystem() throws {
+    func testOwnedProcessStateRoundTripsWithoutKeychainOrFilesystem() throws {
         let state = OwnedProcessState(ownerID: "owner-123", serverPID: 12, tunnelPID: nil)
         let data = try JSONEncoder().encode(state)
         let decoded = try JSONDecoder().decode(OwnedProcessState.self, from: data)
 
-        #expect(decoded.ownerID == "owner-123")
-        #expect(decoded.serverPID == 12)
-        #expect(decoded.tunnelPID == nil)
+        XCTAssertEqual(decoded.ownerID, "owner-123")
+        XCTAssertEqual(decoded.serverPID, 12)
+        XCTAssertNil(decoded.tunnelPID)
     }
 }

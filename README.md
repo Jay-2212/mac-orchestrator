@@ -355,6 +355,7 @@ Run the Python suite and Swift package checks on macOS:
 PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -B test_mcp_server.py
 swift build
 swift build -c release
+swift test
 git diff --check
 ```
 
@@ -369,11 +370,12 @@ those grants — not in CI.
 `.github/workflows/ci.yml` names the release responsibilities explicitly:
 
 - required `Swift build gate (macOS 14)` builds the Swift package in debug and
-  release configurations;
+  release configurations and runs ordinary `swift test`;
 - required `Python hygiene gate (required)` compiles tracked Python files and
   runs the secret/personal-path scan with the pinned interpreter;
 - required `Python dependency gate (required)` performs the frozen dependency
-  sync and imports the locked native Python stack; and
+  sync, runs deterministic pagination tests, and imports the locked native
+  Python stack; and
 - required `All required release gates` aggregates those deterministic jobs.
 
 `Python UI checks (informational; TCC-dependent)` separately attempts the full

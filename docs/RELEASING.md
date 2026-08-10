@@ -44,9 +44,9 @@ also callable by the release workflow at an explicit commit SHA.
 
 | Job name | Required for release? | Responsibility |
 | --- | --- | --- |
-| `Swift build gate (macOS 14)` | Yes | Prints the Swift toolchain and runs debug and release SwiftPM builds. |
+| `Swift build gate (macOS 14)` | Yes | Prints the Swift toolchain and runs debug and release SwiftPM builds plus ordinary `swift test`. |
 | `Python hygiene gate (required)` | Yes | Uses the pinned Python to compile every tracked Python file and runs the existing secret/personal-path scan. |
-| `Python dependency gate (required)` | Yes | Uses the pinned Python, performs a frozen lock sync, and imports the locked EasyOCR/Torch/Torchvision native stack without exercising UI automation. |
+| `Python dependency gate (required)` | Yes | Uses the pinned Python, performs a frozen lock sync, runs deterministic `test_pagination.py`, and imports the locked EasyOCR/Torch/Torchvision native stack without exercising UI automation. |
 | `All required release gates` | Yes | Runs after the three deterministic jobs and exits nonzero unless every one has result `success`. This is the stable aggregate check to require in branch protection. |
 | `Python UI checks (informational; TCC-dependent)` | No | Attempts the full behavioral suite for evidence. Its result is non-blocking because hosted macOS does not supply the Accessibility, Screen Recording, and interactive-console grants needed to interpret UI checks authoritatively. |
 
@@ -62,29 +62,32 @@ unlocked Mac with the required permissions granted to the exact Python binary
 running it. A hosted-runner permission skip is evidence about the runner, not
 proof that the UI behavior passed.
 
-## Session 1 deterministic-test integration
+## Deterministic test gates
 
-This branch deliberately does not name a test file or command that has not
-landed yet. After Session 1's deterministic/offline Python entry point is
-merged:
+The required `python-dependency-gate` runs Session 1's deterministic pagination
+test immediately after the frozen dependency synchronization:
 
-1. Add a new step named `Run deterministic Python tests (required)` immediately
-   after `Sync the locked dependency set with the exact interpreter` in the
-   `python-dependency-gate` job.
-2. Use Session 1's exact committed command, invoking the pinned
-   `.venv/bin/python` (or `uv run --python .venv/bin/python` if that is the
-   entry point's documented contract).
-3. Do not add `continue-on-error` to the step or job. A deterministic failure
-   must make `python-dependency-gate` fail and therefore make
-   `All required release gates` fail.
-4. Keep the command out of `python-ui-informational`; TCC-dependent evidence
-   must not be used as a release gate.
-5. Record the final command and its source path in this guide after the
-   integration merge. Because the release workflow calls the reusable CI
-   workflow, no second release-workflow copy of the command is needed.
+```bash
+PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -B test_pagination.py
+```
 
-The integration must not modify Session 1's test implementation as part of the
-CI wiring, and it must not pull Session 1's unmerged files into this branch.
+`test_pagination.py` exercises the real `get_ui_tree()` entry point against a
+fixed offline AX source. It is the CI oracle for pagination correctness; live
+mutable Finder pagination is not authoritative evidence. The step has no
+`continue-on-error`, so a deterministic failure fails `python-dependency-gate`
+and therefore fails `All required release gates`. It remains separate from the
+TCC-dependent `python-ui-informational` job.
+
+The required Swift gate runs the ordinary SwiftPM contract in order:
+
+```bash
+swift build
+swift build -c release
+swift test
+```
+
+The `swift test` step is required and has no `continue-on-error`. Its committed
+SwiftPM test target therefore participates in `All required release gates`.
 
 ## Supported release path
 

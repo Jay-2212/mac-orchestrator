@@ -75,6 +75,7 @@ PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -B test_mcp_server.py
 # Swift
 swift build
 swift build -c release
+swift test
 
 # Whitespace hygiene on your diff
 git diff --check
@@ -95,7 +96,7 @@ CI separates deterministic release gates from the
 non-blocking because hosted macOS cannot provide authoritative Accessibility,
 Screen Recording, and interactive-console evidence. See
 [`docs/RELEASING.md`](docs/RELEASING.md) for the required job names, pinned
-toolchain, Session 1 deterministic-test integration point, and supported
+toolchain, deterministic test gates, and supported
 release path.
 
 ### Style notes specific to this codebase

@@ -39,6 +39,9 @@ jobs:
       - name: Swift release build
         run: swift build -c release
 
+      - name: Swift test suite (required)
+        run: swift test
+
   python-hygiene-gate:
     name: Python hygiene gate (required)
     runs-on: macos-14
@@ -120,9 +123,9 @@ jobs:
           set -euo pipefail
           uv sync --managed-python --frozen --python .venv/bin/python
 
-      # Session 1 integration point: after its deterministic/offline test
-      # entry point is merged, add that exact command here as a required step.
-      # Keep it on .venv/bin/python and do not add continue-on-error.
+      - name: Run deterministic Python tests (required)
+        run: PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -B test_pagination.py
+
       - name: Verify locked native dependencies import
         run: |
           set -euo pipefail

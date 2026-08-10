@@ -3,6 +3,16 @@ import XCTest
 @testable import MacOrchestrator
 
 final class ConfigurationStoreTests: XCTestCase {
+    func testDefaultDirectoryUsesCanonicalApplicationSupportLocation() {
+        let applicationSupport = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first!
+        let expected = applicationSupport.appendingPathComponent("Mac Orchestrator", isDirectory: true)
+
+        XCTAssertEqual(ConfigurationStore.defaultDirectoryURL(), expected)
+    }
+
     func testLoadOrCreateWritesFreshConfigurationInInjectedDirectory() throws {
         let directory = try makeTemporaryDirectory()
         let store = ConfigurationStore(directoryURL: directory, ownerIDProvider: { "owner-1" })

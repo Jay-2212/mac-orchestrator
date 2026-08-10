@@ -36,12 +36,34 @@ final class ConfigurationStore {
     private static let backupSuffix = ".backup"
     private static let corruptSuffix = ".corrupt"
     private static let schemaMigrationMarker = "schema-v1"
+    private static let applicationSupportFolderName = "Mac Orchestrator"
 
     private let directoryURL: URL
     private let fileManager: FileManager
     private let ownerIDProvider: () -> String
     private let encoder: JSONEncoder
     private let decoder: JSONDecoder
+
+    static func defaultDirectoryURL(fileManager: FileManager = .default) -> URL {
+        let applicationSupport = fileManager.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first ?? fileManager.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library", isDirectory: true)
+            .appendingPathComponent("Application Support", isDirectory: true)
+        return applicationSupport.appendingPathComponent(Self.applicationSupportFolderName, isDirectory: true)
+    }
+
+    convenience init(
+        fileManager: FileManager = .default,
+        ownerIDProvider: @escaping () -> String = { UUID().uuidString.lowercased() }
+    ) {
+        self.init(
+            directoryURL: Self.defaultDirectoryURL(fileManager: fileManager),
+            fileManager: fileManager,
+            ownerIDProvider: ownerIDProvider
+        )
+    }
 
     var configurationURL: URL {
         directoryURL.appendingPathComponent("config.json", isDirectory: false)

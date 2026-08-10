@@ -1,6 +1,8 @@
 import Foundation
 
-final class RotatingLog {
+/// The logger is shared with pipe readability callbacks. Its immutable
+/// configuration and lock-guarded file mutations make that sharing safe.
+final class RotatingLog: @unchecked Sendable {
     private let directory: URL
     private let name: String
     private let maxBytes: UInt64

@@ -41,7 +41,8 @@ not be treated as a security boundary between mutually untrusted users.
 
 More documentation: [`SECURITY.md`](SECURITY.md) (threat model),
 [`CONTRIBUTING.md`](CONTRIBUTING.md) (dev setup),
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) (component map), and
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) (component map),
+[`docs/RELEASING.md`](docs/RELEASING.md) (CI gates and supported release path),
 [`CHANGELOG.md`](CHANGELOG.md).
 
 ## What it does
@@ -141,7 +142,8 @@ operation.
 
 - Apple Silicon Mac running macOS 13 or newer.
 - A Swift toolchain from Xcode or the Apple Command Line Tools.
-- Python 3.10 or newer and [`uv`](https://docs.astral.sh/uv/).
+- Python 3.10 through 3.13 for the frozen dependency set and
+  [`uv`](https://docs.astral.sh/uv/) (CI pins CPython 3.13.14).
 - An ngrok account and authtoken configured at
   `~/Library/Application Support/ngrok/ngrok.yml` for managed public ingress.
 
@@ -353,6 +355,7 @@ Run the Python suite and Swift package checks on macOS:
 PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -B test_mcp_server.py
 swift build
 swift build -c release
+swift test
 git diff --check
 ```
 
@@ -364,12 +367,23 @@ permission granted to the Python binary running it, plus an active unlocked
 console session, so it is authoritative only when run locally on a Mac with
 those grants — not in CI.
 
-`.github/workflows/ci.yml` runs on `macos-14` runners: a required job builds
-the Swift package (debug and release) and does a portable Python
-syntax/secret-scan pass; a separate best-effort job attempts the full
-Python suite but is expected to report permission-related skips rather than
-full passes, since GitHub-hosted runners don't have an interactive console
-session with Accessibility/Screen Recording granted.
+`.github/workflows/ci.yml` names the release responsibilities explicitly:
+
+- required `Swift build gate (macOS 14)` builds the Swift package in debug and
+  release configurations and runs ordinary `swift test`;
+- required `Python hygiene gate (required)` compiles tracked Python files and
+  runs the secret/personal-path scan with the pinned interpreter;
+- required `Python dependency gate (required)` performs the frozen dependency
+  sync, runs deterministic pagination tests, and imports the locked native
+  Python stack; and
+- required `All required release gates` aggregates those deterministic jobs.
+
+`Python UI checks (informational; TCC-dependent)` separately attempts the full
+Python suite for environmental evidence. It is not a release gate because
+GitHub-hosted macOS cannot provide authoritative Accessibility, Screen
+Recording, or interactive-console permissions. The supported release path and
+the exact SHA it verifies are documented in
+[`docs/RELEASING.md`](docs/RELEASING.md).
 
 ## Lifecycle and diagnostics
 

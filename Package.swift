@@ -12,6 +12,11 @@ let package = Package(
         .executableTarget(
             name: "MacOrchestrator",
             path: "Sources/MacOrchestrator"
+        ),
+        .testTarget(
+            name: "MacOrchestratorTests",
+            dependencies: ["MacOrchestrator"],
+            path: "Tests/MacOrchestratorTests"
         )
     ]
 )

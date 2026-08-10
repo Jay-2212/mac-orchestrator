@@ -46,14 +46,16 @@ Read, in this order:
 ```bash
 git clone https://github.com/Jay-2212/mac-orchestrator.git
 cd mac-orchestrator
-uv sync
-uv run python -c "import automac_mcp; print('OK')"
+uv python install --managed-python 3.13.14
+uv venv --managed-python --python 3.13.14 .venv
+uv sync --managed-python --frozen --python .venv/bin/python
+.venv/bin/python -c "import automac_mcp; print('OK')"
 ```
 
 Run the Python server directly without the Swift supervisor:
 
 ```bash
-uv run python automac_mcp.py
+.venv/bin/python automac_mcp.py
 ```
 
 Build and exercise the native app:
@@ -68,11 +70,12 @@ swift build
 
 ```bash
 # Python
-PYTHONDONTWRITEBYTECODE=1 uv run python -B test_mcp_server.py
+PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -B test_mcp_server.py
 
 # Swift
 swift build
 swift build -c release
+swift test
 
 # Whitespace hygiene on your diff
 git diff --check
@@ -87,6 +90,14 @@ unlocked console session — it is not expected to pass in a headless CI
 runner without those grants. If a specific check can't run in your
 environment, say so explicitly in the PR description rather than silently
 skipping it.
+
+CI separates deterministic release gates from the
+`Python UI checks (informational; TCC-dependent)` job. The latter remains
+non-blocking because hosted macOS cannot provide authoritative Accessibility,
+Screen Recording, and interactive-console evidence. See
+[`docs/RELEASING.md`](docs/RELEASING.md) for the required job names, pinned
+toolchain, deterministic test gates, and supported
+release path.
 
 ### Style notes specific to this codebase
 

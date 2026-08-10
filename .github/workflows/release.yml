@@ -1,0 +1,97 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: New semantic release tag, for example v0.2.2.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  validate-release:
+    name: Validate release target SHA
+    outputs:
+      release_sha: ${{ steps.validate-target.outputs.release_sha }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out dispatch commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Validate main ref, immutable SHA, and unused tag
+        id: validate-target
+        env:
+          RELEASE_SHA: ${{ github.sha }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = "refs/heads/main"
+          test "$RELEASE_SHA" = "$(git rev-parse HEAD)"
+          [[ "$RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          git fetch --no-tags origin main
+          test "$RELEASE_SHA" = "$(git rev-parse origin/main^{commit})"
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          tag_ref="$(git ls-remote --refs origin "refs/tags/$RELEASE_TAG")"
+          test -z "$tag_ref"
+          printf 'release_sha=%s\n' "$RELEASE_SHA" >> "$GITHUB_OUTPUT"
+
+  required-ci-at-release-sha:
+    name: Required CI at release SHA
+    needs: validate-release
+    uses: ./.github/workflows/ci.yml
+    with:
+      checkout_ref: ${{ needs.validate-release.outputs.release_sha }}
+    permissions:
+      contents: read
+
+  publish-release:
+    name: Publish release from verified SHA
+    needs:
+      - validate-release
+      - required-ci-at-release-sha
+    if: ${{ needs.validate-release.result == 'success' && needs.required-ci-at-release-sha.result == 'success' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Check out exact release SHA
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate-release.outputs.release_sha }}
+          fetch-depth: 0
+
+      - name: Recheck target SHA, current main, and tag absence
+        env:
+          RELEASE_SHA: ${{ needs.validate-release.outputs.release_sha }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = "refs/heads/main"
+          test "$RELEASE_SHA" = "$GITHUB_SHA"
+          test "$RELEASE_SHA" = "$(git rev-parse HEAD)"
+          git fetch --no-tags origin main
+          test "$RELEASE_SHA" = "$(git rev-parse origin/main^{commit})"
+          tag_ref="$(git ls-remote --refs origin "refs/tags/$RELEASE_TAG")"
+          test -z "$tag_ref"
+
+      - name: Create GitHub release and tag after all gates
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ needs.validate-release.outputs.release_sha }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release create "$RELEASE_TAG" \
+            --target "$RELEASE_SHA" \
+            --title "$RELEASE_TAG" \
+            --generate-notes

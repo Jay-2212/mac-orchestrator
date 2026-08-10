@@ -67,7 +67,7 @@ The existing Session 1 deterministic command must later be added as a separate r
 
 - [ ] **Step 5: Keep the full suite explicitly informational.**
 
-Create `python-ui-informational` on `macos-14` with `continue-on-error: true`, the same pinned environment setup and frozen sync, and the existing `PYTHONDONTWRITEBYTECODE=1 uv run python -B test_mcp_server.py` behavioral command. Name the job and step as TCC/UI-dependent. Do not move this command into any required job.
+Create `python-ui-informational` on `macos-14` with the same pinned environment setup and frozen sync. Put `continue-on-error: true` only on the existing `PYTHONDONTWRITEBYTECODE=1 uv run python -B test_mcp_server.py` behavioral step, so setup and sync failures remain visible. Name the job and step as TCC/UI-dependent. Do not move this command into any required job.
 
 - [ ] **Step 6: Add the aggregate required-gates job.**
 

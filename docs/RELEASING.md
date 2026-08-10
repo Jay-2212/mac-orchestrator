@@ -50,10 +50,12 @@ also callable by the release workflow at an explicit commit SHA.
 | `All required release gates` | Yes | Runs after the three deterministic jobs and exits nonzero unless every one has result `success`. This is the stable aggregate check to require in branch protection. |
 | `Python UI checks (informational; TCC-dependent)` | No | Attempts the full behavioral suite for evidence. Its result is non-blocking because hosted macOS does not supply the Accessibility, Screen Recording, and interactive-console grants needed to interpret UI checks authoritatively. |
 
-The informational job is visibly separate and retains the full suite. Its
-non-blocking status does not make dependency setup authoritative: the required
-Python dependency gate performs the same pinned frozen synchronization and
-fails the aggregate if that deterministic setup fails.
+The informational job is visibly separate and retains the full suite. Only its
+TCC-dependent behavioral step uses `continue-on-error`; interpreter selection,
+version assertion, and dependency synchronization remain visible failures.
+The required Python dependency gate independently performs the same pinned
+frozen synchronization and fails the aggregate if that deterministic setup
+fails.
 
 The existing `test_mcp_server.py` suite remains authoritative only on a real,
 unlocked Mac with the required permissions granted to the exact Python binary

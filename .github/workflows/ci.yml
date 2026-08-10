@@ -131,7 +131,6 @@ jobs:
   python-ui-informational:
     name: Python UI checks (informational; TCC-dependent)
     runs-on: macos-14
-    continue-on-error: true
     steps:
       - name: Check out exact workflow commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -159,9 +158,11 @@ jobs:
         run: uv sync --managed-python --frozen --python .venv/bin/python
 
       - name: Run full Python behavioral suite (informational)
+        continue-on-error: true
         run: PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -B test_mcp_server.py
-        # Hosted macOS does not grant Accessibility, Screen Recording, or an
-        # interactive console session to this job. Its result is evidence only.
+        # Only this TCC-dependent step is non-blocking. Hosted macOS does not
+        # grant Accessibility, Screen Recording, or an interactive console;
+        # its result is evidence only. Setup and sync failures remain visible.
 
   required-gates:
     name: All required release gates

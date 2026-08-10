@@ -178,15 +178,19 @@ final class ProcessSupervisor {
             redacting: [connectorToken],
             dropping: ["GET /__mac_orchestrator_health "]
         )
-        process.terminationHandler = { [weak self, weak process] terminated in
-            DispatchQueue.main.async {
-                guard let self, let process, self.serverProcess === process else { return }
+        process.terminationHandler = { [weak self] terminated in
+            let processID = ObjectIdentifier(terminated)
+            let terminationStatus = terminated.terminationStatus
+            Task { @MainActor [weak self, processID, terminationStatus] in
+                guard let self,
+                      let process = self.serverProcess,
+                      ObjectIdentifier(process) == processID else { return }
                 self.serverProcess = nil
                 self.persistState()
                 self.snapshot.server = self.serverDesired ? .failed : .stopped
                 self.stopTunnel()
                 if !self.quitting && self.serverDesired {
-                    self.scheduleRestart(component: "server", status: terminated.terminationStatus)
+                    self.scheduleRestart(component: "server", status: terminationStatus)
                 }
             }
         }
@@ -223,15 +227,19 @@ final class ProcessSupervisor {
             "--metadata", "mac-orchestrator-owner=\(ownerID)",
         ]
         attachOutput(of: process, to: tunnelLog)
-        process.terminationHandler = { [weak self, weak process] terminated in
-            DispatchQueue.main.async {
-                guard let self, let process, self.tunnelProcess === process else { return }
+        process.terminationHandler = { [weak self] terminated in
+            let processID = ObjectIdentifier(terminated)
+            let terminationStatus = terminated.terminationStatus
+            Task { @MainActor [weak self, processID, terminationStatus] in
+                guard let self,
+                      let process = self.tunnelProcess,
+                      ObjectIdentifier(process) == processID else { return }
                 self.tunnelProcess = nil
                 self.persistState()
                 self.snapshot.connectorURL = nil
                 self.snapshot.tunnel = self.tunnelDesired ? .failed : .stopped
                 if !self.quitting && self.tunnelDesired && self.serverDesired {
-                    self.scheduleRestart(component: "tunnel", status: terminated.terminationStatus)
+                    self.scheduleRestart(component: "tunnel", status: terminationStatus)
                 }
             }
         }
@@ -297,7 +305,7 @@ final class ProcessSupervisor {
     private func startHealthTimer() {
         healthTimer?.invalidate()
         healthTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
-            Task { @MainActor in
+            Task { @MainActor [weak self] in
                 self?.checkHealth()
             }
         }
@@ -305,11 +313,14 @@ final class ProcessSupervisor {
 
     private func checkHealth() {
         if let process = serverProcess, process.isRunning {
+            let processID = ObjectIdentifier(process)
             var request = URLRequest(url: URL(string: "http://127.0.0.1:8000/__mac_orchestrator_health")!)
             request.timeoutInterval = 1
-            URLSession.shared.dataTask(with: request) { [weak self] _, response, _ in
-                DispatchQueue.main.async {
-                    guard let self, let current = self.serverProcess, current === process else { return }
+            URLSession.shared.dataTask(with: request) { [weak self, processID] _, response, _ in
+                Task { @MainActor [weak self, processID] in
+                    guard let self,
+                          let current = self.serverProcess,
+                          ObjectIdentifier(current) == processID else { return }
                     if response != nil {
                         if self.snapshot.server != .running {
                             self.snapshot.server = .running
@@ -334,9 +345,12 @@ final class ProcessSupervisor {
     private func queryTunnelURL() {
         var request = URLRequest(url: URL(string: "http://127.0.0.1:4040/api/tunnels")!)
         request.timeoutInterval = 1
-        URLSession.shared.dataTask(with: request) { [weak self] data, _, _ in
-            DispatchQueue.main.async {
+        guard let process = tunnelProcess, process.isRunning else { return }
+        let processID = ObjectIdentifier(process)
+        URLSession.shared.dataTask(with: request) { [weak self, processID] data, _, _ in
+            Task { @MainActor [weak self, processID] in
                 guard let self, let process = self.tunnelProcess, process.isRunning,
+                      ObjectIdentifier(process) == processID,
                       let data,
                       let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                       let tunnels = object["tunnels"] as? [[String: Any]],
@@ -349,9 +363,10 @@ final class ProcessSupervisor {
                       let publicURL = ownedTunnel["public_url"] as? String,
                       publicURL.hasPrefix("https://"),
                       let base = URL(string: publicURL) else { return }
-                var components = URLComponents(url: base, resolvingAgainstBaseURL: false)!
-                components.path = "/\(self.connectorToken)/mcp"
-                self.snapshot.connectorURL = components.url
+                self.snapshot.connectorURL = ConnectorURLBuilder.make(
+                    publicURL: base.absoluteString,
+                    capabilityToken: self.connectorToken
+                )
                 self.snapshot.tunnel = .running
                 self.snapshot.error = nil
                 self.tunnelRetryNotBefore = .distantPast
@@ -361,30 +376,30 @@ final class ProcessSupervisor {
 
     private func scheduleRestart(component: String, status: Int32) {
         let now = Date()
-        if component == "server" {
-            serverFailures = serverFailures.filter { now.timeIntervalSince($0) < 120 }
-            serverFailures.append(now)
-            if serverFailures.count > 5 {
-                serverRetryNotBefore = .distantFuture
-                fail("Server stopped repeatedly (last exit \(status)). Use Restart after checking logs.")
-                return
-            }
-        } else {
-            tunnelFailures = tunnelFailures.filter { now.timeIntervalSince($0) < 120 }
-            tunnelFailures.append(now)
-            if tunnelFailures.count > 5 {
-                tunnelRetryNotBefore = .distantFuture
-                fail("Tunnel stopped repeatedly (last exit \(status)). Check ngrok credentials and logs.")
-                return
-            }
-        }
-        let attempts = component == "server" ? serverFailures.count : tunnelFailures.count
-        let delay = min(pow(2.0, Double(max(0, attempts - 1))), 30)
-        if component == "server" {
+        let supervisorComponent: SupervisorComponent = component == "server" ? .server : .tunnel
+        let existingFailures = supervisorComponent == .server ? serverFailures : tunnelFailures
+        let decision = SupervisorRetryPolicy.decision(failures: existingFailures, now: now)
+
+        switch (supervisorComponent, decision) {
+        case let (.server, .circuitOpen(failures)):
+            serverFailures = failures
+            serverRetryNotBefore = .distantFuture
+            fail("Server stopped repeatedly (last exit \(status)). Use Restart after checking logs.")
+            return
+        case let (.tunnel, .circuitOpen(failures)):
+            tunnelFailures = failures
+            tunnelRetryNotBefore = .distantFuture
+            fail("Tunnel stopped repeatedly (last exit \(status)). Check ngrok credentials and logs.")
+            return
+        case let (.server, .retry(failures, delay)):
+            serverFailures = failures
             serverRetryNotBefore = now.addingTimeInterval(delay)
-        } else {
+        case let (.tunnel, .retry(failures, delay)):
+            tunnelFailures = failures
             tunnelRetryNotBefore = now.addingTimeInterval(delay)
         }
+
+        guard case let .retry(_, delay) = decision else { return }
         appLog.write("\(component) exited status=\(status); restart in \(Int(delay))s")
         restartWorkItem?.cancel()
         let item = DispatchWorkItem { [weak self] in
@@ -462,16 +477,25 @@ final class ProcessSupervisor {
             return
         }
         if let pid = state.tunnelPID {
-            terminateRecordedPID(pid, marker: "mac-orchestrator-owner=\(ownerID)", label: "stale tunnel")
+            terminateRecordedPID(pid, component: .tunnel, label: "stale tunnel")
         }
         if let pid = state.serverPID {
-            terminateRecordedPID(pid, marker: "--managed-owner \(ownerID)", label: "stale server")
+            terminateRecordedPID(pid, component: .server, label: "stale server")
         }
         try? FileManager.default.removeItem(at: stateURL)
     }
 
-    private func terminateRecordedPID(_ pid: Int32, marker: String, label: String) {
-        guard kill(pid, 0) == 0, commandLine(for: pid).contains(marker) else { return }
+    private func terminateRecordedPID(
+        _ pid: Int32,
+        component: SupervisorComponent,
+        label: String
+    ) {
+        guard kill(pid, 0) == 0,
+              ProcessOwnership.matches(
+                  commandLine: commandLine(for: pid),
+                  component: component,
+                  ownerID: ownerID
+              ) else { return }
         appLog.write("Cleaning \(label) pid=\(pid)")
         _ = kill(-pid, SIGTERM)
         let deadline = Date().addingTimeInterval(3)

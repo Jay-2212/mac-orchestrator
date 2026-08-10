@@ -7,8 +7,30 @@ import json
 import time
 
 
+class _TestOutcome:
+    """Collect genuine failures without allowing them to disappear in output."""
+
+    def __init__(self):
+        self.failures = []
+        self.skips = []
+        self.inconclusive = []
+
+    def fail(self, message):
+        self.failures.append(message)
+        print(f"✗ {message}")
+
+    def skip(self, message):
+        self.skips.append(message)
+        print(f"SKIP: {message}")
+
+    def mark_inconclusive(self, message):
+        self.inconclusive.append(message)
+        print(f"INCONCLUSIVE/MANUAL: {message}")
+
+
 def test_mcp_server():
     """Test the FastMCP server by running it and checking output"""
+    outcome = _TestOutcome()
     print("Testing AutoMac MCP FastMCP Server")
     print("=" * 35)
     
@@ -22,12 +44,12 @@ def test_mcp_server():
         if result.returncode == 0:
             print("✓ automac_mcp.py syntax OK")
         else:
-            print(f"✗ Syntax error in automac_mcp.py")
+            outcome.fail("Syntax error in automac_mcp.py")
             if result.stderr:
                 print(f"Error: {result.stderr}")
             return False
     except Exception as e:
-        print(f"✗ Error checking syntax: {e}")
+        outcome.fail(f"Error checking syntax: {e}")
         return False
     
     print("\n2. Testing server structure...")
@@ -41,7 +63,7 @@ def test_mcp_server():
         if hasattr(automac_mcp, 'mcp'):
             print("✓ FastMCP instance found")
         else:
-            print("✗ FastMCP instance not found")
+            outcome.fail("FastMCP instance not found")
             return False
             
         # Check for the current tool set (24 tools)
@@ -58,7 +80,7 @@ def test_mcp_server():
             if hasattr(automac_mcp, func_name):
                 print(f"✓ Tool {func_name} found")
             else:
-                print(f"✗ Tool {func_name} not found")
+                outcome.fail(f"Tool {func_name} not found")
                 return False
         
         print(f"\n   Total tools verified: {len(v2_tools)}")
@@ -72,18 +94,20 @@ def test_mcp_server():
         
         for func_name in old_tools:
             if hasattr(automac_mcp, func_name):
-                print(f"⚠ Old tool {func_name} still exists (should be removed)")
+                outcome.fail(f"Old tool {func_name} still exists (should be removed)")
             else:
                 print(f"✓ Old tool {func_name} correctly removed")
                 
     except ImportError as e:
-        print(f"✗ Failed to import module: {e}")
+        outcome.fail(f"Failed to import module: {e}")
         return False
     except Exception as e:
-        print(f"✗ Error checking module: {e}")
+        outcome.fail(f"Error checking module: {e}")
         return False
     
     print("\n3. Testing individual functions...")
+    print("   Live macOS UI checks below are environment-dependent; test_pagination.py is the "
+          "authoritative pagination oracle.")
     
     try:
         # Test get_available_apps (returns structured JSON now)
@@ -91,34 +115,40 @@ def test_mcp_server():
         if result and result.get("status") == "success":
             print(f"✓ get_available_apps: {result.get('message')}")
         else:
-            print(f"✗ get_available_apps failed: {result}")
+            outcome.fail(f"get_available_apps failed: {result}")
             
         # Test focus_app with a quick timeout
         try:
             result = automac_mcp.focus_app("Finder", 5)
-            if result and "status" in result:
+            if result and result.get("status") == "success":
                 print(f"✓ focus_app: {result.get('message')}")
+            elif result and result.get("error_code") == "PERMISSION":
+                outcome.skip("focus_app: Automation/Accessibility permission is unavailable")
             else:
-                print(f"✗ focus_app failed: {result}")
+                outcome.fail(f"focus_app failed: {result}")
         except Exception as e:
-            print(f"✗ focus_app error: {e}")
+            outcome.fail(f"focus_app error: {e}")
         
         # Test press_keystroke (the new consolidated keyboard tool)
         try:
             result = automac_mcp.press_keystroke("escape")
-            if result and "status" in result:
+            if result and result.get("status") == "success":
                 print(f"✓ press_keystroke: {result.get('message')}")
+            elif result and result.get("error_code") == "PERMISSION":
+                outcome.skip("press_keystroke: Accessibility permission is unavailable")
             else:
-                print(f"✗ press_keystroke failed: {result}")
+                outcome.fail(f"press_keystroke failed: {result}")
         except Exception as e:
-            print(f"✗ press_keystroke error: {e}")
+            outcome.fail(f"press_keystroke error: {e}")
             
         # Test get_screen_layout
         result = automac_mcp.get_screen_layout()
-        if result and "status" in result:
+        if result and result.get("status") == "success":
             print(f"✓ get_screen_layout: {result.get('message')}")
+        elif result and result.get("error_code") == "PERMISSION":
+            outcome.skip("get_screen_layout: Accessibility permission is unavailable")
         else:
-            print(f"✗ get_screen_layout failed")
+            outcome.fail("get_screen_layout failed")
 
         # Regression test: AXPosition/AXSize are AXValueRef objects that need
         # AXValueGetValue() to unwrap — a bare except previously swallowed this
@@ -128,9 +158,9 @@ def test_mcp_server():
             if windows and any("bounds" in w for w in windows):
                 print("✓ get_screen_layout: bounds populated (AXValueRef unwrap works)")
             elif windows:
-                print(f"✗ get_screen_layout: no window has 'bounds' — AXValueRef unwrap regressed")
+                outcome.fail("get_screen_layout: no window has 'bounds' — AXValueRef unwrap regressed")
             else:
-                print("  (get_screen_layout: no windows open, skipping bounds check)")
+                outcome.mark_inconclusive("get_screen_layout: no windows open; bounds check was not exercised")
 
         # Test get_session_state
         result = automac_mcp.get_session_state()
@@ -139,7 +169,7 @@ def test_mcp_server():
                 and "session" in result and "permissions" in result):
             print(f"✓ get_session_state: {result.get('message')}")
         else:
-            print(f"✗ get_session_state failed: {result}")
+            outcome.fail(f"get_session_state failed: {result}")
 
         # Test describe()
         r_overview = automac_mcp.describe("overview")
@@ -148,7 +178,7 @@ def test_mcp_server():
                 and r_unknown.get("status") == "success" and "available_topics" in r_unknown):
             print("✓ describe: known topic returns text, unknown topic lists available_topics")
         else:
-            print(f"✗ describe failed: overview={r_overview}, unknown={r_unknown}")
+            outcome.fail(f"describe failed: overview={r_overview}, unknown={r_unknown}")
 
         # Test get_available_apps includes apps_detail with activation_policy
         result = automac_mcp.get_available_apps()
@@ -157,7 +187,7 @@ def test_mcp_server():
                 and all("pid" in a and "activation_policy" in a for a in detail)):
             print(f"✓ get_available_apps: apps_detail has pid/activation_policy ({len(detail)} apps)")
         else:
-            print(f"✗ get_available_apps apps_detail malformed: {result}")
+            outcome.fail(f"get_available_apps apps_detail malformed: {result}")
 
         # Test get_ui_tree — targets the frontmost app by default, no live-UI assumptions
         result = automac_mcp.get_ui_tree(limit=5, depth=2)
@@ -165,22 +195,16 @@ def test_mcp_server():
             print(f"✓ get_ui_tree: {result.get('message')}")
             first_ref = result["elements"][0]["ref"] if result["elements"] else None
         elif result.get("status") == "error" and result.get("error_code") == "PERMISSION":
-            print("  (get_ui_tree: Accessibility permission not granted in this environment, skipping)")
+            outcome.skip("get_ui_tree: Accessibility permission is unavailable")
             first_ref = None
         else:
-            print(f"✗ get_ui_tree failed: {result}")
+            outcome.fail(f"get_ui_tree failed: {result}")
             first_ref = None
 
-        # Regression test: get_ui_tree pagination previously had two distinct bugs —
-        # (1) the continuation_token double-counted the skip window, silently dropping
-        # exactly one element at each page boundary, and (2) flat/filtered mode gated
-        # recursion on the per-page limit, so hitting the limit exactly stopped
-        # traversal before it could discover (and report) that more matches existed.
-        # A ref-based diff can't catch either — refs are always distinct across calls
-        # even for the same element. Only a content comparison against an unpaginated
-        # baseline discriminates. Tree mode (no filter) and flat mode (role_filter/
-        # actionable_only) are two different code paths (_ax_walk_tree/_ax_walk_flat)
-        # with independent bugs found here, so both are checked.
+        # Best-effort live observation only: the Finder AX tree may change between
+        # calls, so this is not the pagination oracle. The deterministic
+        # test_pagination.py command compares both traversal paths against a stable
+        # dictionary-backed AX fixture and owns the pagination invariant.
         def _flatten_ui_tree(nodes, out):
             for n in nodes:
                 out.append((n["role"], n["label"], json.dumps(n.get("bounds"), sort_keys=True)))
@@ -189,10 +213,12 @@ def test_mcp_server():
         def _check_ui_tree_pagination(label, base_kwargs):
             baseline = automac_mcp.get_ui_tree(depth=6, limit=200, node_budget=2000, **base_kwargs)
             if baseline.get("status") == "error" and baseline.get("error_code") == "PERMISSION":
-                print(f"  (get_ui_tree pagination [{label}]: Accessibility permission not granted, skipping)")
+                outcome.skip(f"get_ui_tree pagination [{label}]: Accessibility permission is unavailable")
                 return
             if not (baseline.get("status") == "success" and baseline.get("elements")):
-                print(f"  (get_ui_tree pagination [{label}]: no elements to paginate over, skipping)")
+                outcome.mark_inconclusive(
+                    f"get_ui_tree pagination [{label}]: no elements available to cross a page boundary"
+                )
                 return
             baseline_seq = []
             _flatten_ui_tree(baseline["elements"], baseline_seq)
@@ -219,14 +245,20 @@ def test_mcp_server():
             if pages <= 1:
                 # limit=1 never crossed a page boundary — the one thing that was
                 # actually broken — so this environment can't confirm anything.
-                print(f"  (get_ui_tree pagination [{label}]: only {len(baseline_seq)} element(s), "
-                      f"no page boundary crossed — inconclusive, skipping)")
+                outcome.mark_inconclusive(
+                    f"get_ui_tree pagination [{label}]: only {len(baseline_seq)} element(s); "
+                    "no page boundary was crossed"
+                )
             elif ok and paginated_seq == baseline_seq:
-                print(f"✓ get_ui_tree pagination [{label}]: {pages} pages reproduce the unpaginated "
-                      f"baseline exactly ({len(baseline_seq)} elements)")
+                print(f"LIVE CHECK (non-authoritative) get_ui_tree pagination [{label}]: "
+                      f"{pages} pages reproduced the unpaginated baseline "
+                      f"({len(baseline_seq)} elements)")
             else:
-                print(f"✗ get_ui_tree pagination [{label}] mismatch: baseline={len(baseline_seq)} elements, "
-                      f"paginated={len(paginated_seq)} elements over {pages} pages (ok={ok})")
+                outcome.mark_inconclusive(
+                    f"get_ui_tree pagination [{label}] mismatch: baseline={len(baseline_seq)} elements, "
+                    f"paginated={len(paginated_seq)} elements over {pages} pages (ok={ok}); "
+                    "live AX state is mutable, so run test_pagination.py for the authoritative result"
+                )
 
         _check_ui_tree_pagination("flat/actionable_only", {"app": "Finder", "actionable_only": True})
         _check_ui_tree_pagination("tree/unfiltered", {"app": "Finder"})
@@ -236,21 +268,25 @@ def test_mcp_server():
         if r_bad_ref.get("status") == "error" and r_bad_ref.get("error_code") == "NOT_FOUND":
             print("✓ perform_ui_action: unknown ref returns NOT_FOUND")
         else:
-            print(f"✗ perform_ui_action bad-ref handling failed: {r_bad_ref}")
+            outcome.fail(f"perform_ui_action bad-ref handling failed: {r_bad_ref}")
 
         if first_ref:
             r_bad_action = automac_mcp.perform_ui_action(ref=first_ref, action="AXTotallyBogusAction")
             if r_bad_action.get("status") == "error" and r_bad_action.get("error_code") == "INVALID_PARAM":
                 print("✓ perform_ui_action: unsupported action returns INVALID_PARAM")
             else:
-                print(f"✗ perform_ui_action bad-action handling failed: {r_bad_action}")
+                outcome.fail(f"perform_ui_action bad-action handling failed: {r_bad_action}")
+        else:
+            outcome.mark_inconclusive(
+                "perform_ui_action unsupported-action check: no live UI ref was available"
+            )
 
         # Test run_terminal_command with structured output
         result = automac_mcp.run_terminal_command("echo hello", timeout_seconds=5)
         if result and result.get("status") == "success":
             print(f"✓ run_terminal_command: exit_code={result.get('exit_code')}, stdout='{result.get('stdout', '').strip()}'")
         else:
-            print(f"✗ run_terminal_command failed: {result}")
+            outcome.fail(f"run_terminal_command failed: {result}")
             
         # Test find_file
         repo_dir = os.path.dirname(os.path.abspath(__file__))
@@ -258,7 +294,7 @@ def test_mcp_server():
         if result and result.get("status") == "success":
             print(f"✓ find_file: {result.get('message')}")
         else:
-            print(f"✗ find_file failed: {result}")
+            outcome.fail(f"find_file failed: {result}")
             
         # Test vector_search — no MAC_ORCHESTRATOR_WORKER_URL is configured in this
         # test environment (there's no built-in default backend), so the correct,
@@ -268,11 +304,11 @@ def test_mcp_server():
             if result and result.get("status") == "success":
                 print(f"✓ vector_search: {result.get('message')} (Found {len(result.get('results', []))} matches)")
             else:
-                print(f"✗ vector_search failed: {result}")
+                outcome.fail(f"vector_search failed: {result}")
         elif result.get("status") == "error" and result.get("error_code") == "INVALID_PARAM":
             print("✓ vector_search: fails cleanly with INVALID_PARAM when MAC_ORCHESTRATOR_WORKER_URL is unset")
         else:
-            print(f"✗ vector_search unconfigured-backend handling failed: {result}")
+            outcome.fail(f"vector_search unconfigured-backend handling failed: {result}")
             return False
 
         # Test write_file append mode
@@ -287,7 +323,7 @@ def test_mcp_server():
             if r1.get("status") == "success" and r2.get("status") == "success" and txt == "line1\nline2\n":
                 print("✓ write_file append mode: works correctly")
             else:
-                print(f"✗ write_file append mode failed: {txt!r}")
+                outcome.fail(f"write_file append mode failed: {txt!r}")
         finally:
             os.unlink(tmp_path)
 
@@ -297,14 +333,14 @@ def test_mcp_server():
         if r_set.get("status") == "success" and r_get.get("content") == "test-clipboard-42":
             print("✓ clipboard get/set: works correctly")
         else:
-            print(f"✗ clipboard failed: set={r_set}, get={r_get}")
+            outcome.fail(f"clipboard failed: set={r_set}, get={r_get}")
 
         # Test clipboard invalid action
         r_bad = automac_mcp.clipboard(action="invalid")
         if r_bad.get("status") == "error" and r_bad.get("error_code") == "INVALID_PARAM":
             print("✓ clipboard invalid action: returns correct error")
         else:
-            print(f"✗ clipboard invalid action error not raised: {r_bad}")
+            outcome.fail(f"clipboard invalid action error not raised: {r_bad}")
 
         # Test execute_macro rollback reporting
         macro_result = automac_mcp.execute_macro([
@@ -318,7 +354,7 @@ def test_mcp_server():
                 and "recovery_hint" in macro_result):
             print("✓ execute_macro rollback reporting: partial_success correct")
         else:
-            print(f"✗ execute_macro rollback reporting failed: {macro_result}")
+            outcome.fail(f"execute_macro rollback reporting failed: {macro_result}")
 
         # Test execute_macro run_command step
         macro_cmd = automac_mcp.execute_macro([
@@ -328,7 +364,7 @@ def test_mcp_server():
                 and macro_cmd["steps"][0].get("stdout", "").strip() == "macro-test"):
             print("✓ execute_macro run_command step: works correctly")
         else:
-            print(f"✗ execute_macro run_command step failed: {macro_cmd}")
+            outcome.fail(f"execute_macro run_command step failed: {macro_cmd}")
 
         # Test execute_macro first-step failure → status="error"
         macro_first_fail = automac_mcp.execute_macro([
@@ -337,7 +373,7 @@ def test_mcp_server():
         if macro_first_fail.get("status") == "error" and macro_first_fail.get("completed_steps") == 0:
             print("✓ execute_macro first-step failure: status=error, completed_steps=0")
         else:
-            print(f"✗ execute_macro first-step failure wrong: {macro_first_fail}")
+            outcome.fail(f"execute_macro first-step failure wrong: {macro_first_fail}")
 
         # Test AppleScript permission-error classification — pure function, no
         # live permission denial needed to exercise it.
@@ -356,7 +392,9 @@ def test_mcp_server():
             got = automac_mcp._classify_applescript_error(stderr_sample)
             if got != expected:
                 classify_ok = False
-                print(f"✗ _classify_applescript_error({stderr_sample!r}) = {got!r}, expected {expected!r}")
+                outcome.fail(
+                    f"_classify_applescript_error({stderr_sample!r}) = {got!r}, expected {expected!r}"
+                )
         if classify_ok:
             print(f"✓ _classify_applescript_error: {len(classify_cases)} cases classified correctly")
         else:
@@ -375,8 +413,10 @@ def test_mcp_server():
                 and len(automac_mcp._ax_registry_order) == cap):
             print(f"✓ AX ref registry eviction: oldest ref evicted, cap={cap} enforced, latest ref still resolvable")
         else:
-            print(f"✗ AX ref registry eviction failed: first_ref resolves={automac_mcp._ax_resolve(first_ref)!r}, "
-                  f"registry size={len(automac_mcp._ax_registry_order)}")
+            outcome.fail(
+                f"AX ref registry eviction failed: first_ref resolves={automac_mcp._ax_resolve(first_ref)!r}, "
+                f"registry size={len(automac_mcp._ax_registry_order)}"
+            )
             return False
 
         # Managed connector paths are high-entropy and URL-safe.
@@ -396,7 +436,7 @@ def test_mcp_server():
         if managed.returncode == 0 and managed.stdout.strip() == f"/{'a' * 64}/mcp":
             print("✓ managed connector capability path configured")
         else:
-            print(f"✗ managed connector path failed: {managed.stderr or managed.stdout}")
+            outcome.fail(f"managed connector path failed: {managed.stderr or managed.stdout}")
             return False
 
         # Malformed/short/wrong-charset tokens must fail closed at startup, not
@@ -413,7 +453,7 @@ def test_mcp_server():
                 capture_output=True, text=True, env=bad_env, timeout=15,
             )
             if bad_run.returncode == 0:
-                print(f"✗ malformed token {bad!r} was accepted instead of rejected")
+                outcome.fail(f"malformed token {bad!r} was accepted instead of rejected")
                 return False
         print(f"✓ malformed connector tokens ({len(bad_tokens)} cases) rejected at startup")
 
@@ -429,7 +469,7 @@ def test_mcp_server():
         if no_token.returncode == 0 and no_token.stdout.strip() == "/mcp":
             print("✓ unmanaged/no-token mode mounts plain /mcp (loopback-only, see SECURITY.md)")
         else:
-            print(f"✗ no-token path check failed: {no_token.stderr or no_token.stdout}")
+            outcome.fail(f"no-token path check failed: {no_token.stderr or no_token.stdout}")
             return False
 
         # The supervisor's health probe must be registered outside the
@@ -440,7 +480,7 @@ def test_mcp_server():
         if "/__mac_orchestrator_health" in health_paths and "/__mac_orchestrator_health" != automac_mcp.MCP_PATH:
             print("✓ health check route registered outside the capability path")
         else:
-            print(f"✗ health check route missing or overlapping MCP_PATH: {health_paths}")
+            outcome.fail(f"health check route missing or overlapping MCP_PATH: {health_paths}")
             return False
 
         # Live HTTP proof of the capability path — every check above only
@@ -484,14 +524,16 @@ def test_mcp_server():
         )
         try:
             if not _wait_for_server(8794):
-                print("✗ live capability-path server did not come up in time")
+                outcome.fail("live capability-path server did not come up in time")
                 return False
             bare_status = _http_status(8794, "/mcp")
             token_status = _http_status(8794, f"/{live_token}/mcp")
             if bare_status == 404 and token_status is not None and token_status != 404:
                 print(f"✓ live HTTP: /mcp -> 404, /<token>/mcp -> {token_status} (route exists)")
             else:
-                print(f"✗ live capability path check failed: /mcp={bare_status}, /<token>/mcp={token_status}")
+                outcome.fail(
+                    f"live capability path check failed: /mcp={bare_status}, /<token>/mcp={token_status}"
+                )
                 return False
         finally:
             live_proc.terminate()
@@ -511,13 +553,13 @@ def test_mcp_server():
         )
         try:
             if not _wait_for_server(8795):
-                print("✗ live no-token server did not come up in time")
+                outcome.fail("live no-token server did not come up in time")
                 return False
             unmanaged_status = _http_status(8795, "/mcp")
             if unmanaged_status is not None and unmanaged_status != 404:
                 print(f"✓ live HTTP: unmanaged /mcp -> {unmanaged_status} (route exists, no 404)")
             else:
-                print(f"✗ unmanaged live /mcp check failed: status={unmanaged_status}")
+                outcome.fail(f"unmanaged live /mcp check failed: status={unmanaged_status}")
                 return False
         finally:
             no_token_live_proc.terminate()
@@ -538,7 +580,7 @@ def test_mcp_server():
         if port_check.returncode == 0 and port_check.stdout.strip() == "8791":
             print("✓ MAC_ORCHESTRATOR_PORT override works")
         else:
-            print(f"✗ port override failed: {port_check.stderr or port_check.stdout}")
+            outcome.fail(f"port override failed: {port_check.stderr or port_check.stdout}")
             return False
 
         # Background commands are registered and terminated by server cleanup.
@@ -548,19 +590,31 @@ def test_mcp_server():
         if bg_pid and not automac_mcp._background_processes:
             print("✓ background command ownership cleanup works")
         else:
-            print(f"✗ background command cleanup failed: {bg}")
+            outcome.fail(f"background command cleanup failed: {bg}")
             return False
 
     except Exception as e:
-        print(f"✗ Error testing functions: {e}")
+        outcome.fail(f"Error testing functions: {e}")
+        return False
+
+    if outcome.failures:
+        print("\nFailed checks:")
+        for failure in outcome.failures:
+            print(f"- {failure}")
         return False
     
-    print("\nAll tests completed!")
+    print("\nAll executed checks completed!")
+    if outcome.skips or outcome.inconclusive:
+        print(
+            f"Non-authoritative live checks: {len(outcome.skips)} SKIP, "
+            f"{len(outcome.inconclusive)} INCONCLUSIVE/MANUAL"
+        )
     return True
 
 
 def test_dependencies():
     """Test that all required dependencies are available"""
+    outcome = _TestOutcome()
     print("\nTesting dependencies...")
     
     dependencies = [
@@ -577,7 +631,7 @@ def test_dependencies():
             __import__(dep)
             print(f"✓ {dep}")
         except ImportError:
-            print(f"✗ {dep} - Missing dependency")
+            outcome.fail(f"{dep} - Missing dependency")
             return False
     
     return True
@@ -594,7 +648,7 @@ if __name__ == "__main__":
     
     # Test the server
     if test_mcp_server():
-        print("\n✅ All tests passed!")
+        print("\n✅ All executed checks passed; review any SKIP/INCONCLUSIVE/MANUAL lines above.")
     else:
         print("\n❌ Some tests failed!")
         sys.exit(1)

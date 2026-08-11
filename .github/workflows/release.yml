@@ -45,6 +45,34 @@ jobs:
           test -z "$tag_ref"
           printf 'release_sha=%s\n' "$RELEASE_SHA" >> "$GITHUB_OUTPUT"
 
+      - name: Validate Phase 2 release contract before publication
+        run: |
+          set -euo pipefail
+          for item in release/manifest.schema.json release/manifest.template.json script/bootstrap.sh script/build_release_artifacts.sh script/test_bootstrap.sh; do
+            test -f "$item" || { echo "Missing Phase 2 release input: $item" >&2; exit 1; }
+          done
+          test -x script/bootstrap.sh
+          test -x script/build_release_artifacts.sh
+          test -x script/test_bootstrap.sh
+          python3 -m json.tool release/manifest.schema.json >/dev/null
+          python3 -m json.tool release/manifest.template.json >/dev/null
+          bash -n script/bootstrap.sh script/build_release_artifacts.sh script/test_bootstrap.sh
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          schema = json.loads(Path("release/manifest.schema.json").read_text())
+          template = json.loads(Path("release/manifest.template.json").read_text())
+          assert schema.get("$schema"), "manifest schema must declare a JSON Schema dialect"
+          assert template.get("schemaVersion") == 1, "manifest template must be schema version 1"
+          for field in ("product", "bootstrap", "platform", "helper", "runtime", "ngrok", "compatibility"):
+              assert field in template, f"manifest template missing {field}"
+          PY
+          if git grep -nE '(raw\.githubusercontent\.com|github\.com/[^[:space:]]+)/(main|master)(/|$)' -- release/manifest.schema.json release/manifest.template.json script/bootstrap.sh script/build_release_artifacts.sh; then
+            echo "Mutable branch URL found in the release contract." >&2
+            exit 1
+          fi
+
   required-ci-at-release-sha:
     name: Required CI at release SHA
     needs: validate-release

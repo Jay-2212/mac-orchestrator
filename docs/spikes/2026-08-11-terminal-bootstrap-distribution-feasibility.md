@@ -361,7 +361,7 @@ Observed:
 - Current [free-plan limits](https://ngrok.com/docs/pricing-limits/free-plan-limits)
   say a free account has one automatically assigned development domain tied to
   the account, up to three online endpoints, and no reserved/custom static
-  domain. ngrok’s [product guidance](https://ngrok.com/blog?page=9) says the
+  domain. ngrok’s [product guidance](https://ngrok.com/blog/free-static-domains-ngrok-users) says the
   assigned free dev domain stays fixed across agent restarts. This was not
   independently exercised with an account in this spike.
 - The current [ngrok Terms of Service](https://ngrok.com/tos) permit agent

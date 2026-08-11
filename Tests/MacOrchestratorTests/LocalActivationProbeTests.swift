@@ -181,7 +181,23 @@ final class LocalActivationProbeTests: XCTestCase {
     }
 
     private static func jsonBody(from request: URLRequest) throws -> [String: Any] {
-        let data = try XCTUnwrap(request.httpBody)
+        let data: Data
+        if let body = request.httpBody {
+            data = body
+        } else {
+            let stream = try XCTUnwrap(request.httpBodyStream)
+            stream.open()
+            defer { stream.close() }
+            var collected = Data()
+            let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: 4_096)
+            defer { buffer.deallocate() }
+            while stream.hasBytesAvailable {
+                let count = stream.read(buffer, maxLength: 4_096)
+                if count <= 0 { break }
+                collected.append(buffer, count: count)
+            }
+            data = collected
+        }
         return try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
     }
 

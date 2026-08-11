@@ -65,19 +65,23 @@ dependencies = [
     { name = "mcp" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.3.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
-    { name = "openpyxl" },
     { name = "pyautogui" },
-    { name = "pyngrok" },
     { name = "pyobjc-framework-applicationservices" },
     { name = "pyobjc-framework-cocoa" },
     { name = "pyobjc-framework-quartz" },
+    { name = "requests" },
+    { name = "rich" },
+    { name = "uvicorn" },
+]
+
+[package.optional-dependencies]
+indexer = [
+    { name = "openpyxl" },
+    { name = "pyngrok" },
     { name = "pypdf" },
     { name = "python-docx" },
     { name = "python-pptx" },
-    { name = "requests" },
-    { name = "rich" },
     { name = "sentence-transformers" },
-    { name = "uvicorn" },
 ]
 
 [package.metadata]
@@ -86,20 +90,21 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.115.0" },
     { name = "mcp", specifier = ">=1.27.0" },
     { name = "numpy", specifier = ">=1.21.0" },
-    { name = "openpyxl", specifier = ">=3.1.5" },
+    { name = "openpyxl", marker = "extra == 'indexer'", specifier = ">=3.1.5" },
     { name = "pyautogui", specifier = ">=0.9.54" },
-    { name = "pyngrok", specifier = ">=7.0.0" },
+    { name = "pyngrok", marker = "extra == 'indexer'", specifier = ">=7.0.0" },
     { name = "pyobjc-framework-applicationservices", specifier = ">=11.1" },
     { name = "pyobjc-framework-cocoa", specifier = ">=11.1" },
     { name = "pyobjc-framework-quartz", specifier = ">=11.1" },
-    { name = "pypdf", specifier = ">=6.11.0" },
-    { name = "python-docx", specifier = ">=1.2.0" },
-    { name = "python-pptx", specifier = ">=1.0.2" },
+    { name = "pypdf", marker = "extra == 'indexer'", specifier = ">=6.11.0" },
+    { name = "python-docx", marker = "extra == 'indexer'", specifier = ">=1.2.0" },
+    { name = "python-pptx", marker = "extra == 'indexer'", specifier = ">=1.0.2" },
     { name = "requests", specifier = ">=2.33.1" },
     { name = "rich", specifier = ">=13.0.0" },
-    { name = "sentence-transformers", specifier = ">=3.0.0" },
+    { name = "sentence-transformers", marker = "extra == 'indexer'", specifier = ">=3.0.0" },
     { name = "uvicorn", specifier = ">=0.30.0" },
 ]
+provides-extras = ["indexer"]
 
 [[package]]
 name = "certifi"

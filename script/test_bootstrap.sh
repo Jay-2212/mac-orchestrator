@@ -170,9 +170,22 @@ make_case() {
 capture_bootstrap() {
   case_dir="$1"
   shift
+  capture_bootstrap_pinned "$case_dir" "$(sha256 "$BOOTSTRAP")" "$(sha256 "$case_dir/manifest.json")" "0.3.0-fixture" "$BOOTSTRAP" "$@"
+}
+
+capture_bootstrap_pinned() {
+  case_dir="$1"
+  bootstrap_digest="$2"
+  manifest_digest="$3"
+  release_version="$4"
+  bootstrap_path="$5"
+  shift 5
   BOOTSTRAP_OUTPUT="$(
     /usr/bin/env \
       MAC_ORCHESTRATOR_MANIFEST_PATH="$case_dir/manifest.json" \
+      MAC_ORCHESTRATOR_BOOTSTRAP_SHA256="$bootstrap_digest" \
+      MAC_ORCHESTRATOR_MANIFEST_SHA256="$manifest_digest" \
+      MAC_ORCHESTRATOR_RELEASE_VERSION="$release_version" \
       MAC_ORCHESTRATOR_SUPPORT_DIR="$case_dir/support" \
       MAC_ORCHESTRATOR_FIXTURE_MODE=1 \
       MAC_ORCHESTRATOR_FIXTURE_LOCK_PATH="$case_dir/assets/uv.lock" \
@@ -180,7 +193,7 @@ capture_bootstrap() {
       MAC_ORCHESTRATOR_SW_VERS_BIN="$case_dir/bin/sw_vers" \
       PLUTIL_BIN="$TEST_PLUTIL_BIN" \
       PATH="$ORIGINAL_PATH" \
-      bash "$BOOTSTRAP" "$@" 2>&1
+      bash "$bootstrap_path" "$@" 2>&1
   )"
   BOOTSTRAP_RC=$?
 }
@@ -189,9 +202,23 @@ capture_bootstrap_with_env() {
   case_dir="$1"
   env_name="$2"
   shift 2
+  capture_bootstrap_with_env_pinned "$case_dir" "$env_name" "$(sha256 "$BOOTSTRAP")" "$(sha256 "$case_dir/manifest.json")" "0.3.0-fixture" "$BOOTSTRAP" "$@"
+}
+
+capture_bootstrap_with_env_pinned() {
+  case_dir="$1"
+  env_name="$2"
+  bootstrap_digest="$3"
+  manifest_digest="$4"
+  release_version="$5"
+  bootstrap_path="$6"
+  shift 6
   BOOTSTRAP_OUTPUT="$(
     /usr/bin/env \
       MAC_ORCHESTRATOR_MANIFEST_PATH="$case_dir/manifest.json" \
+      MAC_ORCHESTRATOR_BOOTSTRAP_SHA256="$bootstrap_digest" \
+      MAC_ORCHESTRATOR_MANIFEST_SHA256="$manifest_digest" \
+      MAC_ORCHESTRATOR_RELEASE_VERSION="$release_version" \
       MAC_ORCHESTRATOR_SUPPORT_DIR="$case_dir/support" \
       MAC_ORCHESTRATOR_FIXTURE_MODE=1 \
       MAC_ORCHESTRATOR_FIXTURE_LOCK_PATH="$case_dir/assets/uv.lock" \
@@ -200,7 +227,7 @@ capture_bootstrap_with_env() {
       PLUTIL_BIN="$TEST_PLUTIL_BIN" \
       "$env_name"=1 \
       PATH="$ORIGINAL_PATH" \
-      bash "$BOOTSTRAP" "$@" 2>&1
+      bash "$bootstrap_path" "$@" 2>&1
   )"
   BOOTSTRAP_RC=$?
 }
@@ -209,11 +236,11 @@ test_valid_manifest_acceptance() {
   make_case valid || return 1
   capture_bootstrap "$CASE_DIR"
   [ "$BOOTSTRAP_RC" -eq 0 ] || { echo "$BOOTSTRAP_OUTPUT" >&2; return 1; }
-  assert_contains "$BOOTSTRAP_OUTPUT" "manifest-validated" || return 1
-  assert_contains "$BOOTSTRAP_OUTPUT" "platform-validated" || return 1
-  assert_contains "$BOOTSTRAP_OUTPUT" "digests-verified" || return 1
-  assert_contains "$BOOTSTRAP_OUTPUT" "promoted" || return 1
-  assert_contains "$BOOTSTRAP_OUTPUT" "complete" || return 1
+  assert_contains "$BOOTSTRAP_OUTPUT" "Verified release metadata." || return 1
+  assert_contains "$BOOTSTRAP_OUTPUT" "This Mac meets the release requirements." || return 1
+  assert_contains "$BOOTSTRAP_OUTPUT" "Verified release payloads." || return 1
+  assert_contains "$BOOTSTRAP_OUTPUT" "Installed Mac Orchestrator." || return 1
+  assert_contains "$BOOTSTRAP_OUTPUT" "Mac Orchestrator is ready." || return 1
   assert_not_contains "$BOOTSTRAP_OUTPUT" "$CASE_DIR" || return 1
 }
 
@@ -225,12 +252,48 @@ test_missing_digest_rejected() {
   assert_contains "$BOOTSTRAP_OUTPUT" "helper digest" || return 1
 }
 
+test_sentinel_digest_rejected() {
+  make_case sentinel-digest || return 1
+  replace_string helper.sha256 "0000000000000000000000000000000000000000000000000000000000000000" "$MANIFEST" || return 1
+  capture_bootstrap "$CASE_DIR"
+  [ "$BOOTSTRAP_RC" -ne 0 ] || return 1
+  assert_contains "$BOOTSTRAP_OUTPUT" "must not be all zeroes" || return 1
+}
+
 test_wrong_digest_rejected() {
   make_case wrong-digest || return 1
   replace_string helper.sha256 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "$MANIFEST" || return 1
   capture_bootstrap "$CASE_DIR"
   [ "$BOOTSTRAP_RC" -ne 0 ] || return 1
   assert_contains "$BOOTSTRAP_OUTPUT" "digest mismatch" || return 1
+}
+
+test_manifest_digest_rejected_before_manifest_use() {
+  make_case manifest-digest || return 1
+  expected_manifest_digest="$(sha256 "$MANIFEST")"
+  replace_string product.version "0.3.1-fixture" "$MANIFEST" || return 1
+  capture_bootstrap_pinned "$CASE_DIR" "$(sha256 "$BOOTSTRAP")" "$expected_manifest_digest" "0.3.0-fixture" "$BOOTSTRAP"
+  [ "$BOOTSTRAP_RC" -ne 0 ] || return 1
+  assert_contains "$BOOTSTRAP_OUTPUT" "manifest digest" || return 1
+}
+
+test_bootstrap_digest_rejected_before_execution() {
+  make_case bootstrap-digest || return 1
+  modified_bootstrap="$CASE_DIR/bin/bootstrap-modified"
+  /bin/cp "$BOOTSTRAP" "$modified_bootstrap" || return 1
+  printf '\n' >> "$modified_bootstrap"
+  replace_string bootstrap.sha256 "$(sha256 "$modified_bootstrap")" "$MANIFEST" || return 1
+  capture_bootstrap_pinned "$CASE_DIR" "$(sha256 "$BOOTSTRAP")" "$(sha256 "$MANIFEST")" "0.3.0-fixture" "$modified_bootstrap"
+  [ "$BOOTSTRAP_RC" -ne 0 ] || return 1
+  assert_contains "$BOOTSTRAP_OUTPUT" "bootstrap digest" || return 1
+}
+
+test_modified_core_payload_rejected() {
+  make_case core-digest || return 1
+  printf '%s\n' 'modified-core-payload' >> "$CASE_DIR/assets/core.tar.gz"
+  capture_bootstrap "$CASE_DIR"
+  [ "$BOOTSTRAP_RC" -ne 0 ] || return 1
+  assert_contains "$BOOTSTRAP_OUTPUT" "core payload digest mismatch" || return 1
 }
 
 test_ngrok_zip_format_required() {
@@ -320,6 +383,20 @@ test_interrupted_promotion_recovers_previous_runtime() {
   fi
 }
 
+test_post_promotion_failure_recovers_previous_installation() {
+  make_case post-promotion || return 1
+  /bin/mkdir -p "$CASE_DIR/support/runtime" "$CASE_DIR/support/app" "$CASE_DIR/support/remote/ngrok" "$CASE_DIR/support/install"
+  printf '%s\n' 'previous-runtime' > "$CASE_DIR/support/runtime/.release-marker"
+  printf '%s\n' 'previous-helper' > "$CASE_DIR/support/app/helper-artifact"
+  printf '%s\n' 'previous-ngrok' > "$CASE_DIR/support/remote/ngrok/ngrok"
+  capture_bootstrap_with_env "$CASE_DIR" MAC_ORCHESTRATOR_TEST_FAIL_AFTER_POST_PROMOTION
+  [ "$BOOTSTRAP_RC" -ne 0 ] || return 1
+  assert_content "$CASE_DIR/support/runtime/.release-marker" "previous-runtime" || return 1
+  assert_content "$CASE_DIR/support/app/helper-artifact" "previous-helper" || return 1
+  assert_content "$CASE_DIR/support/remote/ngrok/ngrok" "previous-ngrok" || return 1
+  [ ! -e "$CASE_DIR/support/install/promotion.marker" ] || return 1
+}
+
 test_next_run_recovers_promotion_marker() {
   make_case next-run-recovery || return 1
   /bin/mkdir -p "$CASE_DIR/support/runtime" "$CASE_DIR/support/install/runtime.previous" "$CASE_DIR/support/install/app.previous" "$CASE_DIR/support/install/remote.previous"
@@ -338,6 +415,91 @@ test_next_run_recovers_promotion_marker() {
   fi
 }
 
+test_symlinked_support_root_rejected() {
+  make_case symlinked-support || return 1
+  outside="$CASE_DIR/outside"
+  /bin/mkdir -p "$outside"
+  /bin/rm -rf "$CASE_DIR/support"
+  /bin/ln -s "$outside" "$CASE_DIR/support"
+  capture_bootstrap "$CASE_DIR"
+  [ "$BOOTSTRAP_RC" -ne 0 ] || return 1
+  assert_contains "$BOOTSTRAP_OUTPUT" "symlink" || return 1
+  [ ! -e "$outside/runtime" ] || return 1
+}
+
+test_symlinked_support_parent_rejected() {
+  make_case symlinked-support-parent || return 1
+  outside="$CASE_DIR/outside"
+  /bin/mkdir -p "$outside" "$CASE_DIR/support-parent"
+  /bin/rm -rf "$CASE_DIR/support"
+  /bin/ln -s "$outside" "$CASE_DIR/support-parent/link"
+  BOOTSTRAP_OUTPUT="$({
+    /usr/bin/env \
+      MAC_ORCHESTRATOR_MANIFEST_PATH="$CASE_DIR/manifest.json" \
+      MAC_ORCHESTRATOR_BOOTSTRAP_SHA256="$(sha256 "$BOOTSTRAP")" \
+      MAC_ORCHESTRATOR_MANIFEST_SHA256="$(sha256 "$CASE_DIR/manifest.json")" \
+      MAC_ORCHESTRATOR_RELEASE_VERSION="0.3.0-fixture" \
+      MAC_ORCHESTRATOR_SUPPORT_DIR="$CASE_DIR/support-parent/link/child" \
+      MAC_ORCHESTRATOR_FIXTURE_MODE=1 \
+      MAC_ORCHESTRATOR_FIXTURE_LOCK_PATH="$CASE_DIR/assets/uv.lock" \
+      MAC_ORCHESTRATOR_UNAME_BIN="$CASE_DIR/bin/uname" \
+      MAC_ORCHESTRATOR_SW_VERS_BIN="$CASE_DIR/bin/sw_vers" \
+      PLUTIL_BIN="$TEST_PLUTIL_BIN" \
+      PATH="$ORIGINAL_PATH" \
+      bash "$BOOTSTRAP" 2>&1
+  })"
+  BOOTSTRAP_RC=$?
+  [ "$BOOTSTRAP_RC" -ne 0 ] || return 1
+  assert_contains "$BOOTSTRAP_OUTPUT" "symlinked parent" || return 1
+  [ ! -e "$outside/child" ] || return 1
+}
+
+test_malformed_promotion_marker_fails_closed() {
+  make_case malformed-marker || return 1
+  /bin/mkdir -p "$CASE_DIR/support/install" "$CASE_DIR/support/runtime"
+  printf '%s\n' 'phase=unknown' 'had_runtime=1' 'had_app=0' 'had_remote=0' > "$CASE_DIR/support/install/promotion.marker"
+  printf '%s\n' 'previous-runtime' > "$CASE_DIR/support/runtime/.release-marker"
+  capture_bootstrap "$CASE_DIR"
+  [ "$BOOTSTRAP_RC" -ne 0 ] || return 1
+  assert_contains "$BOOTSTRAP_OUTPUT" "recover" || return 1
+  assert_file "$CASE_DIR/support/install/promotion.marker" || return 1
+  assert_content "$CASE_DIR/support/runtime/.release-marker" "previous-runtime" || return 1
+}
+
+test_missing_recovery_backup_fails_closed() {
+  make_case missing-backup || return 1
+  /bin/mkdir -p "$CASE_DIR/support/install" "$CASE_DIR/support/runtime"
+  printf '%s\n' 'phase=promoting' 'had_runtime=1' 'had_app=0' 'had_remote=0' > "$CASE_DIR/support/install/promotion.marker"
+  printf '%s\n' 'interrupted-runtime' > "$CASE_DIR/support/runtime/.release-marker"
+  capture_bootstrap "$CASE_DIR"
+  [ "$BOOTSTRAP_RC" -ne 0 ] || return 1
+  assert_contains "$BOOTSTRAP_OUTPUT" "recover" || return 1
+  assert_file "$CASE_DIR/support/install/promotion.marker" || return 1
+  assert_content "$CASE_DIR/support/runtime/.release-marker" "interrupted-runtime" || return 1
+}
+
+test_backups_marker_with_unmoved_previous_paths_recovers() {
+  make_case backups-marker || return 1
+  /bin/mkdir -p "$CASE_DIR/support/install" "$CASE_DIR/support/runtime"
+  printf '%s\n' 'phase=backups' 'had_runtime=1' 'had_app=0' 'had_remote=0' > "$CASE_DIR/support/install/promotion.marker"
+  printf '%s\n' 'previous-runtime' > "$CASE_DIR/support/runtime/.release-marker"
+  capture_bootstrap_with_env "$CASE_DIR" MAC_ORCHESTRATOR_TEST_EXIT_AFTER_RECOVERY
+  [ "$BOOTSTRAP_RC" -eq 0 ] || { echo "$BOOTSTRAP_OUTPUT" >&2; return 1; }
+  assert_content "$CASE_DIR/support/runtime/.release-marker" "previous-runtime" || return 1
+  [ ! -e "$CASE_DIR/support/install/promotion.marker" ] || return 1
+}
+
+test_promotion_marker_symlink_rejected() {
+  make_case marker-symlink || return 1
+  /bin/mkdir -p "$CASE_DIR/support/install" "$CASE_DIR/outside"
+  printf '%s\n' 'outside-marker' > "$CASE_DIR/outside/marker"
+  /bin/ln -s "$CASE_DIR/outside/marker" "$CASE_DIR/support/install/promotion.marker"
+  capture_bootstrap "$CASE_DIR"
+  [ "$BOOTSTRAP_RC" -ne 0 ] || return 1
+  assert_contains "$BOOTSTRAP_OUTPUT" "recover" || return 1
+  assert_content "$CASE_DIR/outside/marker" "outside-marker" || return 1
+}
+
 test_artifact_builder_requires_release_inputs() {
   output="$(bash "$PROJECT_DIR/script/build_release_artifacts.sh" --output-dir "$TEST_ROOT/builder-output" 2>&1)"
   rc=$?
@@ -348,11 +510,12 @@ test_artifact_builder_requires_release_inputs() {
 test_artifact_builder_rejects_non_vendor_ngrok_url() {
   digest="$(sha256 "$BOOTSTRAP")"
   output="$(bash "$PROJECT_DIR/script/build_release_artifacts.sh" \
-    --product-version "0.3.0-fixture" \
+    --product-version "0.3.0" \
     --bootstrap-version "1.0.0-fixture" \
     --bootstrap "$BOOTSTRAP" \
     --bootstrap-url "https://github.com/Jay-2212/mac-orchestrator/releases/download/v0.3.0/bootstrap.sh" \
     --bootstrap-sha256 "$digest" \
+    --manifest-url "https://github.com/Jay-2212/mac-orchestrator/releases/download/v0.3.0/manifest.json" \
     --helper-archive "$BOOTSTRAP" \
     --helper-url "https://github.com/Jay-2212/mac-orchestrator/releases/download/v0.3.0/Mac-Orchestrator-arm64.zip" \
     --helper-sha256 "$digest" \
@@ -376,6 +539,151 @@ test_artifact_builder_rejects_non_vendor_ngrok_url() {
   assert_contains "$output" "bin.equinox.io" || return 1
 }
 
+test_artifact_builder_rejects_linked_helper_archive() {
+  malicious_archive="$TEST_ROOT/malicious-helper.zip"
+  python3 - "$malicious_archive" <<'PY'
+import stat
+import sys
+import zipfile
+
+with zipfile.ZipFile(sys.argv[1], "w") as archive:
+    info = zipfile.ZipInfo("link")
+    info.create_system = 3
+    info.external_attr = (stat.S_IFLNK | 0o777) << 16
+    archive.writestr(info, "/outside")
+PY
+  digest="$(sha256 "$BOOTSTRAP")"
+  output="$(bash "$PROJECT_DIR/script/build_release_artifacts.sh" \
+    --product-version "0.3.0" \
+    --bootstrap-version "1.0.0-fixture" \
+    --bootstrap "$BOOTSTRAP" \
+    --bootstrap-url "https://github.com/Jay-2212/mac-orchestrator/releases/download/v0.3.0/bootstrap.sh" \
+    --bootstrap-sha256 "$digest" \
+    --manifest-url "https://github.com/Jay-2212/mac-orchestrator/releases/download/v0.3.0/manifest.json" \
+    --helper-archive "$malicious_archive" \
+    --helper-url "https://github.com/Jay-2212/mac-orchestrator/releases/download/v0.3.0/Mac-Orchestrator-arm64.zip" \
+    --helper-sha256 "$(sha256 "$malicious_archive")" \
+    --uv "$BOOTSTRAP" \
+    --uv-url "https://github.com/Jay-2212/mac-orchestrator/releases/download/v0.3.0/uv-arm64" \
+    --uv-sha256 "$digest" \
+    --core-payload "$BOOTSTRAP" \
+    --core-url "https://github.com/Jay-2212/mac-orchestrator/releases/download/v0.3.0/core-payload.tar.gz" \
+    --core-sha256 "$digest" \
+    --lock "$BOOTSTRAP" \
+    --lock-sha256 "$digest" \
+    --ngrok-archive "$BOOTSTRAP" \
+    --ngrok-version "3.39.10" \
+    --ngrok-url "https://bin.equinox.io/a/b/ngrok.zip" \
+    --ngrok-sha256 "$digest" \
+    --ngrok-authority "Developer ID Application: ngrok, Inc. (TEAMFIX123)" \
+    --ngrok-team "TEAMFIX123" \
+    --output-dir "$TEST_ROOT/builder-linked-helper" 2>&1)"
+  rc=$?
+  [ "$rc" -ne 0 ] || return 1
+  assert_contains "$output" "non-regular" || return 1
+}
+
+make_minimal_signed_helper_archive() {
+  helper_root="$TEST_ROOT/minimal-helper"
+  helper_app="$helper_root/Mac Orchestrator.app"
+  helper_archive="$TEST_ROOT/minimal-helper.zip"
+  /bin/mkdir -p "$helper_app/Contents/MacOS" || return 1
+  /bin/cp /usr/bin/true "$helper_app/Contents/MacOS/MacOrchestrator" || return 1
+  printf '%s\n' '{"CFBundleIdentifier":"com.jay.mac-orchestrator","CFBundleShortVersionString":"0.3.0","CFBundleExecutable":"MacOrchestrator"}' \
+    > "$helper_app/Contents/Info.plist" || return 1
+  /usr/bin/plutil -convert xml1 "$helper_app/Contents/Info.plist" || return 1
+  /usr/bin/codesign --force --deep --sign - "$helper_app" >/dev/null 2>&1 || return 1
+  /usr/bin/ditto -c -k --sequesterRsrc --keepParent "$helper_app" "$helper_archive" >/dev/null 2>&1 || return 1
+}
+
+run_builder_with_core_archive() {
+  core_archive="$1"
+  output_dir="$2"
+  helper_archive="$3"
+  digest="$(sha256 "$BOOTSTRAP")" || return 1
+  BUILDER_OUTPUT="$(bash "$PROJECT_DIR/script/build_release_artifacts.sh" \
+    --product-version "0.3.0" \
+    --bootstrap-version "1.0.0-fixture" \
+    --bootstrap "$BOOTSTRAP" \
+    --bootstrap-url "https://github.com/Jay-2212/mac-orchestrator/releases/download/v0.3.0/bootstrap.sh" \
+    --bootstrap-sha256 "$digest" \
+    --manifest-url "https://github.com/Jay-2212/mac-orchestrator/releases/download/v0.3.0/manifest.json" \
+    --helper-archive "$helper_archive" \
+    --helper-url "https://github.com/Jay-2212/mac-orchestrator/releases/download/v0.3.0/Mac-Orchestrator-arm64.zip" \
+    --helper-sha256 "$(sha256 "$helper_archive")" \
+    --uv "$BOOTSTRAP" \
+    --uv-url "https://github.com/Jay-2212/mac-orchestrator/releases/download/v0.3.0/uv-arm64" \
+    --uv-sha256 "$digest" \
+    --core-payload "$core_archive" \
+    --core-url "https://github.com/Jay-2212/mac-orchestrator/releases/download/v0.3.0/core-payload.tar.gz" \
+    --core-sha256 "$(sha256 "$core_archive")" \
+    --lock "$BOOTSTRAP" \
+    --lock-sha256 "$digest" \
+    --ngrok-archive "$BOOTSTRAP" \
+    --ngrok-version "3.39.10" \
+    --ngrok-url "https://bin.equinox.io/a/b/ngrok.zip" \
+    --ngrok-sha256 "$digest" \
+    --ngrok-authority "Developer ID Application: ngrok, Inc. (TEAMFIX123)" \
+    --ngrok-team "TEAMFIX123" \
+    --output-dir "$output_dir" 2>&1)"
+  BUILDER_RC=$?
+}
+
+test_artifact_builder_rejects_core_boundary_extra() {
+  [ "$(uname -s)" = "Darwin" ] || return 0
+  make_minimal_signed_helper_archive || return 1
+  core_source="$TEST_ROOT/core-extra-source"
+  core_archive="$TEST_ROOT/core-extra.tar.gz"
+  /bin/mkdir -p "$core_source" || return 1
+  printf '%s\n' 'core' > "$core_source/automac_mcp.py"
+  printf '%s\n' 'core' > "$core_source/pyproject.toml"
+  printf '%s\n' 'lock' > "$core_source/uv.lock"
+  printf '%s\n' 'unexpected' > "$core_source/extra.txt"
+  /usr/bin/tar -czf "$core_archive" -C "$core_source" automac_mcp.py pyproject.toml uv.lock extra.txt || return 1
+  run_builder_with_core_archive "$core_archive" "$TEST_ROOT/builder-core-extra" "$TEST_ROOT/minimal-helper.zip" || return 1
+  [ "$BUILDER_RC" -ne 0 ] || return 1
+  assert_contains "$BUILDER_OUTPUT" "core payload contains files outside the declared core boundary" || return 1
+}
+
+test_artifact_builder_rejects_core_special_entry() {
+  [ "$(uname -s)" = "Darwin" ] || return 0
+  make_minimal_signed_helper_archive || return 1
+  core_source="$TEST_ROOT/core-special-source"
+  core_archive="$TEST_ROOT/core-special.tar.gz"
+  /bin/mkdir -p "$core_source" || return 1
+  printf '%s\n' 'core' > "$core_source/automac_mcp.py"
+  printf '%s\n' 'core' > "$core_source/pyproject.toml"
+  printf '%s\n' 'lock' > "$core_source/uv.lock"
+  /usr/bin/mkfifo "$core_source/unsafe-fifo" || return 1
+  /usr/bin/tar -czf "$core_archive" -C "$core_source" automac_mcp.py pyproject.toml uv.lock unsafe-fifo 2>/dev/null || return 1
+  run_builder_with_core_archive "$core_archive" "$TEST_ROOT/builder-core-special" "$TEST_ROOT/minimal-helper.zip" || return 1
+  [ "$BUILDER_RC" -ne 0 ] || return 1
+  assert_contains "$BUILDER_OUTPUT" "archive contains a non-regular entry" || return 1
+}
+
+test_generated_install_command_contains_all_trust_anchors() {
+  command_output="$TEST_ROOT/install-command.txt"
+  output="$(bash "$PROJECT_DIR/script/generate_install_command.sh" \
+    --product-version "0.3.0" \
+    --bootstrap-url "https://github.com/Jay-2212/mac-orchestrator/releases/download/v0.3.0/bootstrap.sh" \
+    --bootstrap-sha256 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" \
+    --manifest-url "https://github.com/Jay-2212/mac-orchestrator/releases/download/v0.3.0/manifest.json" \
+    --manifest-sha256 "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" \
+    --output "$command_output" 2>&1)"
+  rc=$?
+  [ "$rc" -eq 0 ] || { echo "$output" >&2; return 1; }
+  assert_file "$command_output" || return 1
+  command_text="$(/bin/cat "$command_output")" || return 1
+  assert_contains "$command_text" "v0.3.0" || return 1
+  assert_contains "$command_text" "releases/download/v0.3.0/bootstrap.sh" || return 1
+  assert_contains "$command_text" "releases/download/v0.3.0/manifest.json" || return 1
+  assert_contains "$command_text" "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" || return 1
+  assert_contains "$command_text" "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" || return 1
+  assert_contains "$command_text" "manifest-sha256" || return 1
+  assert_not_contains "$command_text" "REPLACE_WITH" || return 1
+  assert_not_contains "$command_text" "refs/heads/main" || return 1
+}
+
 test_package_app_helper_contract() {
   package_contents="$(/bin/cat "$PROJECT_DIR/script/package_app.sh")" || return 1
   assert_contains "$package_contents" "arm64" || return 1
@@ -384,6 +692,21 @@ test_package_app_helper_contract() {
   assert_not_contains "$package_contents" "NGROK_SOURCE" || return 1
   assert_not_contains "$package_contents" "Resources_DIR/ngrok" || return 1
   assert_not_contains "$package_contents" 'codesign --force --sign "$CODESIGN_IDENTITY"' || return 1
+}
+
+test_release_output_does_not_redistribute_ngrok() {
+  builder_contents="$(/bin/cat "$PROJECT_DIR/script/build_release_artifacts.sh")" || return 1
+  release_contents="$(/bin/cat "$PROJECT_DIR/.github/workflows/release.yml")" || return 1
+  assert_not_contains "$builder_contents" 'OUTPUT_DIR/ngrok-arm64.zip' || return 1
+  assert_not_contains "$release_contents" 'release-assets/ngrok-arm64.zip' || return 1
+  assert_contains "$release_contents" 'bin.equinox.io' || return 1
+}
+
+test_bootstrap_completion_is_activation_gated() {
+  bootstrap_contents="$(/bin/cat "$PROJECT_DIR/script/bootstrap.sh")" || return 1
+  assert_contains "$bootstrap_contents" "--wait-for-local-activation" || return 1
+  assert_contains "$bootstrap_contents" "local-activation-confirmed" || return 1
+  assert_contains "$bootstrap_contents" "remote-activation-confirmed" || return 1
 }
 
 run_test() {
@@ -411,7 +734,11 @@ select_test_plutil || exit 1
 
 run_test "valid manifest acceptance" test_valid_manifest_acceptance
 run_test "missing digest rejection" test_missing_digest_rejected
+run_test "sentinel digest rejection" test_sentinel_digest_rejected
 run_test "wrong digest rejection" test_wrong_digest_rejected
+run_test "manifest digest rejection before use" test_manifest_digest_rejected_before_manifest_use
+run_test "bootstrap digest rejection before execution" test_bootstrap_digest_rejected_before_execution
+run_test "modified core payload rejection" test_modified_core_payload_rejected
 run_test "ngrok zip format requirement" test_ngrok_zip_format_required
 run_test "mutable release URL rejection" test_mutable_release_url_rejected
 run_test "non-vendor ngrok URL rejection" test_non_vendor_ngrok_url_rejected
@@ -420,10 +747,23 @@ run_test "minimum macOS rejection" test_old_macos_rejected
 run_test "repeat promotion is idempotent" test_repeat_promotion_is_idempotent
 run_test "failed download preserves previous state" test_failed_download_preserves_previous_state
 run_test "interrupted promotion recovers previous runtime" test_interrupted_promotion_recovers_previous_runtime
+run_test "post-promotion failure recovers previous installation" test_post_promotion_failure_recovers_previous_installation
 run_test "next run recovers promotion marker" test_next_run_recovers_promotion_marker
+run_test "symlinked support root is rejected" test_symlinked_support_root_rejected
+run_test "symlinked support parent is rejected" test_symlinked_support_parent_rejected
+run_test "malformed promotion marker fails closed" test_malformed_promotion_marker_fails_closed
+run_test "missing recovery backup fails closed" test_missing_recovery_backup_fails_closed
+run_test "unmoved backups marker recovers" test_backups_marker_with_unmoved_previous_paths_recovers
+run_test "promotion marker symlink is rejected" test_promotion_marker_symlink_rejected
 run_test "artifact builder requires release inputs" test_artifact_builder_requires_release_inputs
 run_test "artifact builder rejects non-vendor ngrok URL" test_artifact_builder_rejects_non_vendor_ngrok_url
+run_test "artifact builder rejects linked helper archive" test_artifact_builder_rejects_linked_helper_archive
+run_test "artifact builder rejects undeclared core file" test_artifact_builder_rejects_core_boundary_extra
+run_test "artifact builder rejects core special entry" test_artifact_builder_rejects_core_special_entry
+run_test "generated install command contains trust anchors" test_generated_install_command_contains_all_trust_anchors
 run_test "package helper contract" test_package_app_helper_contract
+run_test "release output does not redistribute ngrok" test_release_output_does_not_redistribute_ngrok
+run_test "bootstrap completion waits for activation" test_bootstrap_completion_is_activation_gated
 
 if [ "$FAILURES" -ne 0 ]; then
   echo "$FAILURES bootstrap fixture test(s) failed" >&2

@@ -85,6 +85,85 @@ final class CapabilityReadinessCoordinatorTests: XCTestCase {
     }
 
     @MainActor
+    func testManagedPythonPermissionTruthOverridesSwiftPreflight() async throws {
+        let runtime = try makeRuntime()
+        let coordinator = CapabilityReadinessCoordinator(
+            session: makeTelegramSession(),
+            fileManager: .default,
+            permissionChecker: FakeCapabilityPermissionChecker(
+                accessibility: true,
+                screenRecording: true
+            ),
+            managedPermissionChecker: FakeManagedPermissionChecker(
+                result: ManagedPermissionProbeFacts(accessibility: false, screenRecording: false)
+            )
+        )
+
+        let facts = await coordinator.evaluate(
+            configuration: AppConfiguration.fresh(ownerID: "owner"),
+            keychain: KeychainStore(client: ReadinessKeychainClient()),
+            runtimeDirectory: runtime
+        )
+
+        XCTAssertFalse(facts.localUIReady)
+        XCTAssertFalse(facts.screenOcrReady)
+    }
+
+    @MainActor
+    func testManagedPythonPermissionProbeFailureFailsClosed() async throws {
+        let runtime = try makeRuntime()
+        let coordinator = CapabilityReadinessCoordinator(
+            session: makeTelegramSession(),
+            fileManager: .default,
+            permissionChecker: FakeCapabilityPermissionChecker(
+                accessibility: true,
+                screenRecording: true
+            ),
+            managedPermissionChecker: FakeManagedPermissionChecker(result: nil)
+        )
+
+        let facts = await coordinator.evaluate(
+            configuration: AppConfiguration.fresh(ownerID: "owner"),
+            keychain: KeychainStore(client: ReadinessKeychainClient()),
+            runtimeDirectory: runtime
+        )
+
+        XCTAssertFalse(facts.localUIReady)
+        XCTAssertFalse(facts.screenOcrReady)
+    }
+
+    @MainActor
+    func testManagedSessionTruthGatesUIReadiness() async throws {
+        let runtime = try makeRuntime()
+        let coordinator = CapabilityReadinessCoordinator(
+            session: makeTelegramSession(),
+            fileManager: .default,
+            permissionChecker: FakeCapabilityPermissionChecker(
+                accessibility: true,
+                screenRecording: true
+            ),
+            managedPermissionChecker: FakeManagedPermissionChecker(
+                result: ManagedPermissionProbeFacts(
+                    accessibility: true,
+                    screenRecording: true,
+                    automation: false,
+                    activeConsole: false,
+                    unlocked: false
+                )
+            )
+        )
+
+        let facts = await coordinator.evaluate(
+            configuration: AppConfiguration.fresh(ownerID: "owner"),
+            keychain: KeychainStore(client: ReadinessKeychainClient()),
+            runtimeDirectory: runtime
+        )
+
+        XCTAssertFalse(facts.localUIReady)
+        XCTAssertFalse(facts.screenOcrReady)
+    }
+
+    @MainActor
     func testTelegramReadinessValidatesIdentityAndChatWithoutSending() async throws {
         TelegramReadinessURLProtocol.reset(mode: .success)
         let session = makeTelegramSession()
@@ -297,6 +376,14 @@ private struct FakeCapabilityPermissionChecker: CapabilityPermissionChecking {
 
     func accessibilityIsGranted() -> Bool { accessibility }
     func screenRecordingIsGranted() -> Bool { screenRecording }
+}
+
+private struct FakeManagedPermissionChecker: ManagedPermissionChecking {
+    let result: ManagedPermissionProbeFacts?
+
+    func probe(runtimeDirectory: URL) -> ManagedPermissionProbeFacts? {
+        result
+    }
 }
 
 private final class ReadinessKeychainClient: KeychainClient {

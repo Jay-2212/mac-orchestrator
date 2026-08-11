@@ -1,5 +1,17 @@
 import Foundation
 
+private final class NoRedirectURLSessionDelegate: NSObject, URLSessionTaskDelegate {
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        completionHandler(nil)
+    }
+}
+
 enum LocalActivationProbeError: Error, Equatable, LocalizedError, Sendable {
     case healthCheckFailed(status: Int, body: String)
     case transport(String)
@@ -7,6 +19,7 @@ enum LocalActivationProbeError: Error, Equatable, LocalizedError, Sendable {
     case mcpResponseInvalid(method: String)
     case mcpError(method: String, message: String)
     case missingSessionID
+    case invalidCapabilityToken
 
     var errorDescription: String? {
         switch self {
@@ -23,6 +36,8 @@ enum LocalActivationProbeError: Error, Equatable, LocalizedError, Sendable {
             return "Local MCP \(method) returned an error."
         case .missingSessionID:
             return "Local MCP initialize response did not include a session identifier."
+        case .invalidCapabilityToken:
+            return "The local connector identity is invalid."
         }
     }
 }
@@ -33,11 +48,24 @@ struct LocalActivationProbe: Sendable {
 
     private let session: URLSession
 
-    init(session: URLSession = .shared) {
+    init(session: URLSession = Self.makeDefaultSession()) {
         self.session = session
     }
 
-    func run(port: Int, capabilityToken: String) async throws {
+    private static func makeDefaultSession() -> URLSession {
+        let configuration = URLSessionConfiguration.ephemeral
+        return URLSession(
+            configuration: configuration,
+            delegate: NoRedirectURLSessionDelegate(),
+            delegateQueue: nil
+        )
+    }
+
+    func run(
+        port: Int,
+        capabilityToken: String,
+        requiresInteractiveUI: Bool = false
+    ) async throws {
         let healthURL = URL(string: "http://127.0.0.1:\(port)/__mac_orchestrator_health")!
         var healthRequest = URLRequest(url: healthURL)
         healthRequest.httpMethod = "GET"
@@ -49,7 +77,11 @@ struct LocalActivationProbe: Sendable {
         } catch {
             throw LocalActivationProbeError.transport("network failure")
         }
-        let status = (healthResponse.1 as? HTTPURLResponse)?.statusCode ?? -1
+        guard let healthHTTPResponse = healthResponse.1 as? HTTPURLResponse,
+              healthHTTPResponse.url == healthURL else {
+            throw LocalActivationProbeError.transport("unexpected redirect")
+        }
+        let status = healthHTTPResponse.statusCode
         guard status == 200, healthResponse.0 == Self.expectedHealthBody else {
             throw LocalActivationProbeError.healthCheckFailed(
                 status: status,
@@ -57,7 +89,9 @@ struct LocalActivationProbe: Sendable {
             )
         }
 
-        let mcpURL = URL(string: "http://127.0.0.1:\(port)/\(capabilityToken)/mcp")!
+        guard let mcpURL = URL(string: "http://127.0.0.1:\(port)/\(capabilityToken)/mcp") else {
+            throw LocalActivationProbeError.invalidCapabilityToken
+        }
         let initialize = try await request(
             url: mcpURL,
             method: "initialize",
@@ -80,6 +114,7 @@ struct LocalActivationProbe: Sendable {
         }
         let sessionID = try sessionID(from: initialize.headers)
         try validateResult(initialize.body, method: "initialize", expectedID: 1)
+        try validateInitialize(initialize.body)
 
         let initialized = try await request(
             url: mcpURL,
@@ -126,7 +161,11 @@ struct LocalActivationProbe: Sendable {
                 status: safeCall.status
             )
         }
-        try validateResult(safeCall.body, method: "tools/call", expectedID: 3)
+        try validateSuccessfulToolCall(
+            safeCall.body,
+            expectedID: 3,
+            requiresInteractiveUI: requiresInteractiveUI
+        )
     }
 
     private func request(
@@ -159,6 +198,9 @@ struct LocalActivationProbe: Sendable {
             let (data, response) = try await session.data(for: request)
             guard let httpResponse = response as? HTTPURLResponse else {
                 throw LocalActivationProbeError.transport("MCP returned a non-HTTP response")
+            }
+            guard httpResponse.url == url else {
+                throw LocalActivationProbeError.transport("unexpected redirect")
             }
             var headers: [String: String] = [:]
             for (key, value) in httpResponse.allHeaderFields {
@@ -201,6 +243,78 @@ struct LocalActivationProbe: Sendable {
         }
         guard object["result"] != nil else {
             throw LocalActivationProbeError.mcpResponseInvalid(method: method)
+        }
+    }
+
+    private func validateInitialize(_ data: Data) throws {
+        guard let object = Self.jsonObject(from: data),
+              let result = object["result"] as? [String: Any],
+              result["protocolVersion"] as? String == Self.protocolVersion else {
+            throw LocalActivationProbeError.mcpResponseInvalid(method: "initialize")
+        }
+    }
+
+    private func validateSuccessfulToolCall(
+        _ data: Data,
+        expectedID: Int,
+        requiresInteractiveUI: Bool
+    ) throws {
+        guard let object = Self.jsonObject(from: data) else {
+            throw LocalActivationProbeError.mcpResponseInvalid(method: "tools/call")
+        }
+        guard object["jsonrpc"] as? String == "2.0",
+              let responseID = object["id"] as? NSNumber,
+              responseID.intValue == expectedID else {
+            throw LocalActivationProbeError.mcpResponseInvalid(method: "tools/call")
+        }
+        if let error = object["error"] as? [String: Any] {
+            let message = error["message"] as? String ?? "unknown MCP error"
+            throw LocalActivationProbeError.mcpError(method: "tools/call", message: message)
+        }
+        guard let result = object["result"] as? [String: Any] else {
+            throw LocalActivationProbeError.mcpResponseInvalid(method: "tools/call")
+        }
+        if result["isError"] as? Bool == true {
+            throw LocalActivationProbeError.mcpError(
+                method: "tools/call",
+                message: "get_session_state returned an application-level error."
+            )
+        }
+
+        if let structured = result["structuredContent"] as? [String: Any] {
+            guard structured["status"] as? String == "success" else {
+                throw LocalActivationProbeError.mcpError(
+                    method: "tools/call",
+                    message: "get_session_state returned an application-level error."
+                )
+            }
+            try validateInteractiveUIReadiness(
+                structured,
+                required: requiresInteractiveUI
+            )
+            return
+        }
+
+        guard let content = result["content"] as? [[String: Any]],
+              let text = content.compactMap({ $0["text"] as? String }).first,
+              let textData = text.data(using: .utf8),
+              let contentObject = try? JSONSerialization.jsonObject(with: textData) as? [String: Any],
+              contentObject["status"] as? String == "success" else {
+            throw LocalActivationProbeError.mcpResponseInvalid(method: "tools/call")
+        }
+        try validateInteractiveUIReadiness(contentObject, required: requiresInteractiveUI)
+    }
+
+    private func validateInteractiveUIReadiness(
+        _ result: [String: Any],
+        required: Bool
+    ) throws {
+        guard required else { return }
+        guard result["gui_interaction_available"] as? Bool == true else {
+            throw LocalActivationProbeError.mcpError(
+                method: "tools/call",
+                message: "the managed UI requester is not ready."
+            )
         }
     }
 

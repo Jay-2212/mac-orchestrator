@@ -3,6 +3,11 @@ import XCTest
 @testable import MacOrchestrator
 
 final class NgrokSupportTests: XCTestCase {
+    func testEndpointResponseValidityDistinguishesMalformedData() {
+        XCTAssertTrue(NgrokEndpointParser.isValidResponse(from: Data(#"{"endpoints":[]}"#.utf8)))
+        XCTAssertFalse(NgrokEndpointParser.isValidResponse(from: Data(#"not-json"#.utf8)))
+    }
+
     func testEndpointParserUsesCurrentEndpointsResponseAndMatchesUpstream() throws {
         let data = Data(
             #"{"endpoints":[{"name":"ep_1","url":"https://demo.ngrok.app","upstream":{"url":"http://127.0.0.1:8000"}}]}"#.utf8
@@ -41,5 +46,13 @@ final class NgrokSupportTests: XCTestCase {
                 matching: "http://127.0.0.1:8000"
             )
         )
+    }
+
+    func testEndpointParserDetectsAnyLiveHTTPSEndpointForShutdownVerification() {
+        let data = Data(
+            #"{"endpoints":[{"url":"https://stale.ngrok.app","upstream":{"url":"http://127.0.0.1:9999"}}]}"#.utf8
+        )
+
+        XCTAssertTrue(NgrokEndpointParser.hasLiveHTTPS(from: data))
     }
 }

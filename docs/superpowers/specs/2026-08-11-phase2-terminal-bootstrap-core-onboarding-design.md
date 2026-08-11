@@ -20,12 +20,16 @@ that TCC grants survive replacement.
 
 ### Release trust and manifest
 
-The public command targets an immutable versioned release asset. Its command
-contains the expected SHA-256 for the bootstrap asset; the bootstrap verifies a
-versioned manifest before using it. The manifest independently describes and
-hashes the helper, uv, core payload, and ngrok archive. This is an integrity
-chain, not an end-to-end signature against a compromised release account; the
-limitation is documented and a project-owned signing key remains future work.
+The generated public command targets immutable, same-tag release assets and
+pins the release version plus both the bootstrap and manifest SHA-256 digests.
+It verifies the downloaded bootstrap before executing it. The bootstrap then
+verifies the independently pinned manifest before parsing or using it, and the
+manifest describes and hashes the helper, uv, core payload, and direct-vendor
+ngrok archive. Production URLs and digests are validated again at each trust
+boundary, including rejection of all-zero sentinel digests. This is an
+integrity chain, not an end-to-end signature against a compromised release
+account; the limitation is documented and a project-owned signing key remains
+future work.
 
 The manifest has schema version 1 and contains:
 
@@ -41,8 +45,9 @@ The manifest has schema version 1 and contains:
 - compatible runtime and configuration schema ranges.
 
 The committed release template is intentionally marked as a release template. The
-artifact builder emits a concrete manifest only when all release inputs and
-digests are present. The bootstrap rejects missing or sentinel digests.
+artifact builder emits a concrete manifest and generated install command only when
+all release inputs and digests are present. The bootstrap rejects missing or
+sentinel digests and mutable production URLs.
 
 ### User-owned installation layout
 
@@ -87,9 +92,12 @@ The bootstrap copies only the core server and never copies `indexer.py`.
 `OnboardingConfiguration` gains an additive, backward-compatible
 `phase2State` value with four states: `fresh`, `legacyMigrated`, `interrupted`,
 and `completed`. The existing `completed` boolean remains for compatibility and
-is set only when the local activation contract succeeds. Legacy markers and
-legacy Full Control behavior continue to be authoritative; a false legacy
-`completed` value never blocks supervisor startup.
+is set only after local activation succeeds and the current managed requester
+has satisfied the required desired UI/OCR readiness. The running supervisor's
+activation flag remains an in-memory local-activation fact; remote setup remains
+separate and optional. Legacy markers and legacy Full Control behavior continue
+to be authoritative; a false legacy `completed` value never blocks supervisor
+startup.
 
 For a fresh or interrupted setup, the coordinator checks the configured port
 before client setup and persists the first free port from a bounded candidate
@@ -105,11 +113,16 @@ The supervisor’s first-run activation is a one-time strict probe:
 2. the capability-path MCP endpoint accepts authenticated `initialize`;
 3. authenticated `tools/list` returns a tool array;
 4. authenticated `tools/call` invokes the safe `get_session_state` orientation
-   tool.
+   tool and receives an application-level success result. When `mac.ui` is
+   desired, that result must also report the managed Python UI requester as
+   available: Accessibility, Automation/Apple Events, active console, and an
+   unlocked screen.
 
-Only after the probe succeeds does the supervisor publish the server as
-running, start ngrok, and mark Phase 2 onboarding complete. Subsequent health
-polls remain the existing lightweight lifecycle behavior; this does not
+Only after the probe and a fresh readiness evaluation succeed does the
+supervisor publish the server as running, start ngrok, and mark Phase 2
+onboarding complete. Installation payload promotion, onboarding completion,
+local activation, and optional remote setup remain distinct facts. Subsequent
+health polls remain the existing lightweight lifecycle behavior; this does not
 redesign the Phase 3 retry architecture.
 
 ### ngrok
@@ -133,10 +146,11 @@ inputs, not claims that a live account was exercised in this branch.
 
 ### Terminal handoff
 
-The bootstrap prints a short trust warning, defaults to Guided Control, and
-offers explicit `--full-control` and `--remote` opt-ins. Full Control requires
-an explicit confirmation flag after the warning. Remote setup uses a hidden token prompt and can be
-skipped. A tiny Swift command-line mode stores the token in Keychain without
+The generated install command carries the trust warning through its pinned
+release inputs. The bootstrap reports concise progress, defaults to Guided
+Control, and offers explicit `--full-control` and `--remote` opt-ins. Full
+Control requires an explicit confirmation flag. Remote setup uses a hidden
+token prompt and can be skipped. A tiny Swift command-line mode stores the token in Keychain without
 putting it in argv, then the helper is restarted and the live connector URL is
 queried for display. The URL is explicitly labeled as a password-like
 credential. Client instructions are copyable and distinguish HTTP URL clients
@@ -172,8 +186,8 @@ enum NgrokEndpointParser {
 ```
 
 `LocalActivationProbe` owns the exact HTTP/MCP request sequence and exposes a
-small async result/error surface. `ProcessSupervisor` owns when that probe is
-run and when the existing snapshot transitions to running. `NativeRuntimeCoordinator`
+small sanitized async error surface. `ProcessSupervisor` owns when that probe
+is run and when the existing snapshot transitions to running. `NativeRuntimeCoordinator`
 owns migrations, port persistence, and the completion marker. `ManagedRuntimeLaunchContract`
 continues to own the Python environment and loopback target contract.
 
@@ -183,6 +197,12 @@ The helper command-line modes are deliberately narrow:
 --store-ngrok-token       read one token from stdin and write Keychain only
 --set-profile guided|full update canonical configuration
 --enable-remote           set the canonical remote desired state
+--wait-for-local-activation
+                          wait for exact authenticated local activation
+--print-local-connector-url
+                          wait for local activation and print its URL
+--wait-for-remote-connector
+                          wait for a live remote endpoint and print its URL
 --print-connector-url     query the live local Agent API and print the URL
 ```
 
@@ -193,11 +213,12 @@ The helper command-line modes are deliberately narrow:
 - Missing or mismatched manifest/payload digests stop before extraction or
   promotion.
 - Any failed runtime validation leaves the previous runtime and configuration
-  intact and points to the diagnostic log.
+  intact where promotion has not completed and reports the failing validation.
 - Missing/invalid ngrok credentials leaves local MCP usable and reports remote
   access as optional/not ready.
-- Missing macOS permissions are reported as pending and require real user
-  approval; opening System Settings is not counted as success.
+- Missing macOS permissions are reported as pending and block onboarding
+  completion when the corresponding UI/OCR capability is desired; opening
+  System Settings is not counted as success.
 - A stale or unavailable endpoint is never displayed as the current connector
   URL.
 

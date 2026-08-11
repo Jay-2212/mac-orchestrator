@@ -1337,6 +1337,25 @@ def get_available_apps() -> Dict[str, Any]:
 
 # ── 6.5 Session & Permission Diagnostics ──────────────────────────────────────
 
+def _probe_automation_permission() -> Optional[bool]:
+    """Run one harmless Apple Events read as the managed Python requester."""
+    if sys.platform != "darwin":
+        return None
+    script = (
+        'tell application "System Events" to '
+        'get name of first application process whose frontmost is true'
+    )
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        return result.returncode == 0
+    except Exception:
+        return None
+
 def get_session_state() -> Dict[str, Any]:
     """Check whether this Mac can currently do interactive GUI work, and whether the
     permissions UI automation depends on are actually granted (not just theoretically
@@ -1378,8 +1397,15 @@ def get_session_state() -> Dict[str, Any]:
     except Exception:
         pass
 
+    ui_capability_requested = _runtime().snapshot.capabilities.get("mac.ui")
+    automation_granted = (
+        _probe_automation_permission()
+        if ui_capability_requested is not None and ui_capability_requested.desired
+        else None
+    )
     gui_available = bool(session.get("on_console")) and not bool(session.get("is_locked")) \
-        and accessibility_granted is not False
+        and accessibility_granted is True \
+        and automation_granted is True
 
     notes = []
     if session.get("is_locked"):
@@ -1402,6 +1428,13 @@ def get_session_state() -> Dict[str, Any]:
         else:
             notes.append("Screen Recording permission not granted, and the OCR capability is not "
                          "registered in this snapshot. Ask the user to open Mac Orchestrator.")
+    if automation_granted is False:
+        notes.append("Automation / Apple Events permission not granted — AppleScript-backed UI "
+                     "actions will fail. Grant Automation access to the managed server in "
+                     "System Settings → Privacy & Security → Automation, then restart the server.")
+    elif automation_granted is None and ui_capability_requested is not None and ui_capability_requested.desired:
+        notes.append("Automation / Apple Events readiness could not be verified for the managed "
+                     "server process.")
 
     return _ok(
         "GUI interaction available" if gui_available else "GUI interaction constrained — see notes",
@@ -1410,6 +1443,7 @@ def get_session_state() -> Dict[str, Any]:
         permissions={
             "accessibility": accessibility_granted,
             "screen_recording": screen_recording_granted,
+            "automation": automation_granted,
         },
         background_capabilities_available={
             "file_read": _runtime().policy.allows("mac.files.read"),
@@ -2947,6 +2981,14 @@ SERVER_INSTRUCTIONS = build_server_instructions(DEFAULT_SNAPSHOT)
 # tool pointed at the port. This file does neither implicitly.
 
 def main():
+    if "--permission-probe" in sys.argv:
+        # This is intentionally a child-process probe. TCC decisions are
+        # identity-sensitive, so Swift preflight alone is not authoritative
+        # for the managed Python server that actually performs UI work.
+        result = get_session_state()
+        print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+        return
+
     owner = ""
     if "--managed-owner" in sys.argv:
         try:

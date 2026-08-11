@@ -1,6 +1,8 @@
 # Client setup
 
-Complete this page only after the helper reports that local activation passed.
+Complete this page only after the installer reports `Local connection ready.`
+That message is emitted only after the authenticated health/MCP activation
+oracle succeeds.
 The connector URL is a capability credential: anyone who has it can use the
 enabled Mac Orchestrator tools. Keep it private like a password.
 
@@ -79,9 +81,16 @@ the old entry if the URL is exposed.
 
 ## Local-only use
 
-Remote ingress is optional. A client running on the same Mac can use the local
-capability-path endpoint exposed by the helper if the client supports an HTTP
-URL on loopback. Use the exact URL shown by the helper for the current local
+Remote ingress is optional. A client running on the same Mac can use the
+local capability-path endpoint exposed by the managed Python server if the
+client supports an HTTP URL on loopback. The installer prints:
+
+```text
+Local MCP URL: http://127.0.0.1:<selected-port>/<capability-token>/mcp
+```
+
+You can request the same bounded confirmation from the installed helper with
+`--wait-for-local-activation`. Use the exact URL shown for the current local
 port and capability path; do not guess port `8000` or remove authentication.
 
 The server remains loopback-bound. The public URL, when enabled, is the ngrok
@@ -95,11 +104,14 @@ surface. The profile is local configuration, not an approval prompt for every
 tool call.
 
 UI and screen tools also depend on macOS Accessibility, Screen Recording,
-Apple Events, an unlocked Mac, and an active console session. Approving a
+Apple Events, an unlocked Mac, and an active console session. The helper runs
+the permission probe in the managed Python child that performs the UI work;
+its result and `get_session_state` are the evidence to use. Approving a
 System Settings pane is not proof of access. Grant permissions to the exact
-installed helper and verify with the helper's status or `get_session_state`.
-Ad-hoc replacement builds can lose TCC grants. Gatekeeper and TCC behavior in
-Phase 2 is intentionally documented as a limitation, not hidden or bypassed.
+identity macOS shows for the managed helper/runtime, then use Restart and
+recheck the status. Ad-hoc replacement builds can lose TCC grants. Gatekeeper
+and TCC behavior in Phase 2 is intentionally documented as a limitation, not
+hidden or bypassed.
 
 ## Rotate a leaked URL or token
 

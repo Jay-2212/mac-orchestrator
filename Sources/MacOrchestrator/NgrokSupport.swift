@@ -14,6 +14,20 @@ struct NgrokEndpointUpstream: Decodable, Equatable, Sendable {
 }
 
 enum NgrokEndpointParser {
+    static func isValidResponse(from data: Data) -> Bool {
+        (try? JSONDecoder().decode(NgrokEndpointResponse.self, from: data)) != nil
+    }
+
+    static func hasLiveHTTPS(from data: Data) -> Bool {
+        guard let response = try? JSONDecoder().decode(NgrokEndpointResponse.self, from: data) else {
+            return false
+        }
+        return response.endpoints.contains { endpoint in
+            guard let url = URL(string: endpoint.url) else { return false }
+            return url.scheme?.lowercased() == "https" && url.host != nil
+        }
+    }
+
     static func publicURL(from data: Data, matching target: String) -> URL? {
         guard let response = try? JSONDecoder().decode(NgrokEndpointResponse.self, from: data),
               let endpoint = response.endpoints.first(where: {

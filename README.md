@@ -16,45 +16,43 @@ manifest, verifies its digests, and installs a prebuilt arm64 helper plus a
 private managed Python runtime below the user-owned Application Support tree.
 
 This repository is a source project. A branch or source archive is not a
-published Phase 2 release. Use the exact bootstrap command from a tagged
-release's notes; do not substitute a branch URL or an unverified script.
+published Phase 2 release. Use the generated install command from a tagged
+release page; do not substitute a branch URL or an unverified script.
 
 ## Install the public-core release
 
-When a Phase 2 release is published, its release notes will contain the exact
-values for `VERSION` and `BOOTSTRAP_SHA256`. The command has this shape:
+When a Phase 2 release is published, its release page will include the
+generated `install-command.sh`. Copy that command from the same release; it
+contains the exact version, immutable bootstrap URL, bootstrap SHA-256,
+manifest URL, and manifest SHA-256. Do not hand-edit those values:
 
 ```bash
-VERSION="v<version>"
-BOOTSTRAP_SHA256="<sha256-from-the-same-release-page>"
-BOOTSTRAP="$(mktemp -t mac-orchestrator-bootstrap.XXXXXX)"
-MANIFEST="$(mktemp -t mac-orchestrator-manifest.XXXXXX)"
-trap 'rm -f "$BOOTSTRAP" "$MANIFEST"' EXIT
-curl --fail --location --proto '=https' --tlsv1.2 \
-  "https://github.com/Jay-2212/mac-orchestrator/releases/download/${VERSION}/bootstrap.sh" \
-  --output "$BOOTSTRAP"
-printf '%s  %s\n' "$BOOTSTRAP_SHA256" "$BOOTSTRAP" | shasum -a 256 --check
-curl --fail --location --proto '=https' --tlsv1.2 \
-  "https://github.com/Jay-2212/mac-orchestrator/releases/download/${VERSION}/manifest.json" \
-  --output "$MANIFEST"
-bash "$BOOTSTRAP" --manifest "$MANIFEST"
+# Paste the exact contents of install-command.sh from the tagged release.
+./install-command.sh
 ```
 
-The command verifies the bootstrap file before executing it and supplies the
-manifest from the same immutable release asset set. The bootstrap then
-verifies the concrete versioned manifest, helper, uv, runtime lock, core
-payload, and external ngrok archive before promotion. A missing, sentinel, or
-mismatched digest stops installation. The release asset is the trust anchor;
-this is an integrity chain, not a project-owned signature scheme. Project-owned
-artifact signing remains future work.
+The generated command verifies the bootstrap before executing it and passes
+both external trust anchors to the bootstrap. The bootstrap verifies the
+release version and manifest before parsing it, then verifies every helper,
+uv, runtime lock, core-payload, and vendor ngrok digest before promotion. A
+missing, sentinel, all-zero, or mismatched digest stops installation. The
+release asset is the trust anchor; this is an integrity chain, not a
+project-owned signature scheme. `SHA256SUMS` is published alongside the
+assets for independent release-output checks. Project-owned artifact signing
+remains future work.
 
 The default profile is Guided Control. Full Control is an explicit opt-in with
 a warning because the connector can execute terminal, file, UI, and application
 actions on the Mac. Remote ingress is also optional; local setup remains useful
 without an ngrok account or token.
 
-Continue with [client setup](docs/CLIENT_SETUP.md) after the helper reports a
-successful local activation.
+The installer prints `Local connection ready.` only after the helper has
+passed the exact health, authenticated initialize, tools/list, and safe
+`get_session_state` probe. When Guided Control's UI capability is desired, the
+managed Python requester must also confirm Accessibility, Automation / Apple
+Events, an active console session, and an unlocked screen. It prints the
+confirmed local MCP URL in the terminal. Continue with
+[client setup](docs/CLIENT_SETUP.md) after that message.
 
 ## Where the installation lives
 
@@ -120,10 +118,12 @@ remove quarantine as a substitute for trust.
 
 Accessibility, Screen Recording, Apple Events, and related TCC permissions are
 granted to a particular installed identity. An ad-hoc rebuild or replacement
-can receive a new identity and lose previous grants. A permission prompt or an
-opened System Settings pane is not proof that access was granted: verify the
-actual state through the helper and `get_session_state`. Hosted CI cannot provide
-authoritative TCC evidence, so its UI suite is informational only.
+can receive a new identity and lose previous grants. The helper runs a
+managed-Python permission probe in the same child-runtime identity that
+performs UI work; its result and `get_session_state` are authoritative for
+Python-side readiness. A permission prompt or an opened System Settings pane
+is not proof that access was granted. Hosted CI cannot provide authoritative
+TCC evidence, so its UI suite is informational only.
 
 The connector holder is trusted with the enabled actions. Mac Orchestrator is
 not a security boundary between mutually untrusted users, and the current
@@ -152,8 +152,8 @@ previous runtime while it promotes a validated replacement and records an
 interrupted promotion for the next invocation to recover.
 
 - If the manifest, digest, architecture, lock, import, or smoke check fails,
-  stop and keep the previous runtime. Check the diagnostic log and retry the
-  same verified release.
+  stop and keep the previous runtime. Read the displayed validation error and
+  retry the same verified release.
 - If Gatekeeper warns, follow the normal macOS approval path; do not disable
   protections globally.
 - If UI tools report missing permissions, unlock the Mac, confirm the active

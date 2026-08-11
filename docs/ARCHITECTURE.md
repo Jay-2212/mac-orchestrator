@@ -41,12 +41,14 @@ Support directory.
 
 ## Bootstrap trust and promotion
 
-The release page pins the bootstrap asset by version and SHA-256. The bootstrap
-then verifies a schema-versioned manifest containing product, platform, helper,
-uv/runtime, lock, core-payload, and ngrok metadata. Empty, sentinel, or
-mismatched digests stop before extraction or promotion. This protects against
-accidental or tampered payload substitution but is not an end-to-end signature
-against a compromised release account; project-owned signing is deferred.
+The release page publishes a generated install handoff that pins the bootstrap
+asset, bootstrap SHA-256, manifest asset, and manifest SHA-256 to one version.
+The bootstrap verifies those outer anchors before parsing a schema-versioned
+manifest containing product, platform, helper, uv/runtime, lock, core-payload,
+and ngrok metadata. Empty, all-zero, sentinel, or mismatched digests stop
+before extraction or promotion. This protects against accidental or tampered
+payload substitution but is not an end-to-end signature against a compromised
+release account; project-owned signing is deferred.
 
 Installation uses a unique staging directory and validates architecture,
 versions, lock identity, imports, non-editable metadata, and a local health
@@ -77,8 +79,9 @@ The Swift helper is the lifecycle and configuration plane:
   arguments.
 - `RotatingLog.swift` writes local restricted logs and redacts capability
   credentials.
-- `MenuController.swift` and `AppDelegate.swift` expose profile, permission,
-  remote, restart, and current-URL controls.
+- `MenuController.swift` and `AppDelegate.swift` expose profile, permission
+  guidance, remote, restart, and current-URL controls. Opening Settings is
+  guidance only; the managed Python probe remains the permission oracle.
 
 Fresh or interrupted setup selects and persists the first free port in the
 bounded `8000...8100` range. A completed or genuine legacy installation keeps
@@ -92,16 +95,21 @@ capability path:
 
 1. `GET /__mac_orchestrator_health` must return HTTP 200 and exactly
    `{"status":"ok"}`.
-2. Authenticated MCP `initialize` must succeed, including session-header
-   handling.
+2. Authenticated MCP `initialize` must succeed, negotiate the expected
+   protocol version, and include session-header handling.
 3. Authenticated `tools/list` must return a tool array.
 4. Authenticated `tools/call` must complete the safe `get_session_state`
-   orientation call.
+   orientation call with an application-level success result, not merely a
+   JSON-RPC envelope. When `mac.ui` is desired, the result must also report
+   the managed Python requester as UI-ready: Accessibility, Automation / Apple
+   Events, active console, and an unlocked screen.
 
-Only after all four stages pass does the supervisor publish the local service as
-running, start remote ingress, and mark onboarding complete. Later health polls
-remain lightweight lifecycle checks; a larger retry/doctor/recovery design is
-deferred.
+Only after all four stages and a fresh required-capability readiness evaluation
+pass does the supervisor publish the local service as running, start remote
+ingress, and mark onboarding complete. Installation payload promotion,
+onboarding completion, local activation, and optional remote setup remain
+distinct facts. Later health polls remain lightweight lifecycle checks; a
+larger retry/doctor/recovery design is deferred.
 
 ## Remote endpoint and credential flow
 
@@ -148,9 +156,10 @@ Phase 2 distributes an arm64 ad-hoc-signed helper. It is not Developer ID
 signed or notarized. Gatekeeper may warn when it is first opened; the helper and
 bootstrap do not silently disable Gatekeeper or remove quarantine. TCC grants
 are tied to the installed identity, so an ad-hoc replacement can require fresh
-Accessibility, Screen Recording, or Apple Events approval. Opening System
-Settings is not evidence that the grant succeeded; verify actual permission and
-active-console state through the helper and `get_session_state`.
+Accessibility, Screen Recording, or Apple Events approval. The helper executes
+the permission probe in the managed Python child that consumes those grants.
+Opening System Settings is not evidence that the grant succeeded; use the
+probe and `get_session_state`, then Restart and recheck.
 
 Hosted CI cannot supply authoritative TCC, Screen Recording, or interactive
 console permissions. Those observations remain informational and never replace

@@ -1,5 +1,16 @@
 import Foundation
 
+enum OnboardingCompletionError: Error, Equatable, LocalizedError, Sendable {
+    case requiredCapabilityPending(String)
+
+    var errorDescription: String? {
+        switch self {
+        case let .requiredCapabilityPending(capability):
+            return "Required onboarding capability is still pending: \(capability)."
+        }
+    }
+}
+
 @MainActor
 final class NativeRuntimeCoordinator {
     typealias ReadinessEvaluator = @MainActor (
@@ -52,22 +63,16 @@ final class NativeRuntimeCoordinator {
                 configuration.onboarding.phase2State = .interrupted
             }
         }
-        if state == .fresh || state == .interrupted {
-            let selectedPort = try LocalPortAllocator.select(
-                preferred: configuration.localMCPPort,
-                isOccupied: portIsOccupied
-            )
-            if selectedPort != configuration.localMCPPort {
-                configuration = try store.update { configuration in
-                    configuration.localMCPPort = selectedPort
-                }
-            }
-        }
+        configuration = try allocatePortIfNeeded(configuration, state: state)
         return try await makeLaunchContract(configuration: configuration)
     }
 
     func reload() async throws -> ManagedRuntimeLaunchContract {
-        try await makeLaunchContract(configuration: store.load())
+        let configuration = try store.load()
+        let state = OnboardingStateClassifier.classify(configuration)
+        return try await makeLaunchContract(
+            configuration: allocatePortIfNeeded(configuration, state: state)
+        )
     }
 
     func updateConfiguration(
@@ -78,8 +83,25 @@ final class NativeRuntimeCoordinator {
     }
 
     @discardableResult
-    func markPhase2Completed() throws -> AppConfiguration {
-        try store.update { configuration in
+    func markPhase2Completed() async throws -> AppConfiguration {
+        let configuration = try store.load()
+        let facts = await readinessEvaluator(configuration, keychain, runtimeDirectory)
+        let snapshot = CapabilityRegistry(
+            configuration: configuration,
+            facts: facts
+        ).snapshot()
+
+        guard snapshot.capabilities["core.session"]?.ready == true else {
+            throw OnboardingCompletionError.requiredCapabilityPending("core session")
+        }
+        for capabilityID in ["mac.ui", "mac.screenOcr"] {
+            guard configuration.desiredCapabilities[capabilityID] == true else { continue }
+            guard snapshot.capabilities[capabilityID]?.ready == true else {
+                throw OnboardingCompletionError.requiredCapabilityPending(capabilityID)
+            }
+        }
+
+        return try store.update { configuration in
             configuration.onboarding.completed = true
             configuration.onboarding.phase2State = .completed
         }
@@ -106,5 +128,24 @@ final class NativeRuntimeCoordinator {
             keychain: keychain,
             inheritedEnvironment: inheritedEnvironment
         )
+    }
+
+    private func allocatePortIfNeeded(
+        _ configuration: AppConfiguration,
+        state: Phase2OnboardingState
+    ) throws -> AppConfiguration {
+        guard state == .fresh || state == .interrupted else {
+            return configuration
+        }
+        let selectedPort = try LocalPortAllocator.select(
+            preferred: configuration.localMCPPort,
+            isOccupied: portIsOccupied
+        )
+        guard selectedPort != configuration.localMCPPort else {
+            return configuration
+        }
+        return try store.update { configuration in
+            configuration.localMCPPort = selectedPort
+        }
     }
 }

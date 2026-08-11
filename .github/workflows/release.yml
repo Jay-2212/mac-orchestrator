@@ -76,15 +76,16 @@ jobs:
       - name: Validate Phase 2 release contract before publication
         run: |
           set -euo pipefail
-          for item in release/manifest.schema.json release/manifest.template.json script/bootstrap.sh script/build_release_artifacts.sh script/test_bootstrap.sh; do
+          for item in release/manifest.schema.json release/manifest.template.json script/bootstrap.sh script/build_release_artifacts.sh script/generate_install_command.sh script/test_bootstrap.sh; do
             test -f "$item" || { echo "Missing Phase 2 release input: $item" >&2; exit 1; }
           done
           test -x script/bootstrap.sh
           test -x script/build_release_artifacts.sh
+          test -x script/generate_install_command.sh
           test -x script/test_bootstrap.sh
           python3 -m json.tool release/manifest.schema.json >/dev/null
           python3 -m json.tool release/manifest.template.json >/dev/null
-          bash -n script/bootstrap.sh script/build_release_artifacts.sh script/test_bootstrap.sh
+          bash -n script/bootstrap.sh script/build_release_artifacts.sh script/generate_install_command.sh script/test_bootstrap.sh
           python3 - <<'PY'
           import json
           from pathlib import Path
@@ -147,6 +148,7 @@ jobs:
           /bin/mkdir -p "$release_tmp/core-source" "$release_tmp/output"
           product_version="${RELEASE_TAG#v}"
           asset_base="https://github.com/Jay-2212/mac-orchestrator/releases/download/${RELEASE_TAG}"
+          manifest_url="$asset_base/manifest.json"
 
           MAC_ORCHESTRATOR_VERSION="$product_version" bash script/package_app.sh >/dev/null
           /usr/bin/ditto -c -k --sequesterRsrc --keepParent \
@@ -174,6 +176,7 @@ jobs:
             --bootstrap-version "1.0.0" \
             --bootstrap-url "$asset_base/bootstrap.sh" \
             --bootstrap-sha256 "$bootstrap_sha256" \
+            --manifest-url "$manifest_url" \
             --helper-archive "$release_tmp/Mac-Orchestrator-arm64.zip" \
             --helper-url "$asset_base/Mac-Orchestrator-arm64.zip" \
             --helper-sha256 "$helper_sha256" \
@@ -194,6 +197,13 @@ jobs:
             --output-dir "$release_tmp/output"
           test -f "$release_tmp/output/bootstrap.sh"
           test -f "$release_tmp/output/manifest.json"
+          test -x "$release_tmp/output/install-command.sh"
+          test -f "$release_tmp/output/SHA256SUMS"
+          (cd "$release_tmp/output" && /usr/bin/shasum -a 256 -c SHA256SUMS)
+          if /usr/bin/find "$release_tmp/output" -iname '*ngrok*.zip' -print -quit | /usr/bin/grep -q .; then
+            echo "ngrok archives must not be published as project release assets" >&2
+            exit 1
+          fi
 
       - name: Upload release asset bundle
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -255,4 +265,5 @@ jobs:
             release-assets/Mac-Orchestrator-arm64.zip \
             release-assets/uv-arm64 \
             release-assets/core-payload.tar.gz \
-            release-assets/ngrok-arm64.zip
+            release-assets/install-command.sh \
+            release-assets/SHA256SUMS

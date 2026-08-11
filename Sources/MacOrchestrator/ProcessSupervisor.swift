@@ -168,6 +168,13 @@ final class ProcessSupervisor {
         NSWorkspace.shared.open(logsDirectory)
     }
 
+    func openPrivacySettings() {
+        guard let url = URL(
+            string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+        ) else { return }
+        NSWorkspace.shared.open(url)
+    }
+
     private func updateConfiguration(
         _ update: (inout AppConfiguration) throws -> Void
     ) async {
@@ -250,7 +257,7 @@ final class ProcessSupervisor {
         let script = runtimeDirectory.appendingPathComponent("automac_mcp.py")
         guard FileManager.default.isExecutableFile(atPath: python.path),
               FileManager.default.fileExists(atPath: script.path) else {
-            fail("Installed Python runtime is missing. Run script/distribute.sh.")
+            fail("Installed Python runtime is missing. Run the terminal bootstrap again.")
             return
         }
         if portIsOccupied(contract.port) {
@@ -486,7 +493,8 @@ final class ProcessSupervisor {
             do {
                 try await LocalActivationProbe().run(
                     port: port,
-                    capabilityToken: capabilityToken
+                    capabilityToken: capabilityToken,
+                    requiresInteractiveUI: self.activeContract?.capabilitySnapshot.capabilities["mac.ui"]?.desired == true
                 )
                 guard let process = self.serverProcess,
                       process.isRunning,
@@ -495,7 +503,7 @@ final class ProcessSupervisor {
                     return
                 }
                 do {
-                    try self.runtimeCoordinator.markPhase2Completed()
+                    try await self.runtimeCoordinator.markPhase2Completed()
                 } catch {
                     self.activationInFlight = false
                     self.fail("Activation succeeded but onboarding state could not be saved: \(error.localizedDescription)")
@@ -522,20 +530,33 @@ final class ProcessSupervisor {
     private func queryTunnelURL() {
         var request = URLRequest(url: URL(string: "http://127.0.0.1:4040/api/endpoints")!)
         request.timeoutInterval = 1
-        guard let process = tunnelProcess, process.isRunning,
-              let contract = activeContract,
-              let connectorToken = contract.environment["MAC_ORCHESTRATOR_CONNECTOR_TOKEN"] else { return }
+        guard let process = tunnelProcess, process.isRunning else { return }
+        guard let contract = activeContract,
+              let connectorToken = contract.environment["MAC_ORCHESTRATOR_CONNECTOR_TOKEN"] else {
+            snapshot.connectorURL = nil
+            snapshot.tunnel = .reconnecting
+            snapshot.error = "Remote connector identity is unavailable."
+            return
+        }
         let processID = ObjectIdentifier(process)
         URLSession.shared.dataTask(with: request) { [weak self, processID] data, response, _ in
             Task { @MainActor [weak self, processID] in
                 guard let self, let process = self.tunnelProcess, process.isRunning,
-                      ObjectIdentifier(process) == processID,
-                      (response as? HTTPURLResponse)?.statusCode == 200,
+                      ObjectIdentifier(process) == processID else { return }
+                guard (response as? HTTPURLResponse)?.statusCode == 200,
                       let data,
                       let base = NgrokEndpointParser.publicURL(
                           from: data,
                           matching: contract.tunnelTarget
-                      ) else { return }
+                      ) else {
+                    // A previously observed public URL is never current
+                    // evidence. Clear it until the owned tunnel is confirmed
+                    // again by the Agent API.
+                    self.snapshot.connectorURL = nil
+                    self.snapshot.tunnel = .reconnecting
+                    self.snapshot.error = "Remote connector endpoint is not currently confirmed."
+                    return
+                }
                 self.snapshot.connectorURL = ConnectorURLBuilder.make(
                     publicURL: base.absoluteString,
                     capabilityToken: connectorToken
@@ -597,20 +618,22 @@ final class ProcessSupervisor {
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = pipe
+        let redactor = LockedStreamingLogRedactor(secrets: secrets)
+        let writeSafeLine: @Sendable (String) -> Void = { line in
+            guard !line.isEmpty else { return }
+            guard !fragments.contains(where: line.contains) else { return }
+            log.write(line)
+        }
         pipe.fileHandleForReading.readabilityHandler = { handle in
             let data = handle.availableData
-            guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
-            for line in text.split(whereSeparator: \.isNewline) {
-                var safeLine = String(line)
-                if fragments.contains(where: safeLine.contains) { continue }
-                for secret in secrets where !secret.isEmpty {
-                    safeLine = safeLine.replacingOccurrences(of: secret, with: "<redacted>")
-                }
-                log.write(safeLine)
+            if data.isEmpty {
+                redactor.append("", flush: true).forEach(writeSafeLine)
+                return
             }
+            guard let text = String(data: data, encoding: .utf8) else { return }
+            redactor.append(text, flush: false).forEach(writeSafeLine)
         }
     }
-
     private func portIsOccupied(_ port: Int) -> Bool {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
@@ -622,7 +645,9 @@ final class ProcessSupervisor {
             process.waitUntilExit()
             return process.terminationStatus == 0
         } catch {
-            return false
+            // If ownership cannot be checked, fail closed rather than
+            // claiming that another process is not listening.
+            return true
         }
     }
 

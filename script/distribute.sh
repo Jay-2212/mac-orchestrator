@@ -41,7 +41,7 @@ NGROK_CONFIG="$HOME/Library/Application Support/ngrok/ngrok.yml"
 /usr/bin/ditto "$PROJECT_DIR/indexer.py" "$RUNTIME_DIR/indexer.py"
 /usr/bin/ditto "$PROJECT_DIR/pyproject.toml" "$RUNTIME_DIR/pyproject.toml"
 /usr/bin/ditto "$PROJECT_DIR/uv.lock" "$RUNTIME_DIR/uv.lock"
-"$UV_BIN" sync --project "$RUNTIME_DIR" --frozen
+"$UV_BIN" sync --project "$RUNTIME_DIR" --frozen --extra indexer
 
 /usr/bin/ditto "$BUILT_APP" "$INSTALLED_APP"
 /usr/bin/codesign --verify --strict "$INSTALLED_APP"

@@ -15,21 +15,27 @@ UNAME_BIN="${MAC_ORCHESTRATOR_UNAME_BIN:-uname}"
 SW_VERS_BIN="${MAC_ORCHESTRATOR_SW_VERS_BIN:-sw_vers}"
 
 MANIFEST_SOURCE="${MAC_ORCHESTRATOR_MANIFEST_PATH:-}"
+MANIFEST_PINNED_DIGEST="${MAC_ORCHESTRATOR_MANIFEST_SHA256:-}"
+BOOTSTRAP_PINNED_DIGEST="${MAC_ORCHESTRATOR_BOOTSTRAP_SHA256:-}"
+EXPECTED_RELEASE_VERSION="${MAC_ORCHESTRATOR_RELEASE_VERSION:-}"
 SUPPORT_DIR="${MAC_ORCHESTRATOR_SUPPORT_DIR:-$HOME/Library/Application Support/Mac Orchestrator}"
 INSTALL_DIR="$SUPPORT_DIR/install"
 RUNTIME_DIR="$SUPPORT_DIR/runtime"
 APP_DIR="$SUPPORT_DIR/app"
 REMOTE_DIR="$SUPPORT_DIR/remote/ngrok"
+REMOTE_PARENT_DIR="$SUPPORT_DIR/remote"
 BACKUP_DIR="$INSTALL_DIR/runtime.previous"
 APP_BACKUP_DIR="$INSTALL_DIR/app.previous"
 REMOTE_BACKUP_DIR="$INSTALL_DIR/remote.previous"
 PROMOTION_MARKER="$INSTALL_DIR/promotion.marker"
+LAUNCH_AGENT_BACKUP_PATH="$INSTALL_DIR/launch-agent.previous.plist"
 LAUNCH_AGENTS_DIR="$HOME/Library/LaunchAgents"
 LAUNCH_AGENT_LABEL="com.jay.mac-orchestrator"
 LAUNCH_AGENT_PATH="$LAUNCH_AGENTS_DIR/$LAUNCH_AGENT_LABEL.plist"
 FIXTURE_MODE="${MAC_ORCHESTRATOR_FIXTURE_MODE:-0}"
 FIXTURE_LOCK_PATH="${MAC_ORCHESTRATOR_FIXTURE_LOCK_PATH:-}"
 TEST_FAIL_AFTER_PROMOTION="${MAC_ORCHESTRATOR_TEST_FAIL_AFTER_PROMOTION:-0}"
+TEST_FAIL_AFTER_POST_PROMOTION="${MAC_ORCHESTRATOR_TEST_FAIL_AFTER_POST_PROMOTION:-0}"
 TEST_EXIT_AFTER_RECOVERY="${MAC_ORCHESTRATOR_TEST_EXIT_AFTER_RECOVERY:-0}"
 VERBOSE="0"
 PROFILE="guided"
@@ -52,7 +58,27 @@ die() {
 }
 
 stage() {
-  echo "$1"
+  case "$1" in
+    manifest-validated) echo "Verified release metadata." ;;
+    platform-validated) echo "This Mac meets the release requirements." ;;
+    promotion-recovery) echo "Recovering the previous installation..." ;;
+    promotion-recovered) echo "Recovered the previous installation." ;;
+    digests-verified) echo "Verified release payloads." ;;
+    staged) echo "Prepared a safe staged installation." ;;
+    promoted) echo "Installed Mac Orchestrator." ;;
+    starting-helper) echo "Starting Mac Orchestrator..." ;;
+    profile-guided-default) echo "Guided Control is enabled by default." ;;
+    profile-full-selected) echo "Full Control selected explicitly." ;;
+    remote-authentication-required) echo "Enter the remote access token at the hidden prompt." ;;
+    remote-opt-in-requested) echo "Remote access enabled; waiting for a live connector." ;;
+    remote-optional) echo "Remote access is optional and remains disabled." ;;
+    local-activation-pending) echo "Checking the local connection..." ;;
+    local-activation-confirmed) echo "Local connection ready." ;;
+    remote-activation-pending) echo "Checking the remote connection..." ;;
+    remote-activation-confirmed) echo "Remote connector ready." ;;
+    complete) echo "Mac Orchestrator is ready." ;;
+    *) echo "$1" ;;
+  esac
 }
 
 run_uv() {
@@ -70,16 +96,70 @@ cleanup_path() {
       return 1
       ;;
   esac
+  if [ -L "$path" ]; then
+    return 1
+  fi
   if [ -e "$path" ]; then
     /bin/rm -rf "$path"
   fi
+}
+
+ensure_safe_directory() {
+  path="$1"
+  label="$2"
+  case "$path" in
+    ""|"/"|"$HOME")
+      die "$label is unsafe"
+      ;;
+  esac
+  case "$path" in
+    /*) ;;
+    *) die "$label must be an absolute path" ;;
+  esac
+  [ ! -L "$path" ] || die "$label must not be a symlink"
+  parent="$path"
+  while [ "$parent" != "/" ]; do
+    case "$parent" in
+      /var|/tmp) ;;
+      *) [ ! -L "$parent" ] || die "$label has a symlinked parent" ;;
+    esac
+    parent="$(dirname "$parent")"
+  done
+  if [ -e "$path" ] && [ ! -d "$path" ]; then
+    die "$label is not a directory"
+  fi
+  /bin/mkdir -p "$path" || die "could not create $label"
+  [ ! -L "$path" ] || die "$label must not be a symlink"
+}
+
+write_promotion_marker() {
+  phase="$1"
+  had_runtime="$2"
+  had_app="$3"
+  had_remote="$4"
+  had_launch_agent="$5"
+  [ ! -L "$PROMOTION_MARKER" ] || die "promotion marker must not be a symlink"
+  marker_tmp="$(mktemp "$INSTALL_DIR/promotion.marker.tmp-XXXXXX")" ||
+    die "could not create the promotion marker"
+  if ! printf 'phase=%s\nhad_runtime=%s\nhad_app=%s\nhad_remote=%s\nhad_launch_agent=%s\n' \
+    "$phase" "$had_runtime" "$had_app" "$had_remote" "$had_launch_agent" > "$marker_tmp"; then
+    /bin/rm -f "$marker_tmp"
+    die "could not write the promotion marker"
+  fi
+  /bin/chmod 600 "$marker_tmp"
+  /bin/mv "$marker_tmp" "$PROMOTION_MARKER" || {
+    /bin/rm -f "$marker_tmp"
+    die "could not install the promotion marker"
+  }
 }
 
 finish() {
   rc=$?
   set +e
   if [ "$rc" -ne 0 ] && [ "$PROMOTION_ACTIVE" -eq 1 ]; then
-    recover_pending_promotion >/dev/null 2>&1 || true
+    if ! recover_pending_promotion; then
+      echo "error: interrupted installation recovery could not be completed; the recovery marker was preserved." >&2
+    fi
   fi
   if [ -n "$STAGING_DIR" ] && [ -d "$STAGING_DIR" ]; then
     cleanup_path "$STAGING_DIR" || true
@@ -93,7 +173,7 @@ trap finish EXIT
 trap 'exit 130' HUP INT TERM
 
 usage() {
-  echo "Usage: bootstrap.sh [--manifest PATH|URL] [--full-control] [--remote] [--verbose]" >&2
+  echo "Usage: bootstrap.sh --manifest PATH|URL --manifest-sha256 DIGEST --bootstrap-sha256 DIGEST --release-version VERSION [--full-control] [--remote] [--verbose]" >&2
 }
 
 while [ "$#" -gt 0 ]; do
@@ -101,6 +181,21 @@ while [ "$#" -gt 0 ]; do
     --manifest)
       [ "$#" -ge 2 ] || { usage; exit 2; }
       MANIFEST_SOURCE="$2"
+      shift 2
+      ;;
+    --manifest-sha256)
+      [ "$#" -ge 2 ] || { usage; exit 2; }
+      MANIFEST_PINNED_DIGEST="$2"
+      shift 2
+      ;;
+    --bootstrap-sha256)
+      [ "$#" -ge 2 ] || { usage; exit 2; }
+      BOOTSTRAP_PINNED_DIGEST="$2"
+      shift 2
+      ;;
+    --release-version)
+      [ "$#" -ge 2 ] || { usage; exit 2; }
+      EXPECTED_RELEASE_VERSION="$2"
       shift 2
       ;;
     --full-control)
@@ -155,6 +250,7 @@ require_sha256() {
       die "$label digest must be hexadecimal"
       ;;
   esac
+  [[ ! "$value" =~ ^0{64}$ ]] || die "$label digest must not be all zeroes"
   case "$value" in
     *REPLACE*|*SENTINEL*|*example.invalid*)
       die "$label digest is still a template value"
@@ -174,6 +270,15 @@ require_url() {
       die "$label URL must point to an immutable release asset"
       ;;
   esac
+}
+
+require_release_asset_url() {
+  label="$1"
+  value="$2"
+  filename="$3"
+  [ "$FIXTURE_MODE" = "1" ] && return 0
+  expected="https://github.com/Jay-2212/mac-orchestrator/releases/download/v${PRODUCT_VERSION}/${filename}"
+  [ "$value" = "$expected" ] || die "$label URL must be the immutable release asset URL for v${PRODUCT_VERSION}"
 }
 
 require_ngrok_url() {
@@ -282,7 +387,8 @@ fetch_source() {
       /bin/cp "$source_path" "$destination"
       ;;
     https://*)
-      "$CURL_BIN" -fL --retry 2 --output "$destination" "$source"
+      "$CURL_BIN" --fail --location --proto '=https' --tlsv1.2 --retry 2 \
+        --output "$destination" "$source"
       ;;
     *)
       [ -f "$source" ] || return 1
@@ -304,28 +410,57 @@ download_and_verify() {
 
 safe_archive_entries() {
   archive="$1"
+  archive_entries="$($TAR_BIN -tzf "$archive")" || die "could not inspect core payload archive"
   while IFS= read -r entry; do
     case "$entry" in
       ""|/*|../*|*/../*|..)
         die "archive contains an unsafe path"
-        ;;
+      ;;
     esac
-  done <<EOF
-$($TAR_BIN -tzf "$archive")
-EOF
+  done <<<"$archive_entries"
+  if printf '%s\n' "$archive_entries" | /usr/bin/grep -Eq '(^|/)\.\.?(/|$)'; then
+    die "archive contains an unsafe path"
+  fi
+  archive_listing="$($TAR_BIN -tvzf "$archive")" || die "could not inspect core payload archive"
+  while IFS= read -r entry; do
+    case "${entry:0:1}" in
+      -|d) ;;
+      *) die "archive contains a non-regular entry" ;;
+    esac
+  done <<<"$archive_listing"
+}
+
+validate_core_archive_boundary() {
+  archive="$1"
+  core_entries="$($TAR_BIN -tzf "$archive")" || die "could not list core payload archive"
+  core_entry_count="$(printf '%s\n' "$core_entries" | /usr/bin/wc -l | /usr/bin/tr -d ' ')"
+  [ "$core_entry_count" = "3" ] || die "core payload contains files outside the declared core boundary"
+  while IFS= read -r entry; do
+    case "$entry" in
+      automac_mcp.py|pyproject.toml|uv.lock) ;;
+      *) die "core payload contains a file outside the declared core boundary" ;;
+    esac
+  done <<<"$core_entries"
 }
 
 safe_zip_entries() {
   archive="$1"
+  label="${2:-ngrok archive}"
+  zip_entries="$($UNZIP_BIN -Z1 "$archive")" || die "could not inspect $label"
   while IFS= read -r entry; do
     case "$entry" in
       ""|/*|../*|*/../*|..)
-        die "ngrok archive contains an unsafe path"
-        ;;
+        die "$label contains an unsafe path"
+      ;;
     esac
-  done <<EOF
-$($UNZIP_BIN -Z1 "$archive")
-EOF
+  done <<<"$zip_entries"
+  if printf '%s\n' "$zip_entries" | /usr/bin/grep -Eq '(^|/)\.\.?(/|$)'; then
+    die "$label contains an unsafe path"
+  fi
+  zip_details="$($UNZIP_BIN -Z -v "$archive")" || die "could not inspect $label"
+  if printf '%s\n' "$zip_details" | /usr/bin/grep -Eq 'Unix file attributes \([0-9]+ octal\):[[:space:]]+[^-d]'; then
+    die "$label contains a non-regular entry"
+  fi
 }
 
 read_manifest() {
@@ -380,6 +515,10 @@ read_manifest() {
   CORE_PAYLOAD_DIGEST="$VALUE"
   read_manifest_value runtime.corePayload.format
   [ "$VALUE" = "tar.gz" ] || die "core payload must be tar.gz"
+  core_files_json="$($PLUTIL_BIN -extract runtime.corePayload.files json -o - "$MANIFEST_FILE" 2>/dev/null | tr -d '[:space:]')" ||
+    die "manifest core payload file list is missing"
+  [ "$core_files_json" = '["automac_mcp.py","pyproject.toml","uv.lock"]' ] ||
+    die "manifest core payload file list is outside the declared core boundary"
 
   read_manifest_value ngrok.version
   NGROK_VERSION="$VALUE"
@@ -408,6 +547,12 @@ read_manifest() {
   CONFIG_SCHEMA_MAX="$VALUE"
 }
 
+validate_bootstrap_pin() {
+  [ -n "$BOOTSTRAP_PINNED_DIGEST" ] || die "a pinned bootstrap SHA-256 is required"
+  require_sha256 "bootstrap" "$BOOTSTRAP_PINNED_DIGEST"
+  verify_digest "bootstrap" "$SCRIPT_PATH" "$BOOTSTRAP_PINNED_DIGEST"
+}
+
 validate_manifest() {
   stage "manifest-validated"
   require_sha256 "bootstrap" "$BOOTSTRAP_DIGEST"
@@ -422,6 +567,17 @@ validate_manifest() {
   require_url "core payload" "$CORE_PAYLOAD_URL"
   require_url "ngrok" "$NGROK_URL"
   require_ngrok_url "$NGROK_URL"
+  require_release_asset_url "bootstrap" "$BOOTSTRAP_URL" "bootstrap.sh"
+  require_release_asset_url "helper" "$HELPER_URL" "Mac-Orchestrator-arm64.zip"
+  require_release_asset_url "uv" "$UV_URL" "uv-arm64"
+  require_release_asset_url "core payload" "$CORE_PAYLOAD_URL" "core-payload.tar.gz"
+  if [ -n "$EXPECTED_RELEASE_VERSION" ] && [ "$PRODUCT_VERSION" != "$EXPECTED_RELEASE_VERSION" ]; then
+    die "manifest product version does not match the pinned release version"
+  fi
+  pinned_bootstrap_digest="$(echo "$BOOTSTRAP_PINNED_DIGEST" | tr '[:upper:]' '[:lower:]')"
+  manifest_bootstrap_digest="$(echo "$BOOTSTRAP_DIGEST" | tr '[:upper:]' '[:lower:]')"
+  [ "$manifest_bootstrap_digest" = "$pinned_bootstrap_digest" ] ||
+    die "manifest bootstrap digest does not match the pinned bootstrap digest"
   require_schema_range "runtime" "$RUNTIME_SCHEMA_MIN" "$RUNTIME_SCHEMA_MAX"
   require_schema_range "configuration" "$CONFIG_SCHEMA_MIN" "$CONFIG_SCHEMA_MAX"
   [ "$RUNTIME_SCHEMA_VERSION" -ge "$RUNTIME_SCHEMA_MIN" ] || die "runtime schema is older than the compatible range"
@@ -448,6 +604,7 @@ validate_platform() {
 }
 
 recover_pending_promotion() {
+  [ ! -L "$PROMOTION_MARKER" ] || return 1
   [ -f "$PROMOTION_MARKER" ] || return 0
   stage "promotion-recovery"
 
@@ -479,9 +636,16 @@ recover_pending_promotion() {
       backup_path="$2"
       had_previous="$3"
       if [ -e "$backup_path" ]; then
+        [ ! -L "$backup_path" ] || return 1
         cleanup_path "$final_path" || return 1
-        /bin/mkdir -p "$(dirname "$final_path")"
+        /bin/mkdir -p "$(dirname "$final_path")" || return 1
         /bin/mv "$backup_path" "$final_path" || return 1
+      elif [ "$had_previous" = "1" ]; then
+        if [ "$marker_phase" = "backups" ] && [ -e "$final_path" ]; then
+          [ ! -L "$final_path" ] || return 1
+        else
+          return 1
+        fi
       elif [ "$marker_phase" = "promoting" ] && [ "$had_previous" = "0" ]; then
         cleanup_path "$final_path" || return 1
       fi
@@ -490,20 +654,46 @@ recover_pending_promotion() {
     had_runtime="$(/usr/bin/awk -F= '$1 == "had_runtime" { print $2; exit }' "$PROMOTION_MARKER" 2>/dev/null || true)"
     had_app="$(/usr/bin/awk -F= '$1 == "had_app" { print $2; exit }' "$PROMOTION_MARKER" 2>/dev/null || true)"
     had_remote="$(/usr/bin/awk -F= '$1 == "had_remote" { print $2; exit }' "$PROMOTION_MARKER" 2>/dev/null || true)"
+    had_launch_agent="$(/usr/bin/awk -F= '$1 == "had_launch_agent" { print $2; exit }' "$PROMOTION_MARKER" 2>/dev/null || true)"
+    [ -n "$had_launch_agent" ] || had_launch_agent="0"
     [ "$had_runtime" = "0" ] || [ "$had_runtime" = "1" ] || return 1
     [ "$had_app" = "0" ] || [ "$had_app" = "1" ] || return 1
     [ "$had_remote" = "0" ] || [ "$had_remote" = "1" ] || return 1
+    [ "$had_launch_agent" = "0" ] || [ "$had_launch_agent" = "1" ] || return 1
     restore_path "$RUNTIME_DIR" "$BACKUP_DIR" "$had_runtime" || return 1
     restore_path "$APP_DIR" "$APP_BACKUP_DIR" "$had_app" || return 1
     restore_path "$REMOTE_DIR" "$REMOTE_BACKUP_DIR" "$had_remote" || return 1
+    if [ "$FIXTURE_MODE" != "1" ]; then
+      [ ! -L "$LAUNCH_AGENTS_DIR" ] || return 1
+      [ ! -L "$LAUNCH_AGENT_PATH" ] || return 1
+      [ ! -L "$LAUNCH_AGENT_BACKUP_PATH" ] || return 1
+      /bin/launchctl bootout "gui/$(id -u)/$LAUNCH_AGENT_LABEL" >/dev/null 2>&1 || true
+      if [ "$had_launch_agent" = "1" ]; then
+        if [ -e "$LAUNCH_AGENT_BACKUP_PATH" ]; then
+          cleanup_path "$LAUNCH_AGENT_PATH" || return 1
+          /bin/mv "$LAUNCH_AGENT_BACKUP_PATH" "$LAUNCH_AGENT_PATH" || return 1
+          /bin/chmod 600 "$LAUNCH_AGENT_PATH"
+          /bin/launchctl bootstrap "gui/$(id -u)" "$LAUNCH_AGENT_PATH" || return 1
+        elif [ "$marker_phase" != "backups" ] || [ ! -f "$LAUNCH_AGENT_PATH" ]; then
+          return 1
+        fi
+      else
+        cleanup_path "$LAUNCH_AGENT_PATH" || return 1
+      fi
+    fi
   fi
-  /bin/rm -f "$PROMOTION_MARKER"
+  /bin/rm -f "$PROMOTION_MARKER" || return 1
   PROMOTION_ACTIVE="0"
   stage "promotion-recovered"
 }
 
 prepare_directories() {
-  /bin/mkdir -p "$SUPPORT_DIR" "$INSTALL_DIR"
+  ensure_safe_directory "$SUPPORT_DIR" "support directory"
+  ensure_safe_directory "$INSTALL_DIR" "installation directory"
+  ensure_safe_directory "$REMOTE_PARENT_DIR" "remote directory"
+  if [ "$FIXTURE_MODE" != "1" ]; then
+    ensure_safe_directory "$LAUNCH_AGENTS_DIR" "LaunchAgents directory"
+  fi
   /bin/chmod 700 "$SUPPORT_DIR" "$INSTALL_DIR"
   recover_pending_promotion || die "could not recover an interrupted promotion"
   if [ "$TEST_EXIT_AFTER_RECOVERY" = "1" ]; then
@@ -588,6 +778,8 @@ prepare_release_stage() {
   stage "digests-verified"
 
   safe_archive_entries "$core_archive"
+  validate_core_archive_boundary "$core_archive"
+  safe_zip_entries "$helper_archive" "helper archive"
   "$DITTO_BIN" -x -k "$helper_archive" "$STAGING_DIR/app" || die "helper archive extraction failed"
   helper_app="$STAGING_DIR/app/Mac Orchestrator.app"
   validate_helper_bundle "$helper_app"
@@ -638,7 +830,7 @@ prepare_release_stage() {
 
   ngrok_extract_dir="$STAGING_DIR/remote/ngrok/extracted"
   /bin/mkdir -p "$ngrok_extract_dir"
-  safe_zip_entries "$ngrok_archive"
+  safe_zip_entries "$ngrok_archive" "ngrok archive"
   "$DITTO_BIN" -x -k "$ngrok_archive" "$ngrok_extract_dir" || die "ngrok archive extraction failed"
   ngrok_source="$(find "$ngrok_extract_dir" -type f -name "$NGROK_EXECUTABLE" -print | sed -n '1p')"
   [ -n "$ngrok_source" ] || die "ngrok executable is missing from the archive"
@@ -675,6 +867,22 @@ promote() {
   had_runtime="0"
   had_app="0"
   had_remote="0"
+  had_launch_agent="0"
+  [ ! -L "$RUNTIME_DIR" ] || die "runtime directory must not be a symlink"
+  [ ! -L "$APP_DIR" ] || die "app directory must not be a symlink"
+  [ ! -L "$REMOTE_DIR" ] || die "remote directory must not be a symlink"
+  if [ "$FIXTURE_MODE" != "1" ]; then
+    [ ! -L "$LAUNCH_AGENTS_DIR" ] || die "LaunchAgents directory must not be a symlink"
+    [ ! -L "$LAUNCH_AGENT_PATH" ] || die "LaunchAgent file must not be a symlink"
+    cleanup_path "$LAUNCH_AGENT_BACKUP_PATH" || die "could not clear the previous LaunchAgent backup"
+    if [ -e "$LAUNCH_AGENT_PATH" ]; then
+      [ -f "$LAUNCH_AGENT_PATH" ] || die "LaunchAgent path is not a regular file"
+      /bin/cp -p "$LAUNCH_AGENT_PATH" "$LAUNCH_AGENT_BACKUP_PATH" ||
+        die "could not preserve the previous LaunchAgent"
+      /bin/chmod 600 "$LAUNCH_AGENT_BACKUP_PATH"
+      had_launch_agent="1"
+    fi
+  fi
   if [ -e "$RUNTIME_DIR" ]; then
     cleanup_path "$BACKUP_DIR" || die "could not clear the previous runtime backup"
     had_runtime="1"
@@ -687,9 +895,7 @@ promote() {
     cleanup_path "$REMOTE_BACKUP_DIR" || die "could not clear the previous remote backup"
     had_remote="1"
   fi
-  printf 'phase=backups\nhad_runtime=%s\nhad_app=%s\nhad_remote=%s\n' \
-    "$had_runtime" "$had_app" "$had_remote" > "$PROMOTION_MARKER"
-  /bin/chmod 600 "$PROMOTION_MARKER"
+  write_promotion_marker "backups" "$had_runtime" "$had_app" "$had_remote" "$had_launch_agent"
   PROMOTION_ACTIVE="1"
 
   if [ "$had_runtime" = "1" ]; then
@@ -701,8 +907,7 @@ promote() {
   if [ "$had_remote" = "1" ]; then
     /bin/mv "$REMOTE_DIR" "$REMOTE_BACKUP_DIR" || die "could not preserve the previous remote payload"
   fi
-  printf 'phase=promoting\nhad_runtime=%s\nhad_app=%s\nhad_remote=%s\n' \
-    "$had_runtime" "$had_app" "$had_remote" > "$PROMOTION_MARKER"
+  write_promotion_marker "promoting" "$had_runtime" "$had_app" "$had_remote" "$had_launch_agent"
   /bin/mv "$STAGING_DIR/runtime" "$RUNTIME_DIR" || die "could not promote the staged runtime"
 
   if [ "$TEST_FAIL_AFTER_PROMOTION" = "1" ]; then
@@ -718,13 +923,19 @@ promote() {
   if [ -f "$REMOTE_DIR/ngrok.yml" ]; then
     /bin/chmod 600 "$REMOTE_DIR/ngrok.yml"
   fi
+  stage "promoted"
+}
+
+finalize_promotion() {
+  [ ! -L "$PROMOTION_MARKER" ] || die "promotion marker must not be a symlink"
   /bin/rm -f "$PROMOTION_MARKER"
   PROMOTION_ACTIVE="0"
-  stage "promoted"
 }
 
 write_launch_agent() {
   [ "$FIXTURE_MODE" = "1" ] && return 0
+  [ ! -L "$LAUNCH_AGENTS_DIR" ] || die "LaunchAgents directory must not be a symlink"
+  [ ! -L "$LAUNCH_AGENT_PATH" ] || die "LaunchAgent file must not be a symlink"
   /bin/mkdir -p "$LAUNCH_AGENTS_DIR"
   /bin/chmod 700 "$LAUNCH_AGENTS_DIR"
   "$PLUTIL_BIN" -create xml1 "$LAUNCH_AGENT_PATH"
@@ -738,19 +949,35 @@ write_launch_agent() {
   /bin/launchctl bootstrap "gui/$(id -u)" "$LAUNCH_AGENT_PATH"
 }
 
+wait_for_activation() {
+  [ "$FIXTURE_MODE" = "1" ] && return 0
+  helper_executable="$APP_DIR/Mac Orchestrator.app/Contents/MacOS/MacOrchestrator"
+  [ -x "$helper_executable" ] || die "installed helper executable is missing"
+  stage "local-activation-pending"
+  "$helper_executable" --wait-for-local-activation ||
+    die "installed helper did not complete the authenticated local activation probe"
+  stage "local-activation-confirmed"
+  if [ "$REMOTE_REQUESTED" = "1" ]; then
+    stage "remote-activation-pending"
+    "$helper_executable" --wait-for-remote-connector ||
+      die "remote opt-in was requested but no live HTTPS connector was confirmed"
+    stage "remote-activation-confirmed"
+  fi
+}
+
 configure_installed_helper() {
   [ "$FIXTURE_MODE" = "1" ] && return 0
   helper_executable="$APP_DIR/Mac Orchestrator.app/Contents/MacOS/MacOrchestrator"
   [ -x "$helper_executable" ] || die "installed helper executable is missing"
   if [ "$PROFILE" = "full" ]; then
-    "$helper_executable" --set-profile full --confirm-full-control ||
+    MAC_ORCHESTRATOR_SKIP_SUPERVISOR_RELOAD=1 "$helper_executable" --set-profile full --confirm-full-control ||
       die "could not persist the explicitly selected Full Control profile"
   fi
   if [ "$REMOTE_REQUESTED" = "1" ]; then
     stage "remote-authentication-required"
-    "$helper_executable" --store-ngrok-token ||
+    MAC_ORCHESTRATOR_SKIP_SUPERVISOR_RELOAD=1 "$helper_executable" --store-ngrok-token ||
       die "remote setup requires an ngrok authtoken entered through hidden input"
-    "$helper_executable" --enable-remote ||
+    MAC_ORCHESTRATOR_SKIP_SUPERVISOR_RELOAD=1 "$helper_executable" --enable-remote ||
       die "could not enable the opted-in remote connector"
   fi
 }
@@ -772,9 +999,15 @@ load_manifest_file() {
       ;;
   esac
   [ -f "$MANIFEST_FILE" ] || die "manifest file is missing"
+  [ -n "$MANIFEST_PINNED_DIGEST" ] || die "a pinned manifest SHA-256 is required"
+  require_sha256 "manifest" "$MANIFEST_PINNED_DIGEST"
+  verify_digest "manifest" "$MANIFEST_FILE" "$MANIFEST_PINNED_DIGEST"
 }
 
 main() {
+  validate_bootstrap_pin
+  ensure_safe_directory "$SUPPORT_DIR" "support directory"
+  ensure_safe_directory "$INSTALL_DIR" "installation directory"
   load_manifest_file
   read_manifest
   validate_manifest
@@ -782,7 +1015,11 @@ main() {
   prepare_directories
   prepare_stage
   promote
+  if [ "$TEST_FAIL_AFTER_POST_PROMOTION" = "1" ]; then
+    die "simulated interruption after complete promotion"
+  fi
   configure_installed_helper
+  stage "starting-helper"
   write_launch_agent
   if [ "$PROFILE" = "full" ]; then
     stage "profile-full-selected"
@@ -794,6 +1031,8 @@ main() {
   else
     stage "remote-optional"
   fi
+  wait_for_activation
+  finalize_promotion
   stage "complete"
 }
 

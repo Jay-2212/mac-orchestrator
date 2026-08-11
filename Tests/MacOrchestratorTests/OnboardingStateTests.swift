@@ -23,6 +23,16 @@ final class OnboardingStateTests: XCTestCase {
         )
     }
 
+    func testSecretOnlyLegacyMarkerClassifiesMigratedLegacyInstall() {
+        var configuration = AppConfiguration.fresh(ownerID: "legacy-secret-owner")
+        configuration.onboarding.migrationMarkers = ["legacy-secrets-v1"]
+
+        XCTAssertEqual(
+            OnboardingStateClassifier.classify(configuration),
+            .legacyMigrated
+        )
+    }
+
     func testInterruptedStateIsNotTreatedAsFresh() {
         var configuration = AppConfiguration.fresh(ownerID: "interrupted-owner")
         configuration.onboarding.phase2State = .interrupted
@@ -40,6 +50,17 @@ final class OnboardingStateTests: XCTestCase {
         XCTAssertEqual(
             OnboardingStateClassifier.classify(configuration),
             .completed
+        )
+    }
+
+    func testInterruptedStateWinsOverConflictingCompletedBoolean() {
+        var configuration = AppConfiguration.fresh(ownerID: "conflicted-owner")
+        configuration.onboarding.completed = true
+        configuration.onboarding.phase2State = .interrupted
+
+        XCTAssertEqual(
+            OnboardingStateClassifier.classify(configuration),
+            .interrupted
         )
     }
 

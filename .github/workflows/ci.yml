@@ -67,6 +67,7 @@ jobs:
             release/manifest.template.json
             script/bootstrap.sh
             script/build_release_artifacts.sh
+            script/generate_install_command.sh
             script/test_bootstrap.sh
           )
           for item in "${required_files[@]}"; do
@@ -74,10 +75,11 @@ jobs:
           done
           test -x script/bootstrap.sh
           test -x script/build_release_artifacts.sh
+          test -x script/generate_install_command.sh
           test -x script/test_bootstrap.sh
           python3 -m json.tool release/manifest.schema.json >/dev/null
           python3 -m json.tool release/manifest.template.json >/dev/null
-          bash -n script/bootstrap.sh script/build_release_artifacts.sh script/test_bootstrap.sh
+          bash -n script/bootstrap.sh script/build_release_artifacts.sh script/generate_install_command.sh script/test_bootstrap.sh
 
       - name: Verify immutable payload boundary (required)
         run: |
@@ -87,6 +89,7 @@ jobs:
             release/manifest.template.json
             script/bootstrap.sh
             script/build_release_artifacts.sh
+            script/generate_install_command.sh
           )
           if git grep -nE '(raw\.githubusercontent\.com|github\.com/[^[:space:]]+)/(main|master)(/|$)' -- "${contract_files[@]}"; then
             echo "Mutable branch URL found in the release/bootstrap contract." >&2
@@ -102,6 +105,10 @@ jobs:
           fi
           if git grep -nE '(cp|ditto|install|rsync|tar)[^[:cntrl:]]*indexer\.py' -- script/bootstrap.sh script/build_release_artifacts.sh; then
             echo "The core bootstrap/artifact path includes indexer.py." >&2
+            exit 1
+          fi
+          if git grep -nE '(release-assets/ngrok-arm64\.zip|output/ngrok-arm64\.zip|OUTPUT_DIR/ngrok)' -- script/build_release_artifacts.sh .github/workflows/release.yml; then
+            echo "The project release path must not redistribute the vendor ngrok archive." >&2
             exit 1
           fi
 

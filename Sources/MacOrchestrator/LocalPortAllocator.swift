@@ -40,7 +40,9 @@ enum LocalPortAllocator {
             process.waitUntilExit()
             return process.terminationStatus == 0
         } catch {
-            return false
+            // An unavailable ownership probe must never be treated as proof
+            // that a port is safe to claim.
+            return true
         }
     }
 }

@@ -15,12 +15,14 @@ The release contract is represented by:
   template, never a distributable concrete manifest;
 - `script/bootstrap.sh` — the Bash 3.2-compatible public installer;
 - `script/build_release_artifacts.sh` — maintainer-only helper/manifest
-  assembly; and
+  assembly;
+- `script/generate_install_command.sh` — exact release-pinned install handoff; and
 - `script/test_bootstrap.sh` — deterministic fixture coverage for validation,
   staging, recovery, and artifact boundaries.
 
-The public bootstrap command is pinned to a versioned release asset and an
-expected SHA-256. It rejects mutable branch URLs, empty or sentinel digests,
+The public bootstrap command is generated with a versioned release asset,
+bootstrap SHA-256, manifest URL, and manifest SHA-256. It rejects mutable
+branch URLs, empty, all-zero, or sentinel digests,
 unsupported arm64/macOS combinations, bad helper/uv/runtime/ngrok hashes, lock
 identity mismatches, editable metadata, missing imports, and failed local smoke
 activation. The release manifest is an integrity chain, not a project-owned
@@ -134,9 +136,11 @@ Do not create a tag first and rely on a later push workflow to find a failure.
    required job therefore tests that same immutable commit, including the
    bootstrap harness and dependency partition.
 5. The asset-assembly job runs on arm64 macOS, builds the ad-hoc helper, creates
-   the core payload, downloads the exact vendor ngrok ZIP, validates its digest
-   and original signature, and asks `script/build_release_artifacts.sh` to emit
-   `bootstrap.sh`, `manifest.json`, and the release payloads.
+   the core payload, downloads the exact vendor ngrok ZIP for temporary
+   validation, checks its digest and original signature, and asks
+   `script/build_release_artifacts.sh` to emit `bootstrap.sh`, `manifest.json`,
+   `install-command.sh`, `SHA256SUMS`, and the release payloads. The ngrok ZIP
+   itself is not copied into or uploaded as a project release asset.
 6. Publication depends on validation, required CI, and asset assembly. It
    rechecks the SHA, current remote `main`, and tag absence before uploading the
    assembled assets with GitHub's release command and `--target "$RELEASE_SHA"`.
@@ -162,6 +166,11 @@ examples, screenshots, and diagnostics must contain placeholders only. The
 helper reads the ngrok token from Keychain, passes it only in the owned child
 environment, discovers the current endpoint through `/api/endpoints`, and never
 uses the deprecated `/api/tunnels` route.
+
+The generated `install-command.sh` is the consumer-facing handoff. Its
+bootstrap and manifest URLs must remain the exact same-tag GitHub release
+assets, and its two SHA-256 values must match those assets. Do not publish a
+manual command with a branch URL or an unpinned manifest.
 
 ## Maintainer-only scripts and deferred work
 

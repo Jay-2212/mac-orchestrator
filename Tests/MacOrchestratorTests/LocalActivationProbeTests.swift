@@ -50,7 +50,14 @@ final class LocalActivationProbeTests: XCTestCase {
                 case "tools/call":
                     return .init(
                         status: 200,
-                        body: Self.rpcResult(["content": [["type": "text", "text": "ok"]]], id: 3)
+                        body: Self.rpcResult([
+                            "content": [["type": "text", "text": "ok"]],
+                            "structuredContent": [
+                                "status": "success",
+                                "gui_interaction_available": true,
+                            ],
+                            "isError": false,
+                        ], id: 3)
                     )
                 default:
                     XCTFail("Unexpected MCP request: \(payload)")
@@ -66,7 +73,11 @@ final class LocalActivationProbeTests: XCTestCase {
         configuration.protocolClasses = [ActivationProbeURLProtocol.self]
         let probe = LocalActivationProbe(session: URLSession(configuration: configuration))
 
-        try await probe.run(port: 8_000, capabilityToken: "connector-token")
+        try await probe.run(
+            port: 8_000,
+            capabilityToken: "connector-token",
+            requiresInteractiveUI: true
+        )
 
         XCTAssertEqual(ActivationProbeURLProtocol.requests.map { $0.url?.path }, [
             "/__mac_orchestrator_health",
@@ -83,6 +94,67 @@ final class LocalActivationProbeTests: XCTestCase {
             mcpRequests.dropFirst(2).first?.value(forHTTPHeaderField: "Mcp-Session-Id"),
             sessionID
         )
+    }
+
+    func testProbeRejectsManagedUIReadinessFailureWhenRequired() async throws {
+        ActivationProbeURLProtocol.handler = { request in
+            switch request.url?.path {
+            case "/__mac_orchestrator_health":
+                return .init(status: 200, body: Data(#"{"status":"ok"}"#.utf8))
+            case "/connector-token/mcp":
+                let payload = try XCTUnwrap(Self.jsonBody(from: request))
+                switch payload["method"] as? String {
+                case "initialize":
+                    return .init(
+                        status: 200,
+                        body: Self.rpcResult(["protocolVersion": "2025-06-18"], id: 1),
+                        headers: ["Mcp-Session-Id": "session-123"]
+                    )
+                case "notifications/initialized":
+                    return .init(status: 202, body: Data())
+                case "tools/list":
+                    return .init(
+                        status: 200,
+                        body: Self.rpcResult(["tools": [["name": "get_session_state"]]], id: 2)
+                    )
+                case "tools/call":
+                    return .init(
+                        status: 200,
+                        body: Self.rpcResult([
+                            "structuredContent": [
+                                "status": "success",
+                                "gui_interaction_available": false,
+                            ],
+                            "isError": false,
+                        ], id: 3)
+                    )
+                default:
+                    XCTFail("Unexpected MCP request: \(payload)")
+                    return .init(status: 500, body: Data())
+                }
+            default:
+                XCTFail("Unexpected URL: \(request.url?.absoluteString ?? "nil")")
+                return .init(status: 404, body: Data())
+            }
+        }
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ActivationProbeURLProtocol.self]
+        let probe = LocalActivationProbe(session: URLSession(configuration: configuration))
+
+        do {
+            try await probe.run(
+                port: 8_000,
+                capabilityToken: "connector-token",
+                requiresInteractiveUI: true
+            )
+            XCTFail("A managed UI readiness failure must not complete activation.")
+        } catch let error as LocalActivationProbeError {
+            XCTAssertEqual(
+                error,
+                .mcpError(method: "tools/call", message: "the managed UI requester is not ready.")
+            )
+        }
     }
 
     func testProbeRejectsHealthResponseUnlessStatusAndBodyAreExact() async throws {
@@ -137,6 +209,75 @@ final class LocalActivationProbeTests: XCTestCase {
         }
     }
 
+    func testProbeRejectsWrongCapabilityAuthentication() async throws {
+        ActivationProbeURLProtocol.handler = { request in
+            switch request.url?.path {
+            case "/__mac_orchestrator_health":
+                return .init(status: 200, body: Data(#"{"status":"ok"}"#.utf8))
+            case "/wrong-token/mcp":
+                return .init(status: 401, body: Data())
+            default:
+                XCTFail("Unexpected URL: \(request.url?.absoluteString ?? "nil")")
+                return .init(status: 404, body: Data())
+            }
+        }
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ActivationProbeURLProtocol.self]
+        let probe = LocalActivationProbe(session: URLSession(configuration: configuration))
+
+        do {
+            try await probe.run(port: 8_000, capabilityToken: "wrong-token")
+            XCTFail("A wrong capability token must not activate the runtime.")
+        } catch let error as LocalActivationProbeError {
+            XCTAssertEqual(error, .mcpRequestFailed(method: "initialize", status: 401))
+        }
+    }
+
+    func testProbeRejectsWrongSessionIdentity() async throws {
+        ActivationProbeURLProtocol.handler = { request in
+            switch request.url?.path {
+            case "/__mac_orchestrator_health":
+                return .init(status: 200, body: Data(#"{"status":"ok"}"#.utf8))
+            case "/connector-token/mcp":
+                let payload = try XCTUnwrap(Self.jsonBody(from: request))
+                switch payload["method"] as? String {
+                case "initialize":
+                    return .init(
+                        status: 200,
+                        body: Self.rpcResult(["protocolVersion": "2025-06-18"], id: 1),
+                        headers: ["Mcp-Session-Id": "session-123"]
+                    )
+                case "notifications/initialized":
+                    return .init(status: 202, body: Data())
+                case "tools/list":
+                    XCTAssertEqual(
+                        request.value(forHTTPHeaderField: "Mcp-Session-Id"),
+                        "session-123"
+                    )
+                    return .init(status: 409, body: Data())
+                default:
+                    XCTFail("Unexpected MCP request: \(payload)")
+                    return .init(status: 500, body: Data())
+                }
+            default:
+                XCTFail("Unexpected URL: \(request.url?.absoluteString ?? "nil")")
+                return .init(status: 404, body: Data())
+            }
+        }
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ActivationProbeURLProtocol.self]
+        let probe = LocalActivationProbe(session: URLSession(configuration: configuration))
+
+        do {
+            try await probe.run(port: 8_000, capabilityToken: "connector-token")
+            XCTFail("A wrong session identity must not activate the runtime.")
+        } catch let error as LocalActivationProbeError {
+            XCTAssertEqual(error, .mcpRequestFailed(method: "tools/list", status: 409))
+        }
+    }
+
     func testProbeRequiresSafeSessionTool() async throws {
         ActivationProbeURLProtocol.handler = { request in
             switch request.url?.path {
@@ -177,6 +318,112 @@ final class LocalActivationProbeTests: XCTestCase {
             XCTFail("The safe session tool is required for activation.")
         } catch let error as LocalActivationProbeError {
             XCTAssertEqual(error, .mcpResponseInvalid(method: "tools/list"))
+        }
+    }
+
+    func testProbeRejectsApplicationLevelToolFailure() async throws {
+        ActivationProbeURLProtocol.handler = { request in
+            switch request.url?.path {
+            case "/__mac_orchestrator_health":
+                return .init(status: 200, body: Data(#"{"status":"ok"}"#.utf8))
+            case "/connector-token/mcp":
+                let payload = try XCTUnwrap(Self.jsonBody(from: request))
+                switch payload["method"] as? String {
+                case "initialize":
+                    return .init(
+                        status: 200,
+                        body: Self.rpcResult(["protocolVersion": "2025-06-18"], id: 1),
+                        headers: ["Mcp-Session-Id": "session-123"]
+                    )
+                case "notifications/initialized":
+                    return .init(status: 202, body: Data())
+                case "tools/list":
+                    return .init(
+                        status: 200,
+                        body: Self.rpcResult(["tools": [["name": "get_session_state"]]], id: 2)
+                    )
+                case "tools/call":
+                    return .init(
+                        status: 200,
+                        body: Self.rpcResult([
+                            "content": [["type": "text", "text": "permission denied"]],
+                            "structuredContent": ["status": "error", "error_code": "PERMISSION"],
+                            "isError": true,
+                        ], id: 3)
+                    )
+                default:
+                    XCTFail("Unexpected MCP request: \(payload)")
+                    return .init(status: 500, body: Data())
+                }
+            default:
+                XCTFail("Unexpected URL: \(request.url?.absoluteString ?? "nil")")
+                return .init(status: 404, body: Data())
+            }
+        }
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ActivationProbeURLProtocol.self]
+        let probe = LocalActivationProbe(session: URLSession(configuration: configuration))
+
+        do {
+            try await probe.run(port: 8_000, capabilityToken: "connector-token")
+            XCTFail("An application-level tool failure must not activate the runtime.")
+        } catch let error as LocalActivationProbeError {
+            XCTAssertEqual(
+                error,
+                .mcpError(
+                    method: "tools/call",
+                    message: "get_session_state returned an application-level error."
+                )
+            )
+        }
+    }
+
+    func testProbeRejectsMalformedToolSuccessPayload() async throws {
+        ActivationProbeURLProtocol.handler = { request in
+            switch request.url?.path {
+            case "/__mac_orchestrator_health":
+                return .init(status: 200, body: Data(#"{"status":"ok"}"#.utf8))
+            case "/connector-token/mcp":
+                let payload = try XCTUnwrap(Self.jsonBody(from: request))
+                switch payload["method"] as? String {
+                case "initialize":
+                    return .init(
+                        status: 200,
+                        body: Self.rpcResult(["protocolVersion": "2025-06-18"], id: 1),
+                        headers: ["Mcp-Session-Id": "session-123"]
+                    )
+                case "notifications/initialized":
+                    return .init(status: 202, body: Data())
+                case "tools/list":
+                    return .init(
+                        status: 200,
+                        body: Self.rpcResult(["tools": [["name": "get_session_state"]]], id: 2)
+                    )
+                case "tools/call":
+                    return .init(
+                        status: 200,
+                        body: Self.rpcResult(["content": []], id: 3)
+                    )
+                default:
+                    XCTFail("Unexpected MCP request: \(payload)")
+                    return .init(status: 500, body: Data())
+                }
+            default:
+                XCTFail("Unexpected URL: \(request.url?.absoluteString ?? "nil")")
+                return .init(status: 404, body: Data())
+            }
+        }
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ActivationProbeURLProtocol.self]
+        let probe = LocalActivationProbe(session: URLSession(configuration: configuration))
+
+        do {
+            try await probe.run(port: 8_000, capabilityToken: "connector-token")
+            XCTFail("A malformed tool result must not activate the runtime.")
+        } catch let error as LocalActivationProbeError {
+            XCTAssertEqual(error, .mcpResponseInvalid(method: "tools/call"))
         }
     }
 

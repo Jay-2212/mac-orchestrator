@@ -933,6 +933,21 @@ def _macro_actions_text(snapshot: CapabilitySnapshot) -> str:
     )
 
 
+def _local_search_scope(snapshot: CapabilitySnapshot) -> str:
+    return (
+        "an approved directory"
+        if snapshot.control_profile == "guided"
+        else "the directory you want to search"
+    )
+
+
+def _local_search_instruction(snapshot: CapabilitySnapshot) -> str:
+    return (
+        "- Use Local Pattern Search (smart_search()) for regex or exact content "
+        f"within {_local_search_scope(snapshot)}."
+    )
+
+
 def build_server_instructions(snapshot: CapabilitySnapshot) -> str:
     """Generate agent guidance from exactly the snapshot used for registration."""
     lines = [
@@ -959,7 +974,7 @@ def build_server_instructions(snapshot: CapabilitySnapshot) -> str:
             "",
             "LOCAL SEARCH:",
             "- Use find_file() for Spotlight keyword/exact-content search.",
-            "- Use Local Pattern Search (smart_search()) for regex or exact content within an approved directory.",
+            _local_search_instruction(snapshot),
             "- Use list_directory() for browsing by date or size.",
         ])
     if snapshot.is_ready("meridian.search"):
@@ -1008,11 +1023,11 @@ get_screen_size() returns logical dimensions for mouse_action(). Positions from
 get_ui_tree() and OCR are already in logical space. Do not mix Retina pixel values
 with logical coordinates."""
     if snapshot.is_ready("mac.files.read"):
-        search_text = """find_file() uses Spotlight keyword matching (mdfind), not semantic search.
+        search_text = f"""find_file() uses Spotlight keyword matching (mdfind), not semantic search.
 
 Use filename/content keywords or Spotlight metadata queries such as "kind:pdf".
 Use list_directory() for browsing by date or size and Local Pattern Search
-(smart_search()) for regex content search inside an approved directory."""
+(smart_search()) for regex content search inside {_local_search_scope(snapshot)}."""
         if snapshot.is_ready("meridian.search"):
             search_text += "\nUse vector_search() for semantic search when the registered integration is ready."
         topics["find_file_query_syntax"] = search_text

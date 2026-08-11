@@ -2,8 +2,8 @@ import Foundation
 import XCTest
 @testable import MacOrchestrator
 
-@MainActor
 final class RuntimeBootstrapTests: XCTestCase {
+    @MainActor
     func testPrepareRunsBothMigrationsBeforeReadinessAndBuildsOneExactSnapshot() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("runtime-bootstrap-\(UUID().uuidString)", isDirectory: true)
@@ -58,7 +58,7 @@ final class RuntimeBootstrapTests: XCTestCase {
         let encoded = try XCTUnwrap(
             contract.environment["MAC_ORCHESTRATOR_CAPABILITY_SNAPSHOT"]
         )
-        try XCTAssertEqual(
+        XCTAssertEqual(
             try CapabilitySnapshotCodec.decode(Data(encoded.utf8)),
             contract.capabilitySnapshot
         )

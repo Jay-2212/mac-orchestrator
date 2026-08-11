@@ -2,8 +2,8 @@ import Foundation
 import XCTest
 @testable import MacOrchestrator
 
-@MainActor
 final class CapabilityReadinessCoordinatorTests: XCTestCase {
+    @MainActor
     func testGuidedAndFullLocalReadinessUsesFrozenProfilePolicy() async throws {
         let runtime = try makeRuntime()
         let coordinator = makeCoordinator(
@@ -43,6 +43,7 @@ final class CapabilityReadinessCoordinatorTests: XCTestCase {
         XCTAssertTrue(full.shellReady)
     }
 
+    @MainActor
     func testOCRRequiresScreenRecordingAndExistingLocalRuntimePayload() async throws {
         let runtime = try makeRuntime()
         let fileManager = ReadinessFileManager(
@@ -83,6 +84,7 @@ final class CapabilityReadinessCoordinatorTests: XCTestCase {
         XCTAssertFalse(withoutScreenRecording.screenOcrReady)
     }
 
+    @MainActor
     func testTelegramReadinessValidatesIdentityAndChatWithoutSending() async throws {
         TelegramReadinessURLProtocol.reset(mode: .success)
         let session = makeTelegramSession()
@@ -111,6 +113,7 @@ final class CapabilityReadinessCoordinatorTests: XCTestCase {
         XCTAssertFalse(TelegramReadinessURLProtocol.endpointNames.contains("sendDocument"))
     }
 
+    @MainActor
     func testTelegramProbeFailureIsNotReadyAndDoesNotExposeToken() async throws {
         TelegramReadinessURLProtocol.reset(mode: .botIdentityMismatch)
         let coordinator = CapabilityReadinessCoordinator(
@@ -136,6 +139,7 @@ final class CapabilityReadinessCoordinatorTests: XCTestCase {
         XCTAssertFalse(String(reflecting: facts).contains(secret))
     }
 
+    @MainActor
     func testTelegramChatIdentityMismatchIsNotReady() async throws {
         TelegramReadinessURLProtocol.reset(mode: .chatIdentityMismatch)
         let coordinator = CapabilityReadinessCoordinator(
@@ -159,6 +163,7 @@ final class CapabilityReadinessCoordinatorTests: XCTestCase {
         XCTAssertFalse(facts.telegramReady)
     }
 
+    @MainActor
     func testDisabledTelegramDoesNotPerformNetworkValidation() async throws {
         TelegramReadinessURLProtocol.reset(mode: .success)
         let coordinator = CapabilityReadinessCoordinator(
@@ -182,6 +187,7 @@ final class CapabilityReadinessCoordinatorTests: XCTestCase {
         XCTAssertTrue(TelegramReadinessURLProtocol.endpointNames.isEmpty)
     }
 
+    @MainActor
     func testMeridianAndRemoteConnectorRemainNotReadyInProductionFacts() async throws {
         let client = ReadinessKeychainClient(values: [
             KeychainItem.meridianIngestToken(account: NSUserName()).key: "synthetic-ingest",
@@ -211,6 +217,7 @@ final class CapabilityReadinessCoordinatorTests: XCTestCase {
         XCTAssertFalse(facts.remoteConnectorReady)
     }
 
+    @MainActor
     private func makeCoordinator(
         permissions: CapabilityPermissionChecking,
         fileManager: FileManager = .default
@@ -228,6 +235,7 @@ final class CapabilityReadinessCoordinatorTests: XCTestCase {
         return URLSession(configuration: configuration)
     }
 
+    @MainActor
     private func makeRuntime() throws -> URL {
         let runtime = FileManager.default.temporaryDirectory
             .appendingPathComponent("MacOrchestratorReadinessTests-" + UUID().uuidString, isDirectory: true)
@@ -256,6 +264,7 @@ final class CapabilityReadinessCoordinatorTests: XCTestCase {
         return runtime
     }
 
+    @MainActor
     private func installOCRPayload(using fileManager: FileManager) throws {
         let models = fileManager.homeDirectoryForCurrentUser
             .appendingPathComponent(".EasyOCR/model", isDirectory: true)

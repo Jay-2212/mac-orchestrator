@@ -52,6 +52,13 @@ LOCAL_SEARCH_INSTRUCTIONS = (
     "- Use Local Pattern Search (smart_search()) for regex or exact content within an approved directory.",
     "- Use list_directory() for browsing by date or size.",
 )
+FULL_LOCAL_SEARCH_INSTRUCTIONS = (
+    "",
+    "LOCAL SEARCH:",
+    "- Use find_file() for Spotlight keyword/exact-content search.",
+    "- Use Local Pattern Search (smart_search()) for regex or exact content within the directory you want to search.",
+    "- Use list_directory() for browsing by date or size.",
+)
 MERIDIAN_INSTRUCTION = (
     "",
     "- Use vector_search() for semantic search only when it is registered.",
@@ -260,7 +267,7 @@ class CapabilityInventoryTests(unittest.TestCase):
             UI_INSTRUCTION_START,
             OCR_INSTRUCTION,
             MACRO_INSTRUCTION,
-            LOCAL_SEARCH_INSTRUCTIONS,
+            FULL_LOCAL_SEARCH_INSTRUCTIONS,
             SHELL_INSTRUCTION,
             WRITE_INSTRUCTION,
             INSTRUCTION_FOOTER,
@@ -273,6 +280,16 @@ class CapabilityInventoryTests(unittest.TestCase):
         self.assertIn("execute_macro", names)
         self.assertNotIn("send_file_to_telegram", names)
         self.assertNotIn("vector_search", names)
+
+        find_file_guide = automac_mcp.describe_for_snapshot(
+            snapshot,
+            "find_file_query_syntax",
+        )
+        self.assertIn(
+            "(smart_search()) for regex content search inside the directory you want to search.",
+            find_file_guide,
+        )
+        self.assertNotIn("approved directory", find_file_guide)
 
         descriptions = tool_map(server)
         macro_description = descriptions["execute_macro"].description or ""
@@ -422,7 +439,7 @@ class CapabilityInventoryTests(unittest.TestCase):
             UI_INSTRUCTION_START,
             OCR_INSTRUCTION,
             MACRO_INSTRUCTION,
-            LOCAL_SEARCH_INSTRUCTIONS,
+            FULL_LOCAL_SEARCH_INSTRUCTIONS,
             MERIDIAN_INSTRUCTION,
             SHELL_INSTRUCTION,
             WRITE_INSTRUCTION,

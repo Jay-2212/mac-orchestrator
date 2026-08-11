@@ -114,7 +114,7 @@ final class RuntimeLaunchContractTests: XCTestCase {
         let encodedSnapshot = try XCTUnwrap(
             contract.environment["MAC_ORCHESTRATOR_CAPABILITY_SNAPSHOT"]
         )
-        try XCTAssertEqual(
+        XCTAssertEqual(
             try CapabilitySnapshotCodec.decode(Data(encodedSnapshot.utf8)),
             capabilitySnapshot
         )

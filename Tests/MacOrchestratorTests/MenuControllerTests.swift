@@ -1,8 +1,8 @@
 import XCTest
 @testable import MacOrchestrator
 
-@MainActor
 final class MenuControllerTests: XCTestCase {
+    @MainActor
     func testRuntimeStatusTitlesExposeProfileReadinessErrorAndClientRefresh() {
         let snapshot = ServiceSnapshot(
             server: .running,

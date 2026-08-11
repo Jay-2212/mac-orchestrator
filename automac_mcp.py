@@ -66,9 +66,7 @@ CAPABILITY_IDS = (
 )
 _CAPABILITY_ID_SET = frozenset(CAPABILITY_IDS)
 _CONTROL_PROFILES = frozenset({"guided", "full"})
-_HEALTH_VALUES = frozenset({
-    "ready", "disabled", "unconfigured", "not_ready", "degraded", "error", "unknown"
-})
+_HEALTH_VALUES = frozenset({"ready", "disabled", "degraded", "unavailable"})
 
 
 class CapabilitySnapshotError(ValueError):
@@ -236,14 +234,21 @@ class CapabilitySnapshot:
         ):
             raise CapabilitySnapshotError("policy.approvedFileRoots must be a list of paths")
         roots: list[Path] = []
+        seen_roots: set[Path] = set()
         for raw_root in raw_roots:
-            expanded = os.path.expanduser(raw_root)
-            root = Path(expanded)
-            if not root.is_absolute():
+            root = Path(raw_root)
+            if (
+                raw_root.startswith("~")
+                or not root.is_absolute()
+                or os.path.normpath(raw_root) != raw_root
+            ):
                 raise CapabilitySnapshotError(
-                    "policy.approvedFileRoots must contain absolute or ~-expanded paths"
+                    "policy.approvedFileRoots must contain normalized absolute paths"
                 )
-            roots.append(root.resolve(strict=False))
+            canonical_root = root.resolve(strict=False)
+            if canonical_root not in seen_roots:
+                seen_roots.add(canonical_root)
+                roots.append(canonical_root)
         clipboard_mutation = raw_policy.get("clipboardMutation")
         if not isinstance(clipboard_mutation, bool):
             raise CapabilitySnapshotError("policy.clipboardMutation must be a boolean")
@@ -2007,9 +2012,9 @@ def get_screen_text(screenshot: bool = False) -> Dict[str, Any]:
     Args:
         screenshot: If False (default), run OCR and return text elements with
                    coordinates. If True, skip OCR — capture a screenshot instead,
-                   save it to ~/Desktop/orchestrator_screenshot.png, and return
-                   the file path. Use screenshots when you need visual context
-                   that OCR cannot capture (charts, images, custom UI graphics).
+                   save it to a timestamped file on the Desktop, and return the
+                   file path. Use screenshots when you need visual context that
+                   OCR cannot capture (charts, images, custom UI graphics).
 
     Returns for screenshot=False: text_elements list with position data, full_text string.
     Returns for screenshot=True:  screenshot_path, width, height.
@@ -2023,8 +2028,10 @@ def get_screen_text(screenshot: bool = False) -> Dict[str, Any]:
         return denied
     screenshot_path: Optional[Path] = None
     if screenshot:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        requested_path = Path.home() / "Desktop" / f"orchestrator_screenshot_{ts}.png"
         screenshot_path, path_error = _path_guard(
-            os.path.expanduser("~/Desktop/orchestrator_screenshot.png"),
+            str(requested_path),
             "mac.files.write",
             "get_screen_text screenshot",
         )
@@ -2034,11 +2041,7 @@ def get_screen_text(screenshot: bool = False) -> Dict[str, Any]:
         ss = pyautogui.screenshot()
 
         if screenshot:
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            save_path = str(
-                (screenshot_path.parent if screenshot_path else Path.home() / "Desktop")
-                / f"orchestrator_screenshot_{ts}.png"
-            )
+            save_path = str(screenshot_path)
             ss.save(save_path)
             lw, lh = pyautogui.size()
             return _ok(
@@ -2707,9 +2710,9 @@ def send_file_to_telegram(file_path: str, caption: str = "") -> Dict[str, Any]:
             resp = requests.post(url, data=data, files={"document": f}, timeout=60)
         if resp.status_code == 200:
             return _ok(f"Sent '{os.path.basename(p)}' to Telegram")
-        return _fail(f"Telegram API error ({resp.status_code}): {resp.text}")
-    except Exception as e:
-        return _fail(f"Failed: {e}")
+        return _fail(f"Telegram API error ({resp.status_code}).")
+    except Exception:
+        return _fail("Telegram request failed.")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

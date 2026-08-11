@@ -52,7 +52,7 @@ final class CapabilityRegistryTests: XCTestCase {
         XCTAssertTrue(allowed.capabilities["mac.clipboard.write"]!.ready)
     }
 
-    func testFullControlStillRequiresExplicitDesiredStateAndApprovedRoots() {
+    func testFullControlRequiresExplicitDesiredStateButNotApprovedRoots() {
         var configuration = AppConfiguration.fresh(ownerID: "owner-1")
         configuration.controlProfile = .full
         configuration.desiredCapabilities["mac.shell"] = true
@@ -61,11 +61,45 @@ final class CapabilityRegistryTests: XCTestCase {
 
         let withoutRoots = CapabilityRegistry(configuration: configuration, facts: readyFacts()).snapshot()
         XCTAssertTrue(withoutRoots.capabilities["mac.shell"]!.ready)
-        XCTAssertFalse(withoutRoots.capabilities["mac.files.write"]!.ready)
+        XCTAssertTrue(withoutRoots.capabilities["mac.files.read"]!.ready)
+        XCTAssertTrue(withoutRoots.capabilities["mac.files.write"]!.ready)
+    }
+
+    func testGuidedFileReadRequiresAnApprovedRoot() {
+        var configuration = AppConfiguration.fresh(ownerID: "owner-1")
+        configuration.desiredCapabilities["mac.files.read"] = true
+
+        let withoutRoots = CapabilityRegistry(configuration: configuration, facts: readyFacts()).snapshot()
+        XCTAssertFalse(withoutRoots.capabilities["mac.files.read"]!.configured)
+        XCTAssertFalse(withoutRoots.capabilities["mac.files.read"]!.ready)
 
         configuration.approvedFileRoots = ["/tmp/approved"]
         let withRoots = CapabilityRegistry(configuration: configuration, facts: readyFacts()).snapshot()
-        XCTAssertTrue(withRoots.capabilities["mac.files.write"]!.ready)
+        XCTAssertTrue(withRoots.capabilities["mac.files.read"]!.ready)
+    }
+
+    func testSnapshotPolicyEmitsOnlyCanonicalDeduplicatedRoots() {
+        var configuration = AppConfiguration.fresh(ownerID: "owner-1")
+        configuration.approvedFileRoots = [
+            "/tmp/mac-orchestrator/approved",
+            "/tmp/mac-orchestrator/nested/../approved/",
+        ]
+
+        let snapshot = CapabilityRegistry(configuration: configuration, facts: readyFacts()).snapshot()
+
+        XCTAssertEqual(snapshot.policy.approvedFileRoots, ["/tmp/mac-orchestrator/approved"])
+    }
+
+    func testInvalidRawRootCannotReachSnapshotOrEnableGuidedRead() {
+        var configuration = AppConfiguration.fresh(ownerID: "owner-1")
+        configuration.desiredCapabilities["mac.files.read"] = true
+        configuration.approvedFileRoots = ["relative/path"]
+
+        let snapshot = CapabilityRegistry(configuration: configuration, facts: readyFacts()).snapshot()
+
+        XCTAssertTrue(snapshot.policy.approvedFileRoots.isEmpty)
+        XCTAssertFalse(snapshot.capabilities["mac.files.read"]!.configured)
+        XCTAssertFalse(snapshot.capabilities["mac.files.read"]!.ready)
     }
 
     func testMeridianTelegramCannotOutrunMeridianSearch() {
@@ -142,6 +176,46 @@ final class CapabilityRegistryTests: XCTestCase {
         XCTAssertThrowsError(try CapabilitySnapshotCodec.decode(data)) { error in
             XCTAssertEqual(error as? CapabilitySnapshotError, .unsupportedSchema(99))
         }
+    }
+
+    func testSharedSchemaV1FixtureDecodesAndRoundTripsWithCanonicalHealthVocabulary() throws {
+        let fixtureURL = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Fixtures/capability_snapshot_v1.json")
+        let fixture = try Data(contentsOf: fixtureURL)
+
+        let decoded = try CapabilitySnapshotCodec.decode(fixture)
+
+        XCTAssertEqual(decoded.snapshotSchemaVersion, 1)
+        XCTAssertEqual(decoded.configGeneration, 7)
+        XCTAssertEqual(decoded.controlProfile, .guided)
+        XCTAssertEqual(Set(decoded.capabilities.keys), Set(CapabilityRegistry.capabilityIDs))
+        XCTAssertEqual(
+            Set(decoded.capabilities.values.map { $0.health.rawValue }),
+            Set(["ready", "disabled", "degraded", "unavailable"])
+        )
+        XCTAssertEqual(decoded.policy.approvedFileRoots, ["/tmp/mac-orchestrator-fixture/approved"])
+        XCTAssertEqual(
+            try CapabilitySnapshotCodec.decode(CapabilitySnapshotCodec.encode(decoded)),
+            decoded
+        )
+    }
+
+    func testUnknownSchemaV1HealthValueIsRejected() throws {
+        let fixtureURL = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Fixtures/capability_snapshot_v1.json")
+        let fixture = String(decoding: try Data(contentsOf: fixtureURL), as: UTF8.self)
+        let unknown = fixture.replacingOccurrences(
+            of: "\"health\": \"ready\"",
+            with: "\"health\": \"future-health\"",
+            options: [],
+            range: fixture.range(of: "\"health\": \"ready\"")
+        )
+
+        XCTAssertThrowsError(try CapabilitySnapshotCodec.decode(Data(unknown.utf8)))
     }
 
     private func readyFacts(

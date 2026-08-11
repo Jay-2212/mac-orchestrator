@@ -46,4 +46,27 @@ final class ConfigurationTests: XCTestCase {
         XCTAssertEqual(decoded.localMCPPort, 9876)
         XCTAssertEqual(decoded.integration.meridianDeploymentURL, "https://meridian.example")
     }
+
+    func testApprovedRootsRejectBlankRelativeAndTildePaths() {
+        for invalidRoot in ["   ", "relative/path", "~/Documents"] {
+            var configuration = AppConfiguration.fresh(ownerID: "owner-1")
+            configuration.approvedFileRoots = [invalidRoot]
+
+            XCTAssertThrowsError(try configuration.validated(), "Expected rejection for \(invalidRoot)") {
+                XCTAssertNotNil($0 as? ConfigurationValidationError)
+            }
+        }
+    }
+
+    func testApprovedRootsAreLexicallyNormalizedAndDeduplicated() throws {
+        var configuration = AppConfiguration.fresh(ownerID: "owner-1")
+        configuration.approvedFileRoots = [
+            "/tmp/mac-orchestrator/approved",
+            "/tmp/mac-orchestrator/nested/../approved/",
+        ]
+
+        let validated = try configuration.validated()
+
+        XCTAssertEqual(validated.approvedFileRoots, ["/tmp/mac-orchestrator/approved"])
+    }
 }

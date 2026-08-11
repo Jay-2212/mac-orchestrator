@@ -281,7 +281,7 @@ struct CapabilityRegistry {
             controlProfile: configuration.controlProfile,
             capabilities: resolved,
             policy: CapabilityPolicySnapshot(
-                approvedFileRoots: Array(Set(configuration.approvedFileRoots)).sorted(),
+                approvedFileRoots: normalizedApprovedFileRoots,
                 clipboardMutation: configuration.policy.clipboardMutation
             )
         )
@@ -308,16 +308,16 @@ struct CapabilityRegistry {
     private func configurationState(for capabilityID: String) -> (Bool, String?) {
         switch capabilityID {
         case "mac.files.read":
-            guard !configuration.approvedFileRoots.isEmpty else {
+            if configuration.controlProfile == .full {
+                return (true, nil)
+            }
+            guard !normalizedApprovedFileRoots.isEmpty else {
                 return (false, "Approve at least one file root before enabling file access.")
             }
             return (true, nil)
         case "mac.files.write":
             guard configuration.controlProfile == .full else {
-                return (false, "File writes require Full Control and an approved file root.")
-            }
-            guard !configuration.approvedFileRoots.isEmpty else {
-                return (false, "Approve at least one file root before enabling file writes.")
+                return (false, "File writes require Full Control.")
             }
             return (true, nil)
         case "mac.shell":
@@ -357,6 +357,10 @@ struct CapabilityRegistry {
         default:
             return (true, nil)
         }
+    }
+
+    private var normalizedApprovedFileRoots: [String] {
+        (try? ApprovedFileRootNormalizer.normalize(configuration.approvedFileRoots)) ?? []
     }
 
     private func readinessFact(for capabilityID: String) -> Bool {

@@ -20,10 +20,8 @@ final class MenuController: NSObject {
 
     private func rebuildMenu() {
         let menu = NSMenu()
-        menu.addItem(label("Server: \(snapshot.server.rawValue)"))
-        menu.addItem(label("Tunnel: \(snapshot.tunnel.rawValue)"))
-        if let error = snapshot.error {
-            menu.addItem(label("Error: \(String(error.prefix(70)))"))
+        for title in Self.runtimeStatusTitles(for: snapshot) {
+            menu.addItem(label(title))
         }
         if let url = snapshot.connectorURL {
             menu.addItem(label("URL: \(url.host ?? "Available")"))
@@ -63,6 +61,27 @@ final class MenuController: NSObject {
             color = .systemGray
         }
         statusItem.button?.contentTintColor = color
+    }
+
+    static func runtimeStatusTitles(for snapshot: ServiceSnapshot) -> [String] {
+        var titles = [
+            "Server: \(snapshot.server.rawValue)",
+            "Tunnel: \(snapshot.tunnel.rawValue)",
+        ]
+        if let profile = snapshot.controlProfile {
+            let profileName = profile == .guided ? "Guided Control" : "Full Control"
+            titles.append("Profile: \(profileName)")
+            titles.append(
+                "Capabilities ready: \(snapshot.readyCapabilityCount)/\(snapshot.totalCapabilityCount)"
+            )
+        }
+        if let error = snapshot.error {
+            titles.append("Error: \(String(error.prefix(70)))")
+        }
+        if snapshot.clientRefreshRequired {
+            titles.append("MCP client refresh/reconnection required")
+        }
+        return titles
     }
 
     private func label(_ title: String) -> NSMenuItem {

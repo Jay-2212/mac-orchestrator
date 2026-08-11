@@ -159,6 +159,7 @@ enum ConfigurationValidationError: Error, Equatable, LocalizedError, Sendable {
     case invalidPort(Int)
     case blankOwnerID
     case invalidMeridianURL
+    case invalidApprovedFileRoot(String)
 
     var errorDescription: String? {
         switch self {
@@ -172,7 +173,31 @@ enum ConfigurationValidationError: Error, Equatable, LocalizedError, Sendable {
             return "Configuration owner identity is missing."
         case .invalidMeridianURL:
             return "Meridian deployment URL must use http:// or https://."
+        case let .invalidApprovedFileRoot(root):
+            return "Approved file root must be a nonblank normalized absolute path: " + root
         }
+    }
+}
+
+enum ApprovedFileRootNormalizer {
+    static func normalize(_ roots: [String]) throws -> [String] {
+        var normalizedRoots = Set<String>()
+        for root in roots {
+            let trimmed = root.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty,
+                  !trimmed.hasPrefix("~"),
+                  trimmed.hasPrefix("/"),
+                  !trimmed.contains("\0") else {
+                throw ConfigurationValidationError.invalidApprovedFileRoot(root)
+            }
+
+            let normalized = (trimmed as NSString).standardizingPath
+            guard normalized.hasPrefix("/"), !normalized.hasPrefix("~") else {
+                throw ConfigurationValidationError.invalidApprovedFileRoot(root)
+            }
+            normalizedRoots.insert(normalized)
+        }
+        return normalizedRoots.sorted()
     }
 }
 
@@ -306,6 +331,8 @@ struct AppConfiguration: Codable, Equatable, Sendable {
         } else if integration.meridianDeploymentURL != nil {
             throw ConfigurationValidationError.invalidMeridianURL
         }
-        return self
+        var normalized = self
+        normalized.approvedFileRoots = try ApprovedFileRootNormalizer.normalize(approvedFileRoots)
+        return normalized
     }
 }

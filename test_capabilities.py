@@ -25,6 +25,57 @@ import automac_mcp
 
 CAPABILITY_IDS = tuple(automac_mcp.CAPABILITY_IDS)
 
+INSTRUCTION_PREAMBLE = (
+    "Mac Orchestrator gives you direct control of this macOS desktop.",
+    "",
+    "START HERE:",
+    "- get_capabilities() — inspect the current capability snapshot and policy.",
+    "- get_session_state() — inspect session and permissions before UI work.",
+    "- describe(topic=...) — request the detailed guide for an enabled tool group.",
+)
+UI_INSTRUCTION_START = (
+    "",
+    "UI INSPECTION:",
+    "- Prefer get_ui_tree() and its stable refs over coordinate guessing.",
+    "- Use get_screen_layout() for a cheap window survey, then perform_ui_action(ref=...) when a ref exists.",
+)
+OCR_INSTRUCTION = (
+    "- Use get_screen_text() as the OCR fallback for custom-drawn content.",
+)
+MACRO_INSTRUCTION = (
+    "- Batch tightly related safe UI actions with execute_macro() when appropriate.",
+)
+LOCAL_SEARCH_INSTRUCTIONS = (
+    "",
+    "LOCAL SEARCH:",
+    "- Use find_file() for Spotlight keyword/exact-content search.",
+    "- Use Local Pattern Search (smart_search()) for regex or exact content within an approved directory.",
+    "- Use list_directory() for browsing by date or size.",
+)
+MERIDIAN_INSTRUCTION = (
+    "",
+    "- Use vector_search() for semantic search only when it is registered.",
+)
+SHELL_INSTRUCTION = (
+    "",
+    "- Use run_terminal_command() only for an explicit task; use capability diagnostics rather than shell repair.",
+)
+WRITE_INSTRUCTION = (
+    "- File writes are available only within the current policy boundary.",
+)
+UI_DISABLED_INSTRUCTION = (
+    "",
+    "UI operation is not enabled in this snapshot. Ask the user to open Mac Orchestrator if it is needed.",
+)
+INSTRUCTION_FOOTER = (
+    "",
+    "Disabled integrations are configured by the user through Mac Orchestrator; do not edit secrets or start services yourself.",
+)
+
+
+def exact_instructions(*sections):
+    return "\n".join(line for section in sections for line in section)
+
 
 def snapshot_document(
     enabled=(),
@@ -81,6 +132,24 @@ def tool_map(server):
 
 
 class CapabilityInventoryTests(unittest.TestCase):
+    def assert_surface(
+        self,
+        snapshot,
+        expected_tools,
+        expected_instructions,
+        secrets=None,
+    ):
+        server = automac_mcp.build_mcp(snapshot, secrets)
+        names = tool_names(server)
+        self.assertEqual(names, list(expected_tools))
+        self.assertEqual(len(names), len(set(names)))
+        self.assertEqual(server._mcp_server.instructions, expected_instructions)
+        self.assertEqual(
+            automac_mcp.describe_for_snapshot(snapshot, "overview"),
+            expected_instructions,
+        )
+        return server
+
     def test_guided_inventory_hides_unready_groups_and_guidance(self):
         snapshot = make_snapshot(
             ["mac.ui", "mac.files.read"],
@@ -89,12 +158,12 @@ class CapabilityInventoryTests(unittest.TestCase):
                 "mac.shell": "Shell is not approved",
             },
         )
-        server = automac_mcp.build_mcp(snapshot)
-        names = tool_names(server)
-        expected = {
+        expected = (
             "describe",
             "get_capabilities",
             "get_session_state",
+            "play_sound_for_user_prompt",
+            "clipboard",
             "get_available_apps",
             "get_screen_size",
             "get_screen_layout",
@@ -110,11 +179,16 @@ class CapabilityInventoryTests(unittest.TestCase):
             "read_file",
             "list_directory",
             "smart_search",
-            "play_sound_for_user_prompt",
-            "clipboard",
-        }
-        self.assertEqual(set(names), expected)
-        self.assertEqual(len(names), len(set(names)))
+        )
+        expected_instructions = exact_instructions(
+            INSTRUCTION_PREAMBLE,
+            UI_INSTRUCTION_START,
+            MACRO_INSTRUCTION,
+            LOCAL_SEARCH_INSTRUCTIONS,
+            INSTRUCTION_FOOTER,
+        )
+        server = self.assert_surface(snapshot, expected, expected_instructions)
+        names = tool_names(server)
         self.assertNotIn("run_terminal_command", names)
         self.assertNotIn("write_file", names)
         self.assertNotIn("send_file_to_telegram", names)
@@ -156,7 +230,43 @@ class CapabilityInventoryTests(unittest.TestCase):
             profile="full",
             clipboard_mutation=True,
         )
-        names = set(tool_names(automac_mcp.build_mcp(snapshot)))
+        expected = (
+            "describe",
+            "get_capabilities",
+            "get_session_state",
+            "play_sound_for_user_prompt",
+            "clipboard",
+            "get_available_apps",
+            "get_screen_size",
+            "get_screen_layout",
+            "get_ui_tree",
+            "focus_app",
+            "press_keystroke",
+            "type_text",
+            "mouse_action",
+            "scroll",
+            "perform_ui_action",
+            "execute_macro",
+            "get_screen_text",
+            "run_terminal_command",
+            "find_file",
+            "read_file",
+            "list_directory",
+            "smart_search",
+            "write_file",
+        )
+        expected_instructions = exact_instructions(
+            INSTRUCTION_PREAMBLE,
+            UI_INSTRUCTION_START,
+            OCR_INSTRUCTION,
+            MACRO_INSTRUCTION,
+            LOCAL_SEARCH_INSTRUCTIONS,
+            SHELL_INSTRUCTION,
+            WRITE_INSTRUCTION,
+            INSTRUCTION_FOOTER,
+        )
+        server = self.assert_surface(snapshot, expected, expected_instructions)
+        names = tool_names(server)
         self.assertIn("run_terminal_command", names)
         self.assertIn("write_file", names)
         self.assertIn("get_screen_text", names)
@@ -164,7 +274,7 @@ class CapabilityInventoryTests(unittest.TestCase):
         self.assertNotIn("send_file_to_telegram", names)
         self.assertNotIn("vector_search", names)
 
-        descriptions = tool_map(automac_mcp.build_mcp(snapshot))
+        descriptions = tool_map(server)
         macro_description = descriptions["execute_macro"].description or ""
         self.assertIn('"run_command"', macro_description)
         self.assertIn('"write_file"', macro_description)
@@ -172,29 +282,94 @@ class CapabilityInventoryTests(unittest.TestCase):
 
     def test_telegram_is_registered_only_when_synthetic_snapshot_is_ready(self):
         disabled = make_snapshot(["mac.files.read"])
-        self.assertNotIn("send_file_to_telegram", tool_names(automac_mcp.build_mcp(disabled)))
-
-        ready = make_snapshot(["mac.files.read", "telegram.send"])
         secrets = automac_mcp.RuntimeSecrets(
             telegram_bot_token="synthetic-token",
             telegram_chat_id="synthetic-chat",
         )
+        base_tools = (
+            "describe",
+            "get_capabilities",
+            "get_session_state",
+            "play_sound_for_user_prompt",
+            "clipboard",
+            "find_file",
+            "read_file",
+            "list_directory",
+            "smart_search",
+        )
+        expected_instructions = exact_instructions(
+            INSTRUCTION_PREAMBLE,
+            LOCAL_SEARCH_INSTRUCTIONS,
+            UI_DISABLED_INSTRUCTION,
+            INSTRUCTION_FOOTER,
+        )
+        disabled_server = self.assert_surface(
+            disabled,
+            base_tools,
+            expected_instructions,
+            secrets,
+        )
+        self.assertNotIn("send_file_to_telegram", tool_names(disabled_server))
+
+        ready = make_snapshot(["mac.files.read", "telegram.send"])
+        ready_server = self.assert_surface(
+            ready,
+            base_tools + ("send_file_to_telegram",),
+            expected_instructions,
+            secrets,
+        )
         self.assertIn(
             "send_file_to_telegram",
-            tool_names(automac_mcp.build_mcp(ready, secrets)),
+            tool_names(ready_server),
         )
 
     def test_meridian_registration_is_independent_of_local_search(self):
         disabled = make_snapshot(["mac.files.read"])
-        self.assertNotIn("vector_search", tool_names(automac_mcp.build_mcp(disabled)))
-        self.assertIn("smart_search", tool_names(automac_mcp.build_mcp(disabled)))
-
-        ready = make_snapshot(["mac.files.read", "meridian.search"])
         secrets = automac_mcp.RuntimeSecrets(
             worker_url="https://synthetic.example/search",
             meridian_ingest_token="synthetic-token",
         )
-        names = tool_names(automac_mcp.build_mcp(ready, secrets))
+        base_tools = (
+            "describe",
+            "get_capabilities",
+            "get_session_state",
+            "play_sound_for_user_prompt",
+            "clipboard",
+            "find_file",
+            "read_file",
+            "list_directory",
+            "smart_search",
+        )
+        disabled_instructions = exact_instructions(
+            INSTRUCTION_PREAMBLE,
+            LOCAL_SEARCH_INSTRUCTIONS,
+            UI_DISABLED_INSTRUCTION,
+            INSTRUCTION_FOOTER,
+        )
+        disabled_server = self.assert_surface(
+            disabled,
+            base_tools,
+            disabled_instructions,
+            secrets,
+        )
+        self.assertNotIn("vector_search", tool_names(disabled_server))
+        self.assertIn("smart_search", tool_names(disabled_server))
+
+        ready = make_snapshot(["mac.files.read", "meridian.search"])
+        ready_instructions = exact_instructions(
+            INSTRUCTION_PREAMBLE,
+            LOCAL_SEARCH_INSTRUCTIONS,
+            MERIDIAN_INSTRUCTION,
+            UI_DISABLED_INSTRUCTION,
+            INSTRUCTION_FOOTER,
+        )
+        ready_server = self.assert_surface(
+            ready,
+            base_tools + ("vector_search",),
+            ready_instructions,
+            secrets,
+        )
+        names = tool_names(ready_server)
         self.assertIn("vector_search", names)
         self.assertIn("smart_search", names)
 
@@ -215,21 +390,12 @@ class CapabilityInventoryTests(unittest.TestCase):
             profile="full",
             clipboard_mutation=True,
         )
-        names = tool_names(
-            automac_mcp.build_mcp(
-                snapshot,
-                automac_mcp.RuntimeSecrets(
-                    telegram_bot_token="synthetic-token",
-                    telegram_chat_id="synthetic-chat",
-                    worker_url="https://synthetic.example",
-                    meridian_ingest_token="synthetic-token",
-                ),
-            )
-        )
-        expected = {
+        expected = (
             "describe",
             "get_capabilities",
             "get_session_state",
+            "play_sound_for_user_prompt",
+            "clipboard",
             "get_available_apps",
             "get_screen_size",
             "get_screen_layout",
@@ -239,26 +405,135 @@ class CapabilityInventoryTests(unittest.TestCase):
             "type_text",
             "mouse_action",
             "scroll",
-            "execute_macro",
             "perform_ui_action",
+            "execute_macro",
             "get_screen_text",
             "run_terminal_command",
             "find_file",
-            "vector_search",
             "read_file",
-            "write_file",
             "list_directory",
             "smart_search",
-            "play_sound_for_user_prompt",
-            "clipboard",
+            "write_file",
             "send_file_to_telegram",
-        }
-        self.assertEqual(set(names), expected)
-        self.assertEqual(len(names), 25)
-        self.assertEqual(len(names), len(set(names)))
+            "vector_search",
+        )
+        expected_instructions = exact_instructions(
+            INSTRUCTION_PREAMBLE,
+            UI_INSTRUCTION_START,
+            OCR_INSTRUCTION,
+            MACRO_INSTRUCTION,
+            LOCAL_SEARCH_INSTRUCTIONS,
+            MERIDIAN_INSTRUCTION,
+            SHELL_INSTRUCTION,
+            WRITE_INSTRUCTION,
+            INSTRUCTION_FOOTER,
+        )
+        server = self.assert_surface(
+            snapshot,
+            expected,
+            expected_instructions,
+            automac_mcp.RuntimeSecrets(
+                telegram_bot_token="synthetic-token",
+                telegram_chat_id="synthetic-chat",
+                worker_url="https://synthetic.example",
+                meridian_ingest_token="synthetic-token",
+            ),
+        )
+        self.assertEqual(len(tool_names(server)), 25)
 
 
 class SnapshotValidationTests(unittest.TestCase):
+    def test_shared_swift_python_schema_v1_fixture_is_accepted(self):
+        fixture_path = (
+            Path(__file__).resolve().parent
+            / "Tests"
+            / "Fixtures"
+            / "capability_snapshot_v1.json"
+        )
+
+        snapshot = automac_mcp.CapabilitySnapshot.from_json(
+            fixture_path.read_text(encoding="utf-8")
+        )
+
+        self.assertEqual(snapshot.snapshot_schema_version, 1)
+        self.assertEqual(snapshot.control_profile, "guided")
+        self.assertEqual(
+            snapshot.capabilities["telegram.send"].health,
+            "unavailable",
+        )
+        self.assertEqual(len(snapshot.policy.approved_file_roots), 1)
+        self.assertTrue(snapshot.policy.approved_file_roots[0].is_absolute())
+        self.assertEqual(snapshot.policy.approved_file_roots[0].name, "approved")
+
+    def test_schema_v1_accepts_unavailable_health(self):
+        document = snapshot_document(["mac.ui"])
+        document["capabilities"]["telegram.send"].update(
+            {
+                "desired": True,
+                "configured": False,
+                "ready": False,
+                "health": "unavailable",
+                "reason": "Telegram credentials are not configured.",
+            }
+        )
+
+        snapshot = automac_mcp.CapabilitySnapshot.from_dict(document)
+
+        self.assertEqual(snapshot.capabilities["telegram.send"].health, "unavailable")
+        self.assertFalse(snapshot.is_ready("telegram.send"))
+
+    def test_schema_v1_rejects_every_noncanonical_legacy_health_value(self):
+        for health in (
+            "unconfigured",
+            "not_ready",
+            "error",
+            "unknown",
+            "future_health",
+            "",
+            None,
+        ):
+            with self.subTest(health=health):
+                document = snapshot_document(["mac.ui"])
+                document["capabilities"]["mac.ui"]["health"] = health
+                with self.assertRaises(automac_mcp.CapabilitySnapshotError):
+                    automac_mcp.CapabilitySnapshot.from_dict(document)
+
+    def test_configured_roots_reject_blank_relative_tilde_and_unnormalized_paths(self):
+        invalid_roots = (
+            "",
+            "   ",
+            "relative/root",
+            "~",
+            "~/approved",
+            "/tmp/../tmp/approved",
+            "/tmp/./approved",
+            "/tmp//approved",
+            "/tmp/approved/",
+        )
+        for root in invalid_roots:
+            with self.subTest(root=root):
+                document = snapshot_document(
+                    ["mac.files.read"],
+                    approved_roots=[root],
+                )
+                with self.assertRaises(automac_mcp.CapabilitySnapshotError):
+                    automac_mcp.CapabilitySnapshot.from_dict(document)
+
+    def test_configured_roots_deduplicate_canonical_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            real_root = Path(tmp) / "real-root"
+            alias_root = Path(tmp) / "alias-root"
+            real_root.mkdir()
+            alias_root.symlink_to(real_root, target_is_directory=True)
+            document = snapshot_document(
+                ["mac.files.read"],
+                approved_roots=[str(real_root), str(alias_root), str(real_root)],
+            )
+
+            snapshot = automac_mcp.CapabilitySnapshot.from_dict(document)
+
+        self.assertEqual(snapshot.policy.approved_file_roots, (real_root.resolve(),))
+
     def test_managed_snapshot_is_required_and_fail_closed(self):
         env = {"MAC_ORCHESTRATOR_MANAGED": "1"}
         with self.assertRaises(automac_mcp.CapabilitySnapshotError):
@@ -302,6 +577,26 @@ class SnapshotValidationTests(unittest.TestCase):
 
 
 class PolicyBypassTests(unittest.TestCase):
+    def test_full_control_bypasses_roots_only_after_capability_authorization(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "readable.txt"
+            target.write_text("allowed", encoding="utf-8")
+            authorized = make_snapshot(
+                ["mac.files.read"],
+                profile="full",
+                approved_roots=[],
+            )
+            unauthorized = make_snapshot([], profile="full", approved_roots=[])
+
+            with automac_mcp.use_runtime(authorized):
+                allowed = automac_mcp.read_file(str(target))
+            with automac_mcp.use_runtime(unauthorized):
+                denied = automac_mcp.read_file(str(target))
+
+        self.assertEqual(allowed["status"], "success")
+        self.assertEqual(allowed["content"], "allowed")
+        self.assertEqual(denied["error_code"], "POLICY_DENIED")
+
     def test_direct_and_macro_shell_paths_share_policy(self):
         snapshot = make_snapshot(["mac.ui"])
         with automac_mcp.use_runtime(snapshot):
@@ -437,6 +732,42 @@ class PolicyBypassTests(unittest.TestCase):
             self.assertEqual(result["error_code"], "POLICY_DENIED")
             post.assert_not_called()
 
+    def test_telegram_send_errors_never_expose_the_bot_token(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            approved = Path(tmp)
+            attachment = approved / "attachment.txt"
+            attachment.write_text("synthetic", encoding="utf-8")
+            snapshot = make_snapshot(
+                ["mac.files.read", "telegram.send"],
+                approved_roots=[str(approved)],
+            )
+            token = "123456:synthetic-secret-token"
+            secrets = automac_mcp.RuntimeSecrets(
+                telegram_bot_token=token,
+                telegram_chat_id="123456",
+            )
+            leaked_url = f"https://api.telegram.org/bot{token}/sendDocument"
+
+            with patch.object(
+                automac_mcp.requests,
+                "post",
+                side_effect=RuntimeError(f"connection failed for {leaked_url}"),
+            ):
+                with automac_mcp.use_runtime(snapshot, secrets):
+                    exception_result = automac_mcp.send_file_to_telegram(str(attachment))
+
+            response = type(
+                "SyntheticTelegramResponse",
+                (),
+                {"status_code": 401, "text": f"unauthorized token={token}"},
+            )()
+            with patch.object(automac_mcp.requests, "post", return_value=response):
+                with automac_mcp.use_runtime(snapshot, secrets):
+                    response_result = automac_mcp.send_file_to_telegram(str(attachment))
+
+        self.assertNotIn(token, json.dumps(exception_result, sort_keys=True))
+        self.assertNotIn(token, json.dumps(response_result, sort_keys=True))
+
     def test_screenshot_write_is_not_a_write_policy_bypass(self):
         snapshot = make_snapshot(["mac.screenOcr"])
         with patch.object(automac_mcp.pyautogui, "screenshot") as screenshot:
@@ -487,6 +818,26 @@ class PolicyBypassTests(unittest.TestCase):
             with patch.object(automac_mcp.pyautogui, "screenshot") as screenshot:
                 with automac_mcp.use_runtime(snapshot):
                     result = automac_mcp.get_screen_text(screenshot=True)
+        self.assertEqual(result["error_code"], "POLICY_DENIED")
+        screenshot.assert_not_called()
+
+    def test_screenshot_authorizes_exact_timestamped_destination_before_capture(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            desktop = Path(tmp) / "Desktop"
+            desktop.mkdir()
+            placeholder = desktop / "orchestrator_screenshot.png"
+            snapshot = make_snapshot(
+                ["mac.screenOcr", "mac.files.write"],
+                approved_roots=[str(placeholder)],
+            )
+            with patch.dict(os.environ, {"HOME": tmp}), patch.object(
+                automac_mcp.pyautogui, "screenshot"
+            ) as screenshot, patch.object(
+                automac_mcp.pyautogui, "size", return_value=(1920, 1080)
+            ):
+                with automac_mcp.use_runtime(snapshot):
+                    result = automac_mcp.get_screen_text(screenshot=True)
+
         self.assertEqual(result["error_code"], "POLICY_DENIED")
         screenshot.assert_not_called()
 

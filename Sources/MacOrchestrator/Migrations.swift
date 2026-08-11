@@ -31,23 +31,30 @@ enum UserDefaultsMigrator {
         }
 
         let legacyKeys = ["serverDesired", "tunnelDesired", "ownerID"]
-        let isLegacyInstall = legacyKeys.contains { userDefaults.object(forKey: $0) != nil }
+        let registeredDefaults = userDefaults.volatileDomain(forName: UserDefaults.registrationDomain)
+        func persistedLegacyValue(forKey key: String) -> Any? {
+            guard registeredDefaults[key] == nil else {
+                return nil
+            }
+            return userDefaults.object(forKey: key)
+        }
+        let isLegacyInstall = legacyKeys.contains { persistedLegacyValue(forKey: $0) != nil }
         var changed = false
 
-        if let ownerID = userDefaults.string(forKey: "ownerID"),
+        if let ownerID = persistedLegacyValue(forKey: "ownerID") as? String,
            !ownerID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
            configuration.ownerID != ownerID {
             configuration.ownerID = ownerID
             changed = true
         }
 
-        if let serverDesired = userDefaults.object(forKey: "serverDesired") as? Bool,
+        if let serverDesired = persistedLegacyValue(forKey: "serverDesired") as? Bool,
            configuration.process.serverDesired != serverDesired {
             configuration.process.serverDesired = serverDesired
             changed = true
         }
 
-        if let tunnelDesired = userDefaults.object(forKey: "tunnelDesired") as? Bool {
+        if let tunnelDesired = persistedLegacyValue(forKey: "tunnelDesired") as? Bool {
             if configuration.process.tunnelDesired != tunnelDesired {
                 configuration.process.tunnelDesired = tunnelDesired
                 changed = true
@@ -61,6 +68,25 @@ enum UserDefaultsMigrator {
         if isLegacyInstall, configuration.controlProfile != .full {
             configuration.controlProfile = .full
             changed = true
+        }
+
+        if isLegacyInstall {
+            for capabilityID in [
+                "core.session",
+                "mac.ui",
+                "mac.screenOcr",
+                "mac.files.read",
+                "mac.files.write",
+                "mac.shell",
+                "mac.clipboard.write",
+            ] where configuration.desiredCapabilities[capabilityID] != true {
+                configuration.desiredCapabilities[capabilityID] = true
+                changed = true
+            }
+            if !configuration.policy.clipboardMutation {
+                configuration.policy.clipboardMutation = true
+                changed = true
+            }
         }
 
         var markers = Set(configuration.onboarding.migrationMarkers)

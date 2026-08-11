@@ -17,7 +17,38 @@ final class MigrationTests: XCTestCase {
         XCTAssertTrue(configuration.process.tunnelDesired)
         XCTAssertEqual(configuration.ownerID, "owner-legacy")
         XCTAssertTrue(configuration.desiredCapabilities["remote.connector"] == true)
+        for capabilityID in [
+            "core.session",
+            "mac.ui",
+            "mac.screenOcr",
+            "mac.files.read",
+            "mac.files.write",
+            "mac.shell",
+            "mac.clipboard.write",
+        ] {
+            XCTAssertTrue(
+                configuration.desiredCapabilities[capabilityID] == true,
+                "Legacy migration did not preserve \(capabilityID)"
+            )
+        }
+        XCTAssertTrue(configuration.policy.clipboardMutation)
         XCTAssertTrue(configuration.onboarding.migrationMarkers.contains("legacy-control-profile-v1"))
+    }
+
+    func testRegisteredDefaultsAloneDoNotTriggerLegacyFullMigration() throws {
+        let defaults = makeIsolatedDefaults()
+        defaults.register(defaults: [
+            "serverDesired": true,
+            "tunnelDesired": false,
+        ])
+        let store = try makeStore()
+
+        let configuration = try UserDefaultsMigrator.migrate(userDefaults: defaults, store: store)
+
+        XCTAssertEqual(configuration.controlProfile, .guided)
+        XCTAssertFalse(configuration.policy.clipboardMutation)
+        XCTAssertFalse(configuration.desiredCapabilities["mac.shell"] == true)
+        XCTAssertFalse(configuration.onboarding.migrationMarkers.contains("legacy-control-profile-v1"))
     }
 
     func testRunningUserDefaultsMigrationTwiceDoesNotResetOrDuplicateMarkers() throws {

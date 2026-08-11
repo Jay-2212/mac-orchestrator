@@ -87,6 +87,7 @@ struct SystemKeychainClient: KeychainClient {
 
 enum KeychainItem: Equatable, Hashable, Sendable {
     case connectorToken
+    case ngrokAuthtoken
     case telegramSendBotToken
     case telegramSendChatID
     case meridianIngestToken(account: String)
@@ -103,7 +104,7 @@ enum KeychainItem: Equatable, Hashable, Sendable {
 
     var service: String {
         switch self {
-        case .connectorToken, .telegramSendBotToken, .telegramSendChatID,
+        case .connectorToken, .ngrokAuthtoken, .telegramSendBotToken, .telegramSendChatID,
              .meridianIngestTokenAlias, .meridianTelegramBotToken, .meridianTelegramWebhookSecret:
             return Self.service
         case .meridianIngestToken:
@@ -115,6 +116,8 @@ enum KeychainItem: Equatable, Hashable, Sendable {
         switch self {
         case .connectorToken:
             return "connector-capability-token"
+        case .ngrokAuthtoken:
+            return "ngrok-agent-authtoken"
         case .telegramSendBotToken:
             return "telegram-send-bot-token"
         case .telegramSendChatID:

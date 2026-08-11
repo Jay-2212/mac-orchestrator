@@ -1,7 +1,7 @@
 # Phase 2 Terminal Bootstrap and Core Onboarding Design
 
-**Date:** 2026-08-11  
-**Base:** `a6bd52b8d0e41e580dc5b748522fc1d6897fd6a6`  
+**Date:** 2026-08-11
+**Base:** `a6bd52b8d0e41e580dc5b748522fc1d6897fd6a6`
 **Status:** implementation design for the Phase 2 public-core candidate
 
 ## Goal
@@ -36,7 +36,7 @@ The manifest has schema version 1 and contains:
   signing declaration;
 - uv version/URL/digest, managed CPython version, lock digest, and core payload
   metadata;
-- ngrok version/archive URL/digest, executable name, required Developer ID
+- ngrok version/archive URL/digest/format, executable name, required Developer ID
   authority/team, and Agent API version;
 - compatible runtime and configuration schema ranges.
 
@@ -51,6 +51,7 @@ All public payloads live below:
 ```text
 ~/Library/Application Support/Mac Orchestrator/
 ├── app/Mac Orchestrator.app
+├── python/cpython-3.13.14/
 ├── runtime/.venv/bin/python
 ├── runtime/{automac_mcp.py,pyproject.toml,uv.lock}
 ├── remote/ngrok/ngrok
@@ -134,7 +135,7 @@ inputs, not claims that a live account was exercised in this branch.
 
 The bootstrap prints a short trust warning, defaults to Guided Control, and
 offers explicit `--full-control` and `--remote` opt-ins. Full Control requires
-a typed confirmation. Remote setup uses a hidden token prompt and can be
+an explicit confirmation flag after the warning. Remote setup uses a hidden token prompt and can be
 skipped. A tiny Swift command-line mode stores the token in Keychain without
 putting it in argv, then the helper is restarted and the live connector URL is
 queried for display. The URL is explicitly labeled as a password-like

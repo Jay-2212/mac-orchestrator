@@ -48,10 +48,11 @@
   },
   "ngrok": {
     "version": "REPLACE_WITH_NGROK_VERSION",
-    "archiveUrl": "https://example.invalid/ngrok/REPLACE/ngrok-arm64.tar.gz",
+    "archiveUrl": "https://example.invalid/ngrok/REPLACE/ngrok-arm64.zip",
     "archiveSha256": "REPLACE_WITH_NGROK_ARCHIVE_SHA256",
+    "archiveFormat": "zip",
     "executableName": "ngrok",
-    "developerIdAuthority": "Developer ID Application: ngrok (REPLACE_TEAM)",
+    "developerIdAuthority": "Developer ID Application: ngrok, Inc. (REPLACE_TEAM)",
     "developerIdTeam": "REPLACE_TEAM",
     "agentApiVersion": "v3"
   },

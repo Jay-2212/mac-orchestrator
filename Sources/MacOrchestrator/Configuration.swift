@@ -116,17 +116,20 @@ struct IntegrationConfiguration: Codable, Equatable, Sendable {
 
 struct OnboardingConfiguration: Codable, Equatable, Sendable {
     var completed: Bool
+    var phase2State: Phase2OnboardingState?
     var migrationMarkers: [String]
     var legacyPlaintextCleanupPending: Bool
     var legacyPlaintextKeys: [String]
 
     init(
         completed: Bool = false,
+        phase2State: Phase2OnboardingState? = nil,
         migrationMarkers: [String] = [],
         legacyPlaintextCleanupPending: Bool = false,
         legacyPlaintextKeys: [String] = []
     ) {
         self.completed = completed
+        self.phase2State = phase2State
         self.migrationMarkers = migrationMarkers
         self.legacyPlaintextCleanupPending = legacyPlaintextCleanupPending
         self.legacyPlaintextKeys = legacyPlaintextKeys
@@ -134,6 +137,7 @@ struct OnboardingConfiguration: Codable, Equatable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case completed
+        case phase2State
         case migrationMarkers
         case legacyPlaintextCleanupPending
         case legacyPlaintextKeys
@@ -143,6 +147,7 @@ struct OnboardingConfiguration: Codable, Equatable, Sendable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         self.init(
             completed: try container.decodeIfPresent(Bool.self, forKey: .completed) ?? false,
+            phase2State: try container.decodeIfPresent(Phase2OnboardingState.self, forKey: .phase2State),
             migrationMarkers: try container.decodeIfPresent([String].self, forKey: .migrationMarkers) ?? [],
             legacyPlaintextCleanupPending: try container.decodeIfPresent(
                 Bool.self,

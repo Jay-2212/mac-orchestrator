@@ -41,6 +41,7 @@ struct ManagedRuntimeLaunchContract: Sendable {
     let capabilitySnapshot: CapabilitySnapshot
     let environment: [String: String]
     let redactedSecrets: [String]
+    let ngrokAuthtoken: String?
 
     var healthURL: URL {
         URL(string: "http://127.0.0.1:\(port)/__mac_orchestrator_health")!
@@ -68,6 +69,12 @@ struct ManagedRuntimeLaunchContract: Sendable {
             }
         }
         var redactedSecrets = [connectorToken]
+        let ngrokAuthtoken = try keychain.value(for: .ngrokAuthtoken)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .flatMap { $0.isEmpty ? nil : $0 }
+        if let ngrokAuthtoken {
+            redactedSecrets.append(ngrokAuthtoken)
+        }
 
         if capabilitySnapshot.capabilities["telegram.send"]?.ready == true {
             guard let botToken = try keychain.value(for: .telegramSendBotToken), !botToken.isEmpty else {
@@ -114,12 +121,26 @@ struct ManagedRuntimeLaunchContract: Sendable {
             configuration: configuration,
             capabilitySnapshot: capabilitySnapshot,
             environment: environment,
-            redactedSecrets: redactedSecrets
+            redactedSecrets: redactedSecrets,
+            ngrokAuthtoken: ngrokAuthtoken
         )
     }
 
     func matchesTunnelAddress(_ address: String) -> Bool {
         address == tunnelTarget || address == "http://localhost:\(port)"
+    }
+
+    func ngrokEnvironment() -> [String: String] {
+        var environment: [String: String] = [:]
+        for name in Self.inheritedNonsecretNames {
+            if let value = self.environment[name] {
+                environment[name] = value
+            }
+        }
+        if let ngrokAuthtoken {
+            environment["NGROK_AUTHTOKEN"] = ngrokAuthtoken
+        }
+        return environment
     }
 }
 

@@ -28,15 +28,20 @@ values for `VERSION` and `BOOTSTRAP_SHA256`. The command has this shape:
 VERSION="v<version>"
 BOOTSTRAP_SHA256="<sha256-from-the-same-release-page>"
 BOOTSTRAP="$(mktemp -t mac-orchestrator-bootstrap.XXXXXX)"
-trap 'rm -f "$BOOTSTRAP"' EXIT
+MANIFEST="$(mktemp -t mac-orchestrator-manifest.XXXXXX)"
+trap 'rm -f "$BOOTSTRAP" "$MANIFEST"' EXIT
 curl --fail --location --proto '=https' --tlsv1.2 \
   "https://github.com/Jay-2212/mac-orchestrator/releases/download/${VERSION}/bootstrap.sh" \
   --output "$BOOTSTRAP"
 printf '%s  %s\n' "$BOOTSTRAP_SHA256" "$BOOTSTRAP" | shasum -a 256 --check
-bash "$BOOTSTRAP"
+curl --fail --location --proto '=https' --tlsv1.2 \
+  "https://github.com/Jay-2212/mac-orchestrator/releases/download/${VERSION}/manifest.json" \
+  --output "$MANIFEST"
+bash "$BOOTSTRAP" --manifest "$MANIFEST"
 ```
 
-The command verifies the bootstrap file before executing it. The bootstrap then
+The command verifies the bootstrap file before executing it and supplies the
+manifest from the same immutable release asset set. The bootstrap then
 verifies the concrete versioned manifest, helper, uv, runtime lock, core
 payload, and external ngrok archive before promotion. A missing, sentinel, or
 mismatched digest stops installation. The release asset is the trust anchor;
@@ -58,6 +63,7 @@ The helper and runtime are owned by the installing macOS user:
 ```text
 ~/Library/Application Support/Mac Orchestrator/
 ├── app/Mac Orchestrator.app
+├── python/cpython-3.13.14/
 ├── runtime/.venv/bin/python
 ├── runtime/{automac_mcp.py,pyproject.toml,uv.lock}
 ├── remote/ngrok/ngrok

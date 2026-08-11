@@ -102,6 +102,12 @@ enum UserDefaultsMigrator {
         if isLegacyInstall, markers.insert(legacyProfileMarker).inserted {
             changed = true
         }
+        if isLegacyInstall,
+           configuration.onboarding.phase2State != .completed,
+           configuration.onboarding.phase2State != .legacyMigrated {
+            configuration.onboarding.phase2State = .legacyMigrated
+            changed = true
+        }
         configuration.onboarding.migrationMarkers = markers.sorted()
 
         if changed {

@@ -14,6 +14,7 @@ Versioned release asset
         └── user-owned Application Support/Mac Orchestrator/
               ├── app/Mac Orchestrator.app
               │     └── LaunchAgent → Swift helper
+              ├── python/cpython-3.13.14/
               ├── runtime/.venv/bin/python
               │     └── automac_mcp.py → 127.0.0.1:<selected-port>
               └── remote/ngrok/ngrok (optional external binary)
@@ -24,6 +25,7 @@ The helper is installed below:
 ```text
 ~/Library/Application Support/Mac Orchestrator/
 ├── app/Mac Orchestrator.app
+├── python/cpython-3.13.14/
 ├── runtime/.venv/bin/python
 ├── runtime/{automac_mcp.py,pyproject.toml,uv.lock}
 ├── remote/ngrok/ngrok

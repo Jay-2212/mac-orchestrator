@@ -168,6 +168,7 @@
         "version",
         "archiveUrl",
         "archiveSha256",
+        "archiveFormat",
         "executableName",
         "developerIdAuthority",
         "developerIdTeam",
@@ -178,10 +179,14 @@
           "$ref": "#/definitions/version"
         },
         "archiveUrl": {
-          "$ref": "#/definitions/assetUrl"
+          "type": "string",
+          "pattern": "^https://bin\\.equinox\\.io/[^\\s]+$"
         },
         "archiveSha256": {
           "$ref": "#/definitions/sha256"
+        },
+        "archiveFormat": {
+          "const": "zip"
         },
         "executableName": {
           "type": "string",

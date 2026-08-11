@@ -158,6 +158,38 @@ final class RuntimeLaunchContractTests: XCTestCase {
             XCTAssertEqual(name, "MAC_ORCHESTRATOR_TELEGRAM_CHAT_ID")
         }
     }
+
+    func testNgrokSecretIsReservedForTheExternalTunnelEnvironment() throws {
+        let configuration = AppConfiguration.fresh(ownerID: "owner-ngrok")
+        let capabilitySnapshot = CapabilityRegistry(
+            configuration: configuration,
+            facts: CapabilityReadinessFacts(coreSessionReady: true)
+        ).snapshot()
+        let ngrokToken = "ngrok-test-token"
+        let keychain = KeychainStore(
+            client: RuntimeKeychainClient(values: [
+                KeychainItem.connectorToken.key: String(repeating: "c", count: 48),
+                KeychainItem.ngrokAuthtoken.key: ngrokToken,
+            ]),
+            meridianAccount: "runtime-test"
+        )
+
+        let contract = try ManagedRuntimeLaunchContract.make(
+            configuration: configuration,
+            capabilitySnapshot: capabilitySnapshot,
+            keychain: keychain,
+            inheritedEnvironment: ["PATH": "/usr/bin"]
+        )
+
+        XCTAssertEqual(contract.ngrokAuthtoken, ngrokToken)
+        XCTAssertNil(contract.environment["NGROK_AUTHTOKEN"])
+        XCTAssertEqual(contract.ngrokEnvironment()["NGROK_AUTHTOKEN"], ngrokToken)
+        XCTAssertNil(contract.ngrokEnvironment()["MAC_ORCHESTRATOR_CONNECTOR_TOKEN"])
+        XCTAssertEqual(Set(contract.redactedSecrets), Set([
+            String(repeating: "c", count: 48),
+            ngrokToken,
+        ]))
+    }
 }
 
 private final class RuntimeKeychainClient: KeychainClient {

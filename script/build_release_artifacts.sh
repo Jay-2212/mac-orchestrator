@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+UNZIP_BIN="/usr/bin/unzip"
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TEMPLATE_PATH="$PROJECT_DIR/release/manifest.template.json"
@@ -126,6 +127,14 @@ require_https_url() {
   esac
 }
 
+require_ngrok_vendor_url() {
+  value="$1"
+  case "$value" in
+    https://bin.equinox.io/*) ;;
+    *) die "--ngrok-url must point directly to bin.equinox.io" ;;
+  esac
+}
+
 sha256_file() {
   result="$($SHASUM_BIN -a 256 "$1")" || return 1
   echo "${result%% *}"
@@ -184,6 +193,17 @@ $($TAR_BIN -tzf "$archive")
 EOF
 }
 
+validate_zip_paths() {
+  archive="$1"
+  while IFS= read -r entry; do
+    case "$entry" in
+      ""|/*|../*|*/../*|..) die "archive contains an unsafe path" ;;
+    esac
+  done <<EOF
+$($UNZIP_BIN -Z1 "$archive")
+EOF
+}
+
 prepare_helper() {
   helper_output="$OUTPUT_DIR/Mac-Orchestrator-arm64.zip"
   if [ -n "$HELPER_ARCHIVE" ]; then
@@ -228,8 +248,8 @@ prepare_core_payload() {
 validate_ngrok_archive() {
   ngrok_dir="$WORK_DIR/ngrok-inspect"
   /bin/mkdir -p "$ngrok_dir"
-  validate_archive_paths "$NGROK_ARCHIVE_PATH"
-  "$TAR_BIN" -xzf "$NGROK_ARCHIVE_PATH" -C "$ngrok_dir" || die "ngrok archive cannot be extracted"
+  validate_zip_paths "$NGROK_ARCHIVE_PATH"
+  "$DITTO_BIN" -x -k "$NGROK_ARCHIVE_PATH" "$ngrok_dir" || die "ngrok archive cannot be extracted"
   ngrok_binary="$(find "$ngrok_dir" -type f -name ngrok -print | sed -n '1p')"
   [ -n "$ngrok_binary" ] || die "ngrok archive is missing ngrok"
   require_arm64 "ngrok" "$ngrok_binary"
@@ -255,7 +275,7 @@ prepare_binary_inputs() {
   verify_digest "ngrok archive" "$NGROK_ARCHIVE_PATH" "$NGROK_SHA256"
   validate_ngrok_archive
   /bin/cp "$UV_PATH" "$OUTPUT_DIR/uv-arm64"
-  /bin/cp "$NGROK_ARCHIVE_PATH" "$OUTPUT_DIR/ngrok-arm64.tar.gz"
+  /bin/cp "$NGROK_ARCHIVE_PATH" "$OUTPUT_DIR/ngrok-arm64.zip"
 }
 
 write_manifest() {
@@ -306,6 +326,7 @@ validate_inputs() {
   require_input "--ngrok-archive" "$NGROK_ARCHIVE_PATH"
   require_input "--ngrok-version" "$NGROK_VERSION"
   require_https_url "--ngrok-url" "$NGROK_URL"
+  require_ngrok_vendor_url "$NGROK_URL"
   require_sha256 "--ngrok-sha256" "$NGROK_SHA256"
   require_input "--ngrok-authority" "$NGROK_AUTHORITY"
   require_input "--ngrok-team" "$NGROK_TEAM"

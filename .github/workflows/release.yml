@@ -7,6 +7,26 @@ on:
         description: New semantic release tag, for example v0.2.2.
         required: true
         type: string
+      ngrok_version:
+        description: Exact vendor ngrok version represented by the archive input.
+        required: true
+        type: string
+      ngrok_url:
+        description: Direct bin.equinox.io URL for the arm64 ngrok ZIP.
+        required: true
+        type: string
+      ngrok_sha256:
+        description: SHA-256 digest of the exact vendor ngrok ZIP.
+        required: true
+        type: string
+      ngrok_authority:
+        description: Original Developer ID authority reported by codesign.
+        required: true
+        type: string
+      ngrok_team:
+        description: Original ten-character Developer ID team identifier.
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -33,6 +53,10 @@ jobs:
         env:
           RELEASE_SHA: ${{ github.sha }}
           RELEASE_TAG: ${{ inputs.tag }}
+          NGROK_URL: ${{ inputs.ngrok_url }}
+          NGROK_SHA256: ${{ inputs.ngrok_sha256 }}
+          NGROK_AUTHORITY: ${{ inputs.ngrok_authority }}
+          NGROK_TEAM: ${{ inputs.ngrok_team }}
         run: |
           set -euo pipefail
           test "$GITHUB_REF" = "refs/heads/main"
@@ -41,6 +65,10 @@ jobs:
           git fetch --no-tags origin main
           test "$RELEASE_SHA" = "$(git rev-parse origin/main^{commit})"
           [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$NGROK_URL" == https://bin.equinox.io/* ]]
+          [[ "$NGROK_SHA256" =~ ^[A-Fa-f0-9]{64}$ ]]
+          [[ "$NGROK_TEAM" =~ ^[A-Z0-9]{10}$ ]]
+          [[ -n "$NGROK_AUTHORITY" ]]
           tag_ref="$(git ls-remote --refs origin "refs/tags/$RELEASE_TAG")"
           test -z "$tag_ref"
           printf 'release_sha=%s\n' "$RELEASE_SHA" >> "$GITHUB_OUTPUT"
@@ -82,12 +110,105 @@ jobs:
     permissions:
       contents: read
 
+  assemble-release-assets:
+    name: Assemble immutable release assets
+    needs:
+      - validate-release
+      - required-ci-at-release-sha
+    if: ${{ needs.validate-release.result == 'success' && needs.required-ci-at-release-sha.result == 'success' }}
+    runs-on: macos-14
+    permissions:
+      contents: read
+    steps:
+      - name: Check out exact release SHA
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate-release.outputs.release_sha }}
+          fetch-depth: 1
+
+      - name: Set up pinned uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.12.3"
+          python-version: "3.13.14"
+          enable-cache: false
+
+      - name: Build and assemble release assets
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          NGROK_VERSION: ${{ inputs.ngrok_version }}
+          NGROK_URL: ${{ inputs.ngrok_url }}
+          NGROK_SHA256: ${{ inputs.ngrok_sha256 }}
+          NGROK_AUTHORITY: ${{ inputs.ngrok_authority }}
+          NGROK_TEAM: ${{ inputs.ngrok_team }}
+        run: |
+          set -euo pipefail
+          release_tmp="$RUNNER_TEMP/mac-orchestrator-release"
+          /bin/mkdir -p "$release_tmp/core-source" "$release_tmp/output"
+          product_version="${RELEASE_TAG#v}"
+          asset_base="https://github.com/Jay-2212/mac-orchestrator/releases/download/${RELEASE_TAG}"
+
+          MAC_ORCHESTRATOR_VERSION="$product_version" bash script/package_app.sh >/dev/null
+          /usr/bin/ditto -c -k --sequesterRsrc --keepParent \
+            "dist/Mac Orchestrator.app" "$release_tmp/Mac-Orchestrator-arm64.zip"
+
+          /bin/cp automac_mcp.py pyproject.toml uv.lock "$release_tmp/core-source/"
+          /usr/bin/tar -czf "$release_tmp/core-payload.tar.gz" \
+            -C "$release_tmp/core-source" automac_mcp.py pyproject.toml uv.lock
+
+          uv_bin="$(command -v uv)"
+          test -f "$uv_bin"
+          /usr/bin/curl --fail --location --proto '=https' --tlsv1.2 \
+            "$NGROK_URL" --output "$release_tmp/ngrok-arm64.zip"
+          test "$(/usr/bin/shasum -a 256 "$release_tmp/ngrok-arm64.zip" | /usr/bin/awk '{print $1}')" = \
+            "$(printf '%s' "$NGROK_SHA256" | /usr/bin/tr '[:upper:]' '[:lower:]')"
+
+          bootstrap_sha256="$(/usr/bin/shasum -a 256 script/bootstrap.sh | /usr/bin/awk '{print $1}')"
+          helper_sha256="$(/usr/bin/shasum -a 256 "$release_tmp/Mac-Orchestrator-arm64.zip" | /usr/bin/awk '{print $1}')"
+          uv_sha256="$(/usr/bin/shasum -a 256 "$uv_bin" | /usr/bin/awk '{print $1}')"
+          core_sha256="$(/usr/bin/shasum -a 256 "$release_tmp/core-payload.tar.gz" | /usr/bin/awk '{print $1}')"
+          lock_sha256="$(/usr/bin/shasum -a 256 uv.lock | /usr/bin/awk '{print $1}')"
+
+          bash script/build_release_artifacts.sh \
+            --product-version "$product_version" \
+            --bootstrap-version "1.0.0" \
+            --bootstrap-url "$asset_base/bootstrap.sh" \
+            --bootstrap-sha256 "$bootstrap_sha256" \
+            --helper-archive "$release_tmp/Mac-Orchestrator-arm64.zip" \
+            --helper-url "$asset_base/Mac-Orchestrator-arm64.zip" \
+            --helper-sha256 "$helper_sha256" \
+            --uv "$uv_bin" \
+            --uv-url "$asset_base/uv-arm64" \
+            --uv-sha256 "$uv_sha256" \
+            --core-payload "$release_tmp/core-payload.tar.gz" \
+            --core-url "$asset_base/core-payload.tar.gz" \
+            --core-sha256 "$core_sha256" \
+            --lock uv.lock \
+            --lock-sha256 "$lock_sha256" \
+            --ngrok-archive "$release_tmp/ngrok-arm64.zip" \
+            --ngrok-version "$NGROK_VERSION" \
+            --ngrok-url "$NGROK_URL" \
+            --ngrok-sha256 "$NGROK_SHA256" \
+            --ngrok-authority "$NGROK_AUTHORITY" \
+            --ngrok-team "$NGROK_TEAM" \
+            --output-dir "$release_tmp/output"
+          test -f "$release_tmp/output/bootstrap.sh"
+          test -f "$release_tmp/output/manifest.json"
+
+      - name: Upload release asset bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: mac-orchestrator-release-assets
+          path: ${{ runner.temp }}/mac-orchestrator-release/output
+          if-no-files-found: error
+
   publish-release:
     name: Publish release from verified SHA
     needs:
       - validate-release
       - required-ci-at-release-sha
-    if: ${{ needs.validate-release.result == 'success' && needs.required-ci-at-release-sha.result == 'success' }}
+      - assemble-release-assets
+    if: ${{ needs.validate-release.result == 'success' && needs.required-ci-at-release-sha.result == 'success' && needs.assemble-release-assets.result == 'success' }}
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -112,6 +233,12 @@ jobs:
           tag_ref="$(git ls-remote --refs origin "refs/tags/$RELEASE_TAG")"
           test -z "$tag_ref"
 
+      - name: Download assembled release assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: mac-orchestrator-release-assets
+          path: release-assets
+
       - name: Create GitHub release and tag after all gates
         env:
           GH_TOKEN: ${{ github.token }}
@@ -122,4 +249,10 @@ jobs:
           gh release create "$RELEASE_TAG" \
             --target "$RELEASE_SHA" \
             --title "$RELEASE_TAG" \
-            --generate-notes
+            --generate-notes \
+            release-assets/bootstrap.sh \
+            release-assets/manifest.json \
+            release-assets/Mac-Orchestrator-arm64.zip \
+            release-assets/uv-arm64 \
+            release-assets/core-payload.tar.gz \
+            release-assets/ngrok-arm64.zip

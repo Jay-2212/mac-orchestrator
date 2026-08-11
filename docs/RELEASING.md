@@ -133,14 +133,19 @@ Do not create a tag first and rely on a later push workflow to find a failure.
 4. The reusable CI workflow receives the validated SHA as `checkout_ref`; every
    required job therefore tests that same immutable commit, including the
    bootstrap harness and dependency partition.
-5. Publication depends on both validation and the reusable required CI caller.
-   It rechecks the SHA, current remote `main`, and tag absence before invoking
-   GitHub's release command with `--target "$RELEASE_SHA"`.
+5. The asset-assembly job runs on arm64 macOS, builds the ad-hoc helper, creates
+   the core payload, downloads the exact vendor ngrok ZIP, validates its digest
+   and original signature, and asks `script/build_release_artifacts.sh` to emit
+   `bootstrap.sh`, `manifest.json`, and the release payloads.
+6. Publication depends on validation, required CI, and asset assembly. It
+   rechecks the SHA, current remote `main`, and tag absence before uploading the
+   assembled assets with GitHub's release command and `--target "$RELEASE_SHA"`.
 
 The current workflow does not dispatch a release, create a tag, or claim that a
-public artifact exists. Release asset assembly remains maintainer-controlled and
-must emit a concrete manifest only when all helper, uv, lock, core payload, and
-ngrok inputs and digests are present.
+public artifact exists. Dispatch remains maintainer-controlled and requires
+explicit ngrok version, direct `bin.equinox.io` URL, digest, authority, and team
+inputs; the workflow refuses to assemble a release from a non-vendor ngrok URL
+or an unverified archive.
 
 ## Trust and evidence boundaries
 

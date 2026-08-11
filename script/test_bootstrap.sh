@@ -133,7 +133,7 @@ make_case() {
   printf '%s\n' 'fixture-helper' > "$CASE_DIR/assets/helper.zip"
   printf '%s\n' 'fixture-uv' > "$CASE_DIR/assets/uv"
   printf '%s\n' 'fixture-core-payload' > "$CASE_DIR/assets/core.tar.gz"
-  printf '%s\n' 'fixture-ngrok-archive' > "$CASE_DIR/assets/ngrok.tar.gz"
+  printf '%s\n' 'fixture-ngrok-archive' > "$CASE_DIR/assets/ngrok.zip"
   printf '%s\n' 'fixture-lock' > "$CASE_DIR/assets/uv.lock"
 
   printf '%s\n' '#!/bin/bash' 'printf "%s\\n" "arm64"' > "$CASE_DIR/bin/uname"
@@ -146,7 +146,7 @@ make_case() {
   helper_path="$CASE_DIR/assets/helper.zip"
   uv_path="$CASE_DIR/assets/uv"
   core_path="$CASE_DIR/assets/core.tar.gz"
-  ngrok_path="$CASE_DIR/assets/ngrok.tar.gz"
+  ngrok_path="$CASE_DIR/assets/ngrok.zip"
   lock_path="$CASE_DIR/assets/uv.lock"
 
   replace_string product.version "0.3.0-fixture" "$MANIFEST" || return 1
@@ -233,12 +233,28 @@ test_wrong_digest_rejected() {
   assert_contains "$BOOTSTRAP_OUTPUT" "digest mismatch" || return 1
 }
 
+test_ngrok_zip_format_required() {
+  make_case ngrok-format || return 1
+  replace_string ngrok.archiveFormat "tar.gz" "$MANIFEST" || return 1
+  capture_bootstrap "$CASE_DIR"
+  [ "$BOOTSTRAP_RC" -ne 0 ] || return 1
+  assert_contains "$BOOTSTRAP_OUTPUT" "ngrok archive must be a zip" || return 1
+}
+
 test_mutable_release_url_rejected() {
   make_case mutable-url || return 1
   replace_string helper.url "https://downloads.example.com/releases/refs/heads/main/helper.zip" "$MANIFEST" || return 1
   capture_bootstrap "$CASE_DIR"
   [ "$BOOTSTRAP_RC" -ne 0 ] || return 1
   assert_contains "$BOOTSTRAP_OUTPUT" "immutable" || return 1
+}
+
+test_non_vendor_ngrok_url_rejected() {
+  make_case non-vendor-ngrok || return 1
+  replace_string ngrok.archiveUrl "https://downloads.example.com/ngrok-arm64.zip" "$MANIFEST" || return 1
+  capture_bootstrap "$CASE_DIR"
+  [ "$BOOTSTRAP_RC" -ne 0 ] || return 1
+  assert_contains "$BOOTSTRAP_OUTPUT" "bin.equinox.io" || return 1
 }
 
 test_unsupported_architecture_rejected() {
@@ -290,11 +306,15 @@ test_failed_download_preserves_previous_state() {
 
 test_interrupted_promotion_recovers_previous_runtime() {
   make_case interrupted || return 1
-  /bin/mkdir -p "$CASE_DIR/support/runtime" "$CASE_DIR/support/install"
+  /bin/mkdir -p "$CASE_DIR/support/runtime" "$CASE_DIR/support/app" "$CASE_DIR/support/remote/ngrok" "$CASE_DIR/support/install"
   printf '%s\n' 'previous-runtime' > "$CASE_DIR/support/runtime/.release-marker"
+  printf '%s\n' 'previous-helper' > "$CASE_DIR/support/app/helper-artifact"
+  printf '%s\n' 'previous-ngrok' > "$CASE_DIR/support/remote/ngrok/ngrok"
   capture_bootstrap_with_env "$CASE_DIR" MAC_ORCHESTRATOR_TEST_FAIL_AFTER_PROMOTION
   [ "$BOOTSTRAP_RC" -ne 0 ] || return 1
   assert_content "$CASE_DIR/support/runtime/.release-marker" "previous-runtime" || return 1
+  assert_content "$CASE_DIR/support/app/helper-artifact" "previous-helper" || return 1
+  assert_content "$CASE_DIR/support/remote/ngrok/ngrok" "previous-ngrok" || return 1
   if [ -e "$CASE_DIR/support/install/promotion.marker" ]; then
     fail "promotion marker survived trapped recovery"
   fi
@@ -302,13 +322,17 @@ test_interrupted_promotion_recovers_previous_runtime() {
 
 test_next_run_recovers_promotion_marker() {
   make_case next-run-recovery || return 1
-  /bin/mkdir -p "$CASE_DIR/support/runtime" "$CASE_DIR/support/install/runtime.previous"
+  /bin/mkdir -p "$CASE_DIR/support/runtime" "$CASE_DIR/support/install/runtime.previous" "$CASE_DIR/support/install/app.previous" "$CASE_DIR/support/install/remote.previous"
   printf '%s\n' 'interrupted-runtime' > "$CASE_DIR/support/runtime/.release-marker"
   printf '%s\n' 'previous-runtime' > "$CASE_DIR/support/install/runtime.previous/.release-marker"
-  printf '%s\n' 'had_previous=1' > "$CASE_DIR/support/install/promotion.marker"
+  printf '%s\n' 'previous-helper' > "$CASE_DIR/support/install/app.previous/helper-artifact"
+  printf '%s\n' 'previous-ngrok' > "$CASE_DIR/support/install/remote.previous/ngrok"
+  printf '%s\n' 'phase=promoting' 'had_runtime=1' 'had_app=1' 'had_remote=1' > "$CASE_DIR/support/install/promotion.marker"
   capture_bootstrap_with_env "$CASE_DIR" MAC_ORCHESTRATOR_TEST_EXIT_AFTER_RECOVERY
   [ "$BOOTSTRAP_RC" -eq 0 ] || { echo "$BOOTSTRAP_OUTPUT" >&2; return 1; }
   assert_content "$CASE_DIR/support/runtime/.release-marker" "previous-runtime" || return 1
+  assert_content "$CASE_DIR/support/app/helper-artifact" "previous-helper" || return 1
+  assert_content "$CASE_DIR/support/remote/ngrok/ngrok" "previous-ngrok" || return 1
   if [ -e "$CASE_DIR/support/install/promotion.marker" ]; then
     fail "promotion marker was not cleared on next run"
   fi
@@ -319,6 +343,37 @@ test_artifact_builder_requires_release_inputs() {
   rc=$?
   [ "$rc" -ne 0 ] || return 1
   assert_contains "$output" "required" || return 1
+}
+
+test_artifact_builder_rejects_non_vendor_ngrok_url() {
+  digest="$(sha256 "$BOOTSTRAP")"
+  output="$(bash "$PROJECT_DIR/script/build_release_artifacts.sh" \
+    --product-version "0.3.0-fixture" \
+    --bootstrap-version "1.0.0-fixture" \
+    --bootstrap "$BOOTSTRAP" \
+    --bootstrap-url "https://github.com/Jay-2212/mac-orchestrator/releases/download/v0.3.0/bootstrap.sh" \
+    --bootstrap-sha256 "$digest" \
+    --helper-archive "$BOOTSTRAP" \
+    --helper-url "https://github.com/Jay-2212/mac-orchestrator/releases/download/v0.3.0/Mac-Orchestrator-arm64.zip" \
+    --helper-sha256 "$digest" \
+    --uv "$BOOTSTRAP" \
+    --uv-url "https://github.com/Jay-2212/mac-orchestrator/releases/download/v0.3.0/uv-arm64" \
+    --uv-sha256 "$digest" \
+    --core-payload "$BOOTSTRAP" \
+    --core-url "https://github.com/Jay-2212/mac-orchestrator/releases/download/v0.3.0/core-payload.tar.gz" \
+    --core-sha256 "$digest" \
+    --lock "$BOOTSTRAP" \
+    --lock-sha256 "$digest" \
+    --ngrok-archive "$BOOTSTRAP" \
+    --ngrok-version "3.39.10" \
+    --ngrok-url "https://downloads.example.com/ngrok-arm64.zip" \
+    --ngrok-sha256 "$digest" \
+    --ngrok-authority "Developer ID Application: ngrok, Inc. (TEAMFIX123)" \
+    --ngrok-team "TEAMFIX123" \
+    --output-dir "$TEST_ROOT/builder-vendor-output" 2>&1)"
+  rc=$?
+  [ "$rc" -ne 0 ] || return 1
+  assert_contains "$output" "bin.equinox.io" || return 1
 }
 
 test_package_app_helper_contract() {
@@ -357,7 +412,9 @@ select_test_plutil || exit 1
 run_test "valid manifest acceptance" test_valid_manifest_acceptance
 run_test "missing digest rejection" test_missing_digest_rejected
 run_test "wrong digest rejection" test_wrong_digest_rejected
+run_test "ngrok zip format requirement" test_ngrok_zip_format_required
 run_test "mutable release URL rejection" test_mutable_release_url_rejected
+run_test "non-vendor ngrok URL rejection" test_non_vendor_ngrok_url_rejected
 run_test "unsupported architecture rejection" test_unsupported_architecture_rejected
 run_test "minimum macOS rejection" test_old_macos_rejected
 run_test "repeat promotion is idempotent" test_repeat_promotion_is_idempotent
@@ -365,6 +422,7 @@ run_test "failed download preserves previous state" test_failed_download_preserv
 run_test "interrupted promotion recovers previous runtime" test_interrupted_promotion_recovers_previous_runtime
 run_test "next run recovers promotion marker" test_next_run_recovers_promotion_marker
 run_test "artifact builder requires release inputs" test_artifact_builder_requires_release_inputs
+run_test "artifact builder rejects non-vendor ngrok URL" test_artifact_builder_rejects_non_vendor_ngrok_url
 run_test "package helper contract" test_package_app_helper_contract
 
 if [ "$FAILURES" -ne 0 ]; then

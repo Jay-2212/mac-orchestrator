@@ -15,6 +15,7 @@ final class NativeRuntimeCoordinator {
     let runtimeDirectory: URL
     private let inheritedEnvironment: [String: String]
     private let readinessEvaluator: ReadinessEvaluator
+    private let portIsOccupied: (Int) -> Bool
 
     init(
         store: ConfigurationStore,
@@ -23,6 +24,7 @@ final class NativeRuntimeCoordinator {
         legacyConfigurationURL: URL,
         runtimeDirectory: URL,
         inheritedEnvironment: [String: String] = ProcessInfo.processInfo.environment,
+        portIsOccupied: @escaping (Int) -> Bool = LocalPortAllocator.isOccupied,
         readinessEvaluator: @escaping ReadinessEvaluator
     ) {
         self.store = store
@@ -31,6 +33,7 @@ final class NativeRuntimeCoordinator {
         self.legacyConfigurationURL = legacyConfigurationURL
         self.runtimeDirectory = runtimeDirectory
         self.inheritedEnvironment = inheritedEnvironment
+        self.portIsOccupied = portIsOccupied
         self.readinessEvaluator = readinessEvaluator
     }
 
@@ -42,7 +45,25 @@ final class NativeRuntimeCoordinator {
             keychain: keychain,
             store: store
         ).migrate()
-        return try await makeLaunchContract(configuration: store.load())
+        var configuration = try store.load()
+        let state = OnboardingStateClassifier.classify(configuration)
+        if state == .fresh {
+            configuration = try store.update { configuration in
+                configuration.onboarding.phase2State = .interrupted
+            }
+        }
+        if state == .fresh || state == .interrupted {
+            let selectedPort = try LocalPortAllocator.select(
+                preferred: configuration.localMCPPort,
+                isOccupied: portIsOccupied
+            )
+            if selectedPort != configuration.localMCPPort {
+                configuration = try store.update { configuration in
+                    configuration.localMCPPort = selectedPort
+                }
+            }
+        }
+        return try await makeLaunchContract(configuration: configuration)
     }
 
     func reload() async throws -> ManagedRuntimeLaunchContract {
@@ -54,6 +75,14 @@ final class NativeRuntimeCoordinator {
     ) async throws -> ManagedRuntimeLaunchContract {
         let configuration = try store.update(update)
         return try await makeLaunchContract(configuration: configuration)
+    }
+
+    @discardableResult
+    func markPhase2Completed() throws -> AppConfiguration {
+        try store.update { configuration in
+            configuration.onboarding.completed = true
+            configuration.onboarding.phase2State = .completed
+        }
     }
 
     static func defaultLegacyConfigurationURL(fileManager: FileManager = .default) -> URL {

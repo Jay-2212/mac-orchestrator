@@ -737,7 +737,7 @@ Commands run from the dedicated branch:
 | `uv sync --frozen --dry-run --python .venv/bin/python` | Pass; no changes. |
 | `uv sync --frozen --no-editable --dry-run --python .venv/bin/python` | Pass as a feasibility probe; it showed the editable root would be replaced by a non-editable file install, which the staged installer must use or otherwise validate. |
 | repository secret/personal-path scan from CI | Pass. |
-| `git diff --check` | Run again after this report is added; must pass before commit. |
+| `git diff --check` | Pass on the committed source diff. |
 
 Experimental state was disposable. No existing TCC grant was reset, no Keychain
 value or connector token was read, no ngrok token/account was used, no Telegram
@@ -778,8 +778,9 @@ uncertainties are recorded below rather than converted into guarantees.
 - Branch: `spike/phase2-terminal-bootstrap-feasibility`
 - Starting SHA: `a6bd52b8d0e41e580dc5b748522fc1d6897fd6a6`
 - Expected source change: this report only.
-- Commit and push are performed after final diff, secret, artifact, and gate
-  checks. No merge, tag, release, or `main` update is part of this spike.
+- The report is committed and the branch is pushed after final diff, secret,
+  artifact, and gate checks. No merge, tag, release, or `main` update is part
+  of this spike.
 
 ## Remaining unknowns
 

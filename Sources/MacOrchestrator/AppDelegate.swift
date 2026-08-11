@@ -3,6 +3,7 @@ import AppKit
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var supervisor: ProcessSupervisor?
+    private var runtimeCoordinator: NativeRuntimeCoordinator?
     private var menuController: MenuController?
     private var lockDescriptor: Int32 = -1
     private var sigtermSource: DispatchSourceSignal?
@@ -14,7 +15,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         do {
-            let supervisor = try ProcessSupervisor()
+            let fileManager = FileManager.default
+            let supportDirectory = ConfigurationStore.defaultDirectoryURL(fileManager: fileManager)
+            let runtimeDirectory = supportDirectory.appendingPathComponent("runtime", isDirectory: true)
+            let readinessCoordinator = CapabilityReadinessCoordinator(
+                session: .shared,
+                fileManager: fileManager
+            )
+            let runtimeCoordinator = NativeRuntimeCoordinator(
+                store: ConfigurationStore(fileManager: fileManager),
+                userDefaults: .standard,
+                keychain: KeychainStore(),
+                legacyConfigurationURL: NativeRuntimeCoordinator.defaultLegacyConfigurationURL(
+                    fileManager: fileManager
+                ),
+                runtimeDirectory: runtimeDirectory,
+                readinessEvaluator: { configuration, keychain, runtimeDirectory in
+                    await readinessCoordinator.evaluate(
+                        configuration: configuration,
+                        keychain: keychain,
+                        runtimeDirectory: runtimeDirectory
+                    )
+                }
+            )
+            self.runtimeCoordinator = runtimeCoordinator
+            let supervisor = try ProcessSupervisor(runtimeCoordinator: runtimeCoordinator)
             self.supervisor = supervisor
             menuController = MenuController(supervisor: supervisor)
             NSWorkspace.shared.notificationCenter.addObserver(
@@ -34,7 +59,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             source.resume()
             signal(SIGTERM, SIG_IGN)
             sigtermSource = source
-            supervisor.launch()
+            Task { @MainActor [weak self] in
+                guard let self, let supervisor = self.supervisor else { return }
+                do {
+                    supervisor.launch(with: try await runtimeCoordinator.prepare())
+                } catch {
+                    supervisor.reportStartupFailure(error)
+                }
+            }
         } catch {
             let alert = NSAlert(error: error)
             alert.messageText = "Mac Orchestrator could not start"

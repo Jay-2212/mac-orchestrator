@@ -10,13 +10,11 @@ final class ProcessSupervisor {
         didSet { onSnapshot?(snapshot) }
     }
 
-    private let defaults = UserDefaults.standard
+    private let runtimeCoordinator: NativeRuntimeCoordinator
     private let supportDirectory: URL
     let logsDirectory: URL
     private let runtimeDirectory: URL
     private let stateURL: URL
-    private let ownerID: String
-    private let connectorToken: String
     private let appLog: RotatingLog
     private let serverLog: RotatingLog
     private let tunnelLog: RotatingLog
@@ -30,18 +28,13 @@ final class ProcessSupervisor {
     private var serverRetryNotBefore = Date.distantPast
     private var tunnelRetryNotBefore = Date.distantPast
     private var quitting = false
+    private var activeContract: ManagedRuntimeLaunchContract?
+    private var ownerID = ""
+    private var serverDesired = false
+    private var tunnelDesired = false
 
-    private var serverDesired: Bool {
-        get { defaults.object(forKey: "serverDesired") as? Bool ?? true }
-        set { defaults.set(newValue, forKey: "serverDesired") }
-    }
-
-    private var tunnelDesired: Bool {
-        get { defaults.bool(forKey: "tunnelDesired") }
-        set { defaults.set(newValue, forKey: "tunnelDesired") }
-    }
-
-    init() throws {
+    init(runtimeCoordinator: NativeRuntimeCoordinator) throws {
+        self.runtimeCoordinator = runtimeCoordinator
         let library = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0]
         supportDirectory = library
             .appendingPathComponent("Application Support", isDirectory: true)
@@ -49,28 +42,20 @@ final class ProcessSupervisor {
         logsDirectory = library
             .appendingPathComponent("Logs", isDirectory: true)
             .appendingPathComponent("Mac Orchestrator", isDirectory: true)
-        runtimeDirectory = supportDirectory.appendingPathComponent("runtime", isDirectory: true)
+        runtimeDirectory = runtimeCoordinator.runtimeDirectory
         stateURL = supportDirectory.appendingPathComponent("owned-processes.json")
         try FileManager.default.createDirectory(
             at: supportDirectory,
             withIntermediateDirectories: true,
             attributes: [.posixPermissions: 0o700]
         )
-
-        if let existing = defaults.string(forKey: "ownerID") {
-            ownerID = existing
-        } else {
-            ownerID = UUID().uuidString.lowercased()
-            defaults.set(ownerID, forKey: "ownerID")
-        }
-        connectorToken = try KeychainStore.connectorToken()
         appLog = RotatingLog(directory: logsDirectory, name: "app.log")
         serverLog = RotatingLog(directory: logsDirectory, name: "server.log")
         tunnelLog = RotatingLog(directory: logsDirectory, name: "tunnel.log")
-        serverLog.redact([connectorToken])
     }
 
-    func launch() {
+    func launch(with contract: ManagedRuntimeLaunchContract) {
+        install(contract, requiresClientRefresh: false)
         appLog.write("Supervisor launched")
         cleanStaleOwnedProcesses()
         startHealthTimer()
@@ -79,12 +64,17 @@ final class ProcessSupervisor {
         }
     }
 
+    func reportStartupFailure(_ error: Error) {
+        snapshot.server = .failed
+        fail("Configuration startup failed: \(error.localizedDescription)")
+    }
+
     func startServerRequested() {
-        serverDesired = true
-        restartWorkItem?.cancel()
-        serverFailures.removeAll()
-        serverRetryNotBefore = .distantPast
-        startServer()
+        Task { @MainActor [weak self] in
+            await self?.updateConfiguration { configuration in
+                configuration.process.serverDesired = true
+            }
+        }
     }
 
     func stopServerRequested() {
@@ -92,38 +82,46 @@ final class ProcessSupervisor {
         tunnelDesired = false
         stopTunnel()
         stopServer()
+        Task { @MainActor [weak self] in
+            await self?.updateConfiguration { configuration in
+                configuration.process.serverDesired = false
+                configuration.process.tunnelDesired = false
+                configuration.desiredCapabilities["remote.connector"] = false
+            }
+        }
     }
 
     func enableConnectorRequested() {
-        tunnelDesired = true
-        tunnelFailures.removeAll()
-        tunnelRetryNotBefore = .distantPast
-        if serverProcess == nil {
-            serverDesired = true
-            startServer()
-        } else if snapshot.server == .running {
-            startTunnel()
+        Task { @MainActor [weak self] in
+            await self?.updateConfiguration { configuration in
+                configuration.process.serverDesired = true
+                configuration.process.tunnelDesired = true
+                configuration.desiredCapabilities["remote.connector"] = true
+            }
         }
     }
 
     func disableConnectorRequested() {
         tunnelDesired = false
         stopTunnel()
+        Task { @MainActor [weak self] in
+            await self?.updateConfiguration { configuration in
+                configuration.process.tunnelDesired = false
+                configuration.desiredCapabilities["remote.connector"] = false
+            }
+        }
     }
 
     func restartRequested() {
-        let restoreServer = serverDesired
-        let restoreTunnel = tunnelDesired
-        restartWorkItem?.cancel()
-        stopTunnel()
-        stopServer()
-        serverDesired = restoreServer
-        tunnelDesired = restoreTunnel
-        serverFailures.removeAll()
-        tunnelFailures.removeAll()
-        serverRetryNotBefore = .distantPast
-        tunnelRetryNotBefore = .distantPast
-        if restoreServer { startServer() }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let replacement = try await self.runtimeCoordinator.reload()
+                self.apply(replacement, forceRestart: true)
+            } catch {
+                self.fail("Configuration reload failed: \(error.localizedDescription)")
+            }
+        }
     }
 
     func stopForQuit() {
@@ -137,16 +135,97 @@ final class ProcessSupervisor {
 
     func handleWake() {
         appLog.write("Mac woke; rechecking managed services")
-        checkHealth()
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                self.apply(try await self.runtimeCoordinator.reload())
+            } catch {
+                self.fail("Configuration reload failed: \(error.localizedDescription)")
+            }
+            self.checkHealth()
+        }
     }
 
     func openLogs() {
         NSWorkspace.shared.open(logsDirectory)
     }
 
+    private func updateConfiguration(
+        _ update: (inout AppConfiguration) throws -> Void
+    ) async {
+        do {
+            apply(try await runtimeCoordinator.updateConfiguration(update))
+        } catch {
+            fail("Configuration update failed: \(error.localizedDescription)")
+        }
+    }
+
+    private func apply(
+        _ replacement: ManagedRuntimeLaunchContract,
+        forceRestart: Bool = false
+    ) {
+        guard let current = activeContract else {
+            install(replacement, requiresClientRefresh: false)
+            if serverDesired { startServer() }
+            return
+        }
+
+        let transition = ManagedRuntimeTransition.between(
+            current: current,
+            replacement: replacement
+        )
+        if forceRestart || transition.requiresRestart {
+            restartWorkItem?.cancel()
+            stopTunnel()
+            stopServer()
+            install(
+                replacement,
+                requiresClientRefresh: transition.requiresClientRefresh
+            )
+            serverFailures.removeAll()
+            tunnelFailures.removeAll()
+            serverRetryNotBefore = .distantPast
+            tunnelRetryNotBefore = .distantPast
+            if serverDesired { startServer() }
+            return
+        }
+
+        install(replacement, requiresClientRefresh: false)
+        if !serverDesired {
+            stopTunnel()
+            stopServer()
+        } else if serverProcess == nil {
+            startServer()
+        }
+        if !tunnelDesired {
+            stopTunnel()
+        } else if snapshot.server == .running {
+            startTunnel()
+        }
+    }
+
+    private func install(
+        _ contract: ManagedRuntimeLaunchContract,
+        requiresClientRefresh: Bool
+    ) {
+        activeContract = contract
+        ownerID = contract.configuration.ownerID
+        serverDesired = contract.configuration.process.serverDesired
+        tunnelDesired = contract.configuration.process.tunnelDesired
+        snapshot.applyRuntimeContract(
+            contract,
+            requiresClientRefresh: requiresClientRefresh
+        )
+        snapshot.error = nil
+        appLog.redact(contract.redactedSecrets)
+        serverLog.redact(contract.redactedSecrets)
+        tunnelLog.redact(contract.redactedSecrets)
+    }
+
     private func startServer() {
         guard !quitting, serverDesired, serverProcess == nil,
-              Date() >= serverRetryNotBefore else { return }
+              Date() >= serverRetryNotBefore,
+              let contract = activeContract else { return }
         let python = runtimeDirectory.appendingPathComponent(".venv/bin/python")
         let script = runtimeDirectory.appendingPathComponent("automac_mcp.py")
         guard FileManager.default.isExecutableFile(atPath: python.path),
@@ -154,8 +233,8 @@ final class ProcessSupervisor {
             fail("Installed Python runtime is missing. Run script/distribute.sh.")
             return
         }
-        if portIsOccupied(8000) {
-            fail("Port 8000 is already used by another process. Mac Orchestrator did not terminate it.")
+        if portIsOccupied(contract.port) {
+            fail("Port \(contract.port) is already used by another process. Mac Orchestrator did not terminate it.")
             scheduleRestart(component: "server", status: EADDRINUSE)
             return
         }
@@ -165,17 +244,12 @@ final class ProcessSupervisor {
         let process = Process()
         process.executableURL = python
         process.arguments = [script.path, "--managed-owner", ownerID]
-        var environment = ProcessInfo.processInfo.environment
-        environment["MAC_ORCHESTRATOR_MANAGED"] = "1"
-        environment["MAC_ORCHESTRATOR_CONNECTOR_TOKEN"] = connectorToken
-        environment["PYTHONUNBUFFERED"] = "1"
-        environment["PYTHONDONTWRITEBYTECODE"] = "1"
-        process.environment = environment
+        process.environment = contract.environment
         process.currentDirectoryURL = runtimeDirectory
         attachOutput(
             of: process,
             to: serverLog,
-            redacting: [connectorToken],
+            redacting: contract.redactedSecrets,
             dropping: ["GET /__mac_orchestrator_health "]
         )
         process.terminationHandler = { [weak self] terminated in
@@ -208,7 +282,8 @@ final class ProcessSupervisor {
 
     private func startTunnel() {
         guard !quitting, tunnelDesired, snapshot.server == .running, tunnelProcess == nil,
-              Date() >= tunnelRetryNotBefore else { return }
+              Date() >= tunnelRetryNotBefore,
+              let contract = activeContract else { return }
         guard let ngrok = Bundle.main.url(forResource: "ngrok", withExtension: nil),
               FileManager.default.isExecutableFile(atPath: ngrok.path) else {
             fail("Bundled ngrok agent is missing. Reinstall Mac Orchestrator.")
@@ -219,7 +294,7 @@ final class ProcessSupervisor {
         let process = Process()
         process.executableURL = ngrok
         process.arguments = [
-            "http", "http://127.0.0.1:8000",
+            "http", contract.tunnelTarget,
             "--log", "stdout",
             "--log-format", "json",
             "--log-level", "info",
@@ -312,9 +387,9 @@ final class ProcessSupervisor {
     }
 
     private func checkHealth() {
-        if let process = serverProcess, process.isRunning {
+        if let process = serverProcess, process.isRunning, let contract = activeContract {
             let processID = ObjectIdentifier(process)
-            var request = URLRequest(url: URL(string: "http://127.0.0.1:8000/__mac_orchestrator_health")!)
+            var request = URLRequest(url: contract.healthURL)
             request.timeoutInterval = 1
             URLSession.shared.dataTask(with: request) { [weak self, processID] _, response, _ in
                 Task { @MainActor [weak self, processID] in
@@ -345,7 +420,9 @@ final class ProcessSupervisor {
     private func queryTunnelURL() {
         var request = URLRequest(url: URL(string: "http://127.0.0.1:4040/api/tunnels")!)
         request.timeoutInterval = 1
-        guard let process = tunnelProcess, process.isRunning else { return }
+        guard let process = tunnelProcess, process.isRunning,
+              let contract = activeContract,
+              let connectorToken = contract.environment["MAC_ORCHESTRATOR_CONNECTOR_TOKEN"] else { return }
         let processID = ObjectIdentifier(process)
         URLSession.shared.dataTask(with: request) { [weak self, processID] data, _, _ in
             Task { @MainActor [weak self, processID] in
@@ -357,15 +434,14 @@ final class ProcessSupervisor {
                       let ownedTunnel = tunnels.first(where: {
                           guard let config = $0["config"] as? [String: Any],
                                 let address = config["addr"] as? String else { return false }
-                          return address == "http://127.0.0.1:8000" ||
-                                 address == "http://localhost:8000"
+                          return contract.matchesTunnelAddress(address)
                       }),
                       let publicURL = ownedTunnel["public_url"] as? String,
                       publicURL.hasPrefix("https://"),
                       let base = URL(string: publicURL) else { return }
                 self.snapshot.connectorURL = ConnectorURLBuilder.make(
                     publicURL: base.absoluteString,
-                    capabilityToken: self.connectorToken
+                    capabilityToken: connectorToken
                 )
                 self.snapshot.tunnel = .running
                 self.snapshot.error = nil

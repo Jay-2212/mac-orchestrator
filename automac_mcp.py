@@ -7,24 +7,28 @@ macOS desktop: press keys, move the mouse, read the screen, run commands,
 and chain multiple UI actions into atomic macros with realistic timing.
 """
 
-import subprocess
+import atexit
+import functools
 import json
-import time
+import logging
 import os
-import sys
 import re
 import signal
-import atexit
-import logging
+import subprocess
+import sys
 import threading
-import requests
+import time
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from rich.console import Console
-from rich.prompt import Prompt
-from rich.panel import Panel
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional
+
+import requests
 import pyautogui
+from rich.console import Console
+from rich.panel import Panel
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.server import TransportSecuritySettings
 from starlette.requests import Request
@@ -46,13 +50,474 @@ try:
 except ImportError:
     ACCESSIBILITY_AVAILABLE = False
 
-TELEGRAM_BOT_TOKEN = ""
-TELEGRAM_CHAT_ID = ""
+CAPABILITY_SNAPSHOT_ENV = "MAC_ORCHESTRATOR_CAPABILITY_SNAPSHOT"
+CAPABILITY_IDS = (
+    "core.session",
+    "mac.ui",
+    "mac.screenOcr",
+    "mac.files.read",
+    "mac.files.write",
+    "mac.shell",
+    "mac.clipboard.write",
+    "telegram.send",
+    "meridian.search",
+    "meridian.telegram",
+    "remote.connector",
+)
+_CAPABILITY_ID_SET = frozenset(CAPABILITY_IDS)
+_CONTROL_PROFILES = frozenset({"guided", "full"})
+_HEALTH_VALUES = frozenset({"ready", "disabled", "degraded", "unavailable"})
+
+
+class CapabilitySnapshotError(ValueError):
+    """Raised when the supervisor capability contract cannot be trusted."""
+
+
+class PolicyDenied(RuntimeError):
+    """Raised by the centralized policy layer for a denied operation."""
+
+    def __init__(self, operation: str, capability: str):
+        self.operation = operation
+        self.capability = capability
+        super().__init__(
+            f"{operation} is disabled by Mac Orchestrator policy. "
+            "Ask the user to enable it through Mac Orchestrator."
+        )
+
+
+@dataclass(frozen=True)
+class CapabilityState:
+    desired: bool
+    configured: bool
+    ready: bool
+    health: str
+    dependencies: tuple[str, ...]
+    reason: Optional[str]
+
+    @property
+    def enabled(self) -> bool:
+        return self.desired and self.configured and self.ready and self.health == "ready"
+
+
+@dataclass(frozen=True)
+class CapabilityPolicyConfig:
+    approved_file_roots: tuple[Path, ...]
+    clipboard_mutation: bool
+
+
+@dataclass(frozen=True)
+class CapabilitySnapshot:
+    """Validated, nonsecret capability state supplied by Swift or local dev."""
+
+    snapshot_schema_version: int
+    config_generation: int
+    control_profile: str
+    capabilities: Mapping[str, CapabilityState]
+    policy: CapabilityPolicyConfig
+
+    @classmethod
+    def from_dict(cls, document: Mapping[str, Any]) -> "CapabilitySnapshot":
+        if not isinstance(document, Mapping):
+            raise CapabilitySnapshotError("capability snapshot must be a JSON object")
+
+        expected_keys = {
+            "snapshotSchemaVersion",
+            "configGeneration",
+            "controlProfile",
+            "capabilities",
+            "policy",
+        }
+        unknown_keys = set(document) - expected_keys
+        if unknown_keys:
+            raise CapabilitySnapshotError(
+                f"capability snapshot contains unsupported fields: {sorted(unknown_keys)}"
+            )
+
+        schema_version = document.get("snapshotSchemaVersion")
+        if isinstance(schema_version, bool) or not isinstance(schema_version, int):
+            raise CapabilitySnapshotError("snapshotSchemaVersion must be an integer")
+        if schema_version != 1:
+            raise CapabilitySnapshotError(
+                f"unsupported capability snapshot schema {schema_version}; expected 1"
+            )
+
+        config_generation = document.get("configGeneration")
+        if isinstance(config_generation, bool) or not isinstance(config_generation, int):
+            raise CapabilitySnapshotError("configGeneration must be an integer")
+        if config_generation < 0:
+            raise CapabilitySnapshotError("configGeneration must not be negative")
+
+        control_profile = document.get("controlProfile")
+        if control_profile not in _CONTROL_PROFILES:
+            raise CapabilitySnapshotError(
+                f"controlProfile must be one of {sorted(_CONTROL_PROFILES)}"
+            )
+
+        raw_capabilities = document.get("capabilities")
+        if not isinstance(raw_capabilities, Mapping):
+            raise CapabilitySnapshotError("capabilities must be an object")
+        actual_ids = set(raw_capabilities)
+        missing_ids = _CAPABILITY_ID_SET - actual_ids
+        unknown_ids = actual_ids - _CAPABILITY_ID_SET
+        if missing_ids:
+            raise CapabilitySnapshotError(
+                f"capability snapshot is missing IDs: {sorted(missing_ids)}"
+            )
+        if unknown_ids:
+            raise CapabilitySnapshotError(
+                f"capability snapshot contains unknown IDs: {sorted(unknown_ids)}"
+            )
+
+        capabilities: dict[str, CapabilityState] = {}
+        for capability_id in CAPABILITY_IDS:
+            raw_state = raw_capabilities[capability_id]
+            if not isinstance(raw_state, Mapping):
+                raise CapabilitySnapshotError(f"{capability_id} state must be an object")
+            required_state_keys = {
+                "desired", "configured", "ready", "health", "dependencies", "reason"
+            }
+            unknown_state_keys = set(raw_state) - required_state_keys
+            if unknown_state_keys:
+                raise CapabilitySnapshotError(
+                    f"{capability_id} state contains unsupported fields: "
+                    f"{sorted(unknown_state_keys)}"
+                )
+            booleans = {
+                key: raw_state.get(key)
+                for key in ("desired", "configured", "ready")
+            }
+            if any(isinstance(value, bool) is False for value in booleans.values()):
+                raise CapabilitySnapshotError(
+                    f"{capability_id} desired/configured/ready values must be booleans"
+                )
+            health = raw_state.get("health")
+            if health not in _HEALTH_VALUES:
+                raise CapabilitySnapshotError(
+                    f"{capability_id} health must be one of {sorted(_HEALTH_VALUES)}"
+                )
+            dependencies = raw_state.get("dependencies")
+            if not isinstance(dependencies, list) or any(
+                not isinstance(item, str) or item not in _CAPABILITY_ID_SET
+                for item in dependencies
+            ):
+                raise CapabilitySnapshotError(
+                    f"{capability_id} dependencies must contain only canonical capability IDs"
+                )
+            reason = raw_state.get("reason")
+            if reason is not None and (
+                not isinstance(reason, str) or len(reason) > 512
+            ):
+                raise CapabilitySnapshotError(
+                    f"{capability_id} reason must be null or a short string"
+                )
+            capabilities[capability_id] = CapabilityState(
+                desired=booleans["desired"],
+                configured=booleans["configured"],
+                ready=booleans["ready"],
+                health=health,
+                dependencies=tuple(dependencies),
+                reason=reason,
+            )
+
+        raw_policy = document.get("policy")
+        if not isinstance(raw_policy, Mapping):
+            raise CapabilitySnapshotError("policy must be an object")
+        expected_policy_keys = {"approvedFileRoots", "clipboardMutation"}
+        unknown_policy_keys = set(raw_policy) - expected_policy_keys
+        if unknown_policy_keys:
+            raise CapabilitySnapshotError(
+                f"policy contains unsupported fields: {sorted(unknown_policy_keys)}"
+            )
+        raw_roots = raw_policy.get("approvedFileRoots")
+        if not isinstance(raw_roots, list) or any(
+            not isinstance(root, str) or not root.strip() for root in raw_roots
+        ):
+            raise CapabilitySnapshotError("policy.approvedFileRoots must be a list of paths")
+        roots: list[Path] = []
+        seen_roots: set[Path] = set()
+        for raw_root in raw_roots:
+            root = Path(raw_root)
+            if (
+                raw_root.startswith("~")
+                or not root.is_absolute()
+                or os.path.normpath(raw_root) != raw_root
+            ):
+                raise CapabilitySnapshotError(
+                    "policy.approvedFileRoots must contain normalized absolute paths"
+                )
+            canonical_root = root.resolve(strict=False)
+            if canonical_root not in seen_roots:
+                seen_roots.add(canonical_root)
+                roots.append(canonical_root)
+        clipboard_mutation = raw_policy.get("clipboardMutation")
+        if not isinstance(clipboard_mutation, bool):
+            raise CapabilitySnapshotError("policy.clipboardMutation must be a boolean")
+
+        return cls(
+            snapshot_schema_version=schema_version,
+            config_generation=config_generation,
+            control_profile=control_profile,
+            capabilities=dict(capabilities),
+            policy=CapabilityPolicyConfig(
+                approved_file_roots=tuple(roots),
+                clipboard_mutation=clipboard_mutation,
+            ),
+        )
+
+    @classmethod
+    def from_json(cls, raw_json: str) -> "CapabilitySnapshot":
+        try:
+            document = json.loads(raw_json)
+        except json.JSONDecodeError as exc:
+            raise CapabilitySnapshotError(
+                f"{CAPABILITY_SNAPSHOT_ENV} contains malformed JSON: {exc.msg}"
+            ) from exc
+        return cls.from_dict(document)
+
+    def is_ready(self, capability_id: str) -> bool:
+        try:
+            return self.capabilities[capability_id].enabled
+        except KeyError as exc:
+            raise CapabilitySnapshotError(f"unknown capability ID: {capability_id}") from exc
+
+    def safe_reason(self, capability_id: str) -> str:
+        state = self.capabilities[capability_id]
+        if not state.desired:
+            return "Disabled in Mac Orchestrator"
+        if not state.configured:
+            return "Not configured in Mac Orchestrator"
+        if not state.ready or state.health != "ready":
+            return "Not ready; ask the user to open Mac Orchestrator"
+        return "Ready"
+
+
+class CapabilityPolicy:
+    """Central authorization layer shared by direct and aggregate operations."""
+
+    def __init__(self, snapshot: CapabilitySnapshot):
+        self.snapshot = snapshot
+
+    def allows(self, capability_id: str) -> bool:
+        return self.snapshot.is_ready(capability_id)
+
+    def require(self, capability_id: str, operation: str) -> None:
+        if not self.allows(capability_id):
+            raise PolicyDenied(operation, capability_id)
+
+    @staticmethod
+    def _within(candidate: Path, root: Path) -> bool:
+        return candidate == root or root in candidate.parents
+
+    def canonical_path(self, raw_path: str) -> Path:
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            raise PolicyDenied("file operation", "mac.files.read")
+        return Path(os.path.expanduser(raw_path)).resolve(strict=False)
+
+    def authorize_path(self, raw_path: str, capability_id: str, operation: str) -> Path:
+        self.require(capability_id, operation)
+        candidate = self.canonical_path(raw_path)
+        if self.snapshot.control_profile == "full":
+            return candidate
+        roots = self.snapshot.policy.approved_file_roots
+        if not roots or not any(self._within(candidate, root) for root in roots):
+            raise PolicyDenied(
+                f"{operation} outside the approved file roots",
+                capability_id,
+            )
+        return candidate
+
+    def authorize_clipboard_mutation(self, operation: str) -> None:
+        self.require("mac.clipboard.write", operation)
+        if not self.snapshot.policy.clipboard_mutation:
+            raise PolicyDenied(operation, "mac.clipboard.write")
+
+
+@dataclass(frozen=True)
+class RuntimeSecrets:
+    """Secrets injected explicitly by the supervisor; never loaded from disk."""
+
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
+    meridian_ingest_token: str = ""
+    worker_url: str = ""
+
+    @classmethod
+    def from_environment(cls, environ: Optional[Mapping[str, str]] = None) -> "RuntimeSecrets":
+        env = os.environ if environ is None else environ
+        return cls(
+            telegram_bot_token=env.get("MAC_ORCHESTRATOR_TELEGRAM_BOT_TOKEN", "").strip(),
+            telegram_chat_id=env.get("MAC_ORCHESTRATOR_TELEGRAM_CHAT_ID", "").strip(),
+            meridian_ingest_token=env.get(
+                "MAC_ORCHESTRATOR_MERIDIAN_INGEST_TOKEN", ""
+            ).strip(),
+            worker_url=env.get("MAC_ORCHESTRATOR_WORKER_URL", "").strip(),
+        )
+
+
+@dataclass(frozen=True)
+class ServerRuntime:
+    snapshot: CapabilitySnapshot
+    secrets: RuntimeSecrets
+
+    @property
+    def policy(self) -> CapabilityPolicy:
+        return CapabilityPolicy(self.snapshot)
+
+
+def _local_snapshot(environ: Mapping[str, str]) -> CapabilitySnapshot:
+    """Build the explicit loopback developer profile without reading config files."""
+    secrets = RuntimeSecrets.from_environment(environ)
+    telegram_opt_in = environ.get("MAC_ORCHESTRATOR_ENABLE_TELEGRAM") == "1"
+    meridian_opt_in = environ.get("MAC_ORCHESTRATOR_ENABLE_MERIDIAN") == "1"
+    telegram_ready = telegram_opt_in and bool(
+        secrets.telegram_bot_token and secrets.telegram_chat_id
+    )
+    meridian_ready = meridian_opt_in and bool(
+        secrets.worker_url and secrets.meridian_ingest_token
+    )
+    local_ready = {
+        "core.session",
+        "mac.ui",
+        "mac.screenOcr",
+        "mac.files.read",
+        "mac.files.write",
+        "mac.shell",
+        "mac.clipboard.write",
+    }
+    if telegram_ready:
+        local_ready.add("telegram.send")
+    if meridian_ready:
+        local_ready.add("meridian.search")
+    profile = environ.get("MAC_ORCHESTRATOR_CONTROL_PROFILE", "full")
+    raw_roots = environ.get("MAC_ORCHESTRATOR_APPROVED_FILE_ROOTS", "")
+    roots = [root for root in raw_roots.split(os.pathsep) if root]
+    capabilities = {}
+    for capability_id in CAPABILITY_IDS:
+        if capability_id in local_ready:
+            capabilities[capability_id] = {
+                "desired": True,
+                "configured": True,
+                "ready": True,
+                "health": "ready",
+                "dependencies": [],
+                "reason": None,
+            }
+        else:
+            capabilities[capability_id] = {
+                "desired": False,
+                "configured": False,
+                "ready": False,
+                "health": "disabled",
+                "dependencies": [],
+                "reason": "disabled in local developer mode",
+            }
+    return CapabilitySnapshot.from_dict({
+        "snapshotSchemaVersion": 1,
+        "configGeneration": 0,
+        "controlProfile": profile,
+        "capabilities": capabilities,
+        "policy": {
+            "approvedFileRoots": roots,
+            "clipboardMutation": environ.get(
+                "MAC_ORCHESTRATOR_CLIPBOARD_MUTATION", "1"
+            ) == "1",
+        },
+    })
+
+
+def load_capability_snapshot(
+    environ: Optional[Mapping[str, str]] = None,
+) -> CapabilitySnapshot:
+    """Load a validated managed snapshot or deterministic loopback profile."""
+    env = os.environ if environ is None else environ
+    if env.get("MAC_ORCHESTRATOR_MANAGED") == "1":
+        raw = env.get(CAPABILITY_SNAPSHOT_ENV)
+        if not raw or not raw.strip():
+            raise CapabilitySnapshotError(
+                f"managed mode requires {CAPABILITY_SNAPSHOT_ENV}; refusing the historical full tool surface"
+            )
+        return CapabilitySnapshot.from_json(raw)
+    return _local_snapshot(env)
+
+
+def capability_report(snapshot: CapabilitySnapshot) -> Dict[str, Any]:
+    enabled = [capability_id for capability_id in CAPABILITY_IDS if snapshot.is_ready(capability_id)]
+    disabled = [
+        {"id": capability_id, "reason": snapshot.safe_reason(capability_id)}
+        for capability_id in CAPABILITY_IDS
+        if not snapshot.is_ready(capability_id)
+    ]
+    return {
+        "enabled": enabled,
+        "disabled": disabled,
+        "control_profile": snapshot.control_profile,
+        "snapshot_schema_version": snapshot.snapshot_schema_version,
+        "config_generation": snapshot.config_generation,
+        "file_policy": (
+            "approved_roots_only"
+            if snapshot.control_profile == "guided"
+            else "full_control"
+        ),
+        "clipboard_mutation": snapshot.policy.clipboard_mutation
+        and snapshot.is_ready("mac.clipboard.write"),
+        "setup_hint": (
+            "Disabled integrations are configured by the user through Mac Orchestrator. "
+            "Ask the user to open Mac Orchestrator; do not edit secrets or start services yourself."
+        ),
+    }
 
 MANAGED_MODE = os.getenv("MAC_ORCHESTRATOR_MANAGED") == "1"
 CONNECTOR_TOKEN = os.getenv("MAC_ORCHESTRATOR_CONNECTOR_TOKEN", "").strip()
 if CONNECTOR_TOKEN and not re.fullmatch(r"[A-Za-z0-9_-]{32,128}", CONNECTOR_TOKEN):
     raise RuntimeError("MAC_ORCHESTRATOR_CONNECTOR_TOKEN must be 32-128 URL-safe characters")
+
+try:
+    DEFAULT_SNAPSHOT = load_capability_snapshot()
+except CapabilitySnapshotError as exc:
+    raise RuntimeError(f"Mac Orchestrator capability startup failed: {exc}") from exc
+
+DEFAULT_SECRETS = RuntimeSecrets.from_environment()
+DEFAULT_RUNTIME = ServerRuntime(DEFAULT_SNAPSHOT, DEFAULT_SECRETS)
+_RUNTIME_CONTEXT: ContextVar[Optional[ServerRuntime]] = ContextVar(
+    "mac_orchestrator_runtime", default=None
+)
+
+
+def _runtime() -> ServerRuntime:
+    return _RUNTIME_CONTEXT.get() or DEFAULT_RUNTIME
+
+
+@contextmanager
+def use_runtime(
+    snapshot: CapabilitySnapshot,
+    secrets: Optional[RuntimeSecrets] = None,
+) -> Iterator[ServerRuntime]:
+    """Bind an isolated snapshot for deterministic direct-function tests."""
+    runtime = ServerRuntime(snapshot, secrets or RuntimeSecrets.from_environment())
+    token = _RUNTIME_CONTEXT.set(runtime)
+    try:
+        yield runtime
+    finally:
+        _RUNTIME_CONTEXT.reset(token)
+
+
+def _policy_guard(capability_id: str, operation: str) -> Optional[Dict[str, Any]]:
+    try:
+        _runtime().policy.require(capability_id, operation)
+    except PolicyDenied as exc:
+        return _fail(str(exc), error_code="POLICY_DENIED", capability=capability_id)
+    return None
+
+
+def _path_guard(
+    path: str,
+    capability_id: str,
+    operation: str,
+) -> tuple[Optional[Path], Optional[Dict[str, Any]]]:
+    try:
+        return _runtime().policy.authorize_path(path, capability_id, operation), None
+    except PolicyDenied as exc:
+        return None, _fail(str(exc), error_code="POLICY_DENIED", capability=capability_id)
 
 MCP_PATH = f"/{CONNECTOR_TOKEN}/mcp" if CONNECTOR_TOKEN else "/mcp"
 
@@ -65,40 +530,9 @@ transport_security = (
     else None
 )
 SERVER_PORT = int(os.getenv("MAC_ORCHESTRATOR_PORT", "8000"))
-
-SERVER_INSTRUCTIONS = """Mac Orchestrator gives you direct control of this macOS desktop.
-
-START HERE:
-- get_session_state() — call this first if you're about to do UI work. Tells you whether the
-  screen is unlocked/interactive, and whether Accessibility/Screen Recording permissions are
-  actually granted (not just theoretically available). Cheap, always safe to call.
-- describe(topic="overview") — full guide to macros, coordinate spaces, and UI inspection.
-  Tool descriptions below are intentionally short; call describe() for the deep version of any
-  of them before improvising.
-
-TWO WAYS TO FIND THINGS ON SCREEN:
-1. get_ui_tree(app=...) — structured accessibility tree (buttons, fields, labels, roles) with
-   stable "ref" ids. Prefer this: it's precise and gives you refs to act on directly.
-2. get_screen_text() — OCR fallback for content get_ui_tree can't see (images, canvases,
-   custom-drawn UI). Slower, fuzzier, coordinate-based only.
-
-ACTING ON THINGS: perform_ui_action(ref=...) resolves a ref from get_ui_tree and clicks/
-focuses/sets it, then reports what actually changed — prefer it over blind mouse_action()
-coordinate clicks when a ref is available.
-
-Batch related steps with execute_macro() instead of many separate round-trips."""
-
-mcp = FastMCP(
-    "AutoMac MCP - macOS UI Automation",
-    host="127.0.0.1",
-    port=SERVER_PORT,
-    streamable_http_path=MCP_PATH,
-    transport_security=transport_security,
-    instructions=SERVER_INSTRUCTIONS,
-)
+SERVER_INSTRUCTIONS = ""
 
 
-@mcp.custom_route("/__mac_orchestrator_health", methods=["GET"])
 async def _health_check(request: Request) -> JSONResponse:
     """Liveness probe for the native supervisor. Deliberately outside the
     capability path (FastMCP's custom_route bypasses it by design) and
@@ -290,6 +724,9 @@ def _run_applescript(body: str, timeout: int = 10) -> Dict[str, Any]:
 # These are called by individual MCP tools AND by execute_macro.
 
 def _do_keystroke(key: str, modifiers: list = None) -> Dict[str, Any]:
+    denied = _policy_guard("mac.ui", "press_keystroke")
+    if denied:
+        return denied
     try:
         cmd = _build_keystroke_cmd(key, modifiers)
     except ValueError as e:
@@ -302,6 +739,9 @@ def _do_keystroke(key: str, modifiers: list = None) -> Dict[str, Any]:
 
 def _do_mouse(x: int, y: int, action: str = "click", hold_keys: list = None,
               end_x: int = None, end_y: int = None) -> Dict[str, Any]:
+    denied = _policy_guard("mac.ui", "mouse_action")
+    if denied:
+        return denied
     valid = {"move", "click", "double_click", "right_click", "drag"}
     if action not in valid:
         return _fail(f"Invalid action '{action}'. Valid: {sorted(valid)}")
@@ -346,10 +786,30 @@ def _do_mouse(x: int, y: int, action: str = "click", hold_keys: list = None,
         return _fail(f"Mouse action failed: {e}")
 
 def _do_type(text: str, use_clipboard: Optional[bool] = None) -> Dict[str, Any]:
+    denied = _policy_guard("mac.ui", "type_text")
+    if denied:
+        return denied
     if not text:
         return _fail("text is required", error_code="INVALID_PARAM")
     is_pure_ascii = all(ord(c) < 128 for c in text)
     should_use_clipboard = use_clipboard if use_clipboard is not None else not is_pure_ascii
+    if should_use_clipboard:
+        denied = _policy_guard("mac.clipboard.write", "type_text clipboard fallback")
+        if denied:
+            return denied
+        if not _runtime().snapshot.policy.clipboard_mutation:
+            return _fail(
+                "type_text would require clipboard mutation, which is disabled by policy.",
+                error_code="POLICY_DENIED",
+                capability="mac.clipboard.write",
+            )
+    elif not is_pure_ascii:
+        return _fail(
+            "Unicode typing requires clipboard mutation or a supported native text path; "
+            "clipboard mutation is disabled by policy.",
+            error_code="POLICY_DENIED",
+            capability="mac.clipboard.write",
+        )
     try:
         if should_use_clipboard:
             r = subprocess.run(['pbcopy'], input=text, text=True, capture_output=True, timeout=5)
@@ -368,6 +828,9 @@ def _do_type(text: str, use_clipboard: Optional[bool] = None) -> Dict[str, Any]:
         return _fail(f"Failed to type: {e}", error_code="EXEC_ERROR")
 
 def _do_scroll(dx: int = 0, dy: int = 0) -> Dict[str, Any]:
+    denied = _policy_guard("mac.ui", "scroll")
+    if denied:
+        return denied
     try:
         if dx == 0 and dy == 0:
             return _ok("Scrolled (no movement)")
@@ -383,6 +846,9 @@ def _do_scroll(dx: int = 0, dy: int = 0) -> Dict[str, Any]:
         return _fail(f"Scroll failed: {e}", error_code="EXEC_ERROR")
 
 def _do_focus_app(app_name: str, timeout: int = 30) -> Dict[str, Any]:
+    denied = _policy_guard("mac.ui", "focus_app")
+    if denied:
+        return denied
     if not app_name:
         return _fail("app_name is required")
     if timeout <= 0:
@@ -436,88 +902,166 @@ def _do_focus_app(app_name: str, timeout: int = 30) -> Dict[str, Any]:
 # lot of context. describe() holds the longer version of anything that got
 # trimmed — call it before improvising against an unfamiliar tool.
 
-_DESCRIBE_TOPICS: Dict[str, str] = {
-    "overview": SERVER_INSTRUCTIONS,
-    "macro_actions": """execute_macro() action dict reference — every supported "action" value:
+def _macro_actions_text(snapshot: CapabilitySnapshot) -> str:
+    if not snapshot.is_ready("mac.ui"):
+        return "Macro guidance is unavailable because UI operation is disabled in this snapshot."
+    actions = [
+        '{"action": "keystroke", "key": "space", "modifiers": ["command"]}',
+        '{"action": "type", "text": "Hello World"}',
+        '{"action": "click", "x": 100, "y": 200}',
+        '{"action": "double_click", "x": 100, "y": 200}',
+        '{"action": "right_click", "x": 100, "y": 200}',
+        '{"action": "move", "x": 100, "y": 200}',
+        '{"action": "drag", "x": 200, "y": 300, "end_x": 800, "end_y": 400}',
+        '{"action": "scroll", "dx": 0, "dy": -300}',
+        '{"action": "focus_app", "app": "Notes"}',
+        '{"action": "delay", "ms": 2000}',
+    ]
+    if snapshot.is_ready("mac.shell"):
+        actions.append('{"action": "run_command", "command": "ls ~/Desktop", "timeout_seconds": 30}')
+    if snapshot.is_ready("mac.files.write"):
+        actions.append('{"action": "write_file", "path": "~/Desktop/out.txt", "content": "hello", "mode": "overwrite"}')
+    if snapshot.is_ready("mac.files.read"):
+        actions.append('{"action": "read_file", "path": "~/Desktop/in.txt", "max_chars": 4000}')
+    if snapshot.policy.clipboard_mutation and snapshot.is_ready("mac.clipboard.write"):
+        actions.append('{"action": "set_clipboard", "content": "text to paste later"}')
+    return (
+        'execute_macro() action dict reference — supported "action" values:\n\n'
+        + "\n".join(actions)
+        + '\n\nx/y are logical screen coordinates. The macro stops at the first failed '
+        "step; partial progress and a recovery_hint are always returned."
+    )
 
-{"action": "keystroke", "key": "space", "modifiers": ["command"]}
-{"action": "type", "text": "Hello World"}
-{"action": "click", "x": 100, "y": 200}
-{"action": "double_click", "x": 100, "y": 200}
-{"action": "right_click", "x": 100, "y": 200}
-{"action": "move", "x": 100, "y": 200}
-{"action": "drag", "x": 200, "y": 300, "end_x": 800, "end_y": 400}
-{"action": "scroll", "dx": 0, "dy": -300}
-{"action": "focus_app", "app": "Notes"}
-{"action": "delay", "ms": 2000}
-{"action": "run_command", "command": "ls ~/Desktop", "timeout_seconds": 30}
-{"action": "write_file", "path": "~/Desktop/out.txt", "content": "hello", "mode": "overwrite"}
-{"action": "read_file", "path": "~/Desktop/in.txt", "max_chars": 4000}
-{"action": "set_clipboard", "content": "text to paste later"}
 
-x/y are logical screen coordinates (see describe(topic="coordinate_system")).
-The macro stops at the first failed step; partial progress and a recovery_hint
-are always returned so you know exactly where to resume.""",
-    "find_file_query_syntax": """find_file() uses Spotlight keyword matching (mdfind), NOT semantic search.
+def _local_search_scope(snapshot: CapabilitySnapshot) -> str:
+    return (
+        "an approved directory"
+        if snapshot.control_profile == "guided"
+        else "the directory you want to search"
+    )
 
-Queries that WORK (filename keywords, content keywords, exact terms):
-   "automac_mcp"      -> finds files with this name
-   "Ambica Wooden"     -> finds files containing these words
-   "kind:pdf"          -> Spotlight metadata query
-   "date:today"        -> files modified today
 
-Queries that DON'T WORK (conceptual/semantic):
-   "python scripts"    -> will not match .py files
-   "study notes"       -> won't find your notebook unless it literally says "study notes"
-   "recent downloads"  -> use list_directory(sort_by="date_desc") instead
+def _local_search_instruction(snapshot: CapabilitySnapshot) -> str:
+    return (
+        "- Use Local Pattern Search (smart_search()) for regex or exact content "
+        f"within {_local_search_scope(snapshot)}."
+    )
 
-For semantic/meaning-based search, use vector_search() (requires the indexer to be running).
-For regex-in-content search across a directory, use smart_search().
-For browsing by date or size without a query, use list_directory().""",
-    "ui_inspection": """Three ways to find something on screen, in order of preference:
 
-1. get_ui_tree(app=...) — the accessibility tree. Precise, gives you a "ref" you
-   can pass straight to perform_ui_action(). Use role_filter/actionable_only to
-   narrow a busy window down to just the buttons/fields you care about.
-2. get_screen_layout() — cheap top-level window list (title + bounds) with no
-   children. Good for "what windows are open" before deciding what to inspect.
-3. get_screen_text() — OCR fallback for content the accessibility tree can't see
-   (canvases, images, custom-drawn UI). Slower (~5s cold start), fuzzier, and
-   only gives you coordinates — no ref, no semantic action, no postcondition check.
+def build_server_instructions(snapshot: CapabilitySnapshot) -> str:
+    """Generate agent guidance from exactly the snapshot used for registration."""
+    lines = [
+        "Mac Orchestrator gives you direct control of this macOS desktop.",
+        "",
+        "START HERE:",
+        "- get_capabilities() — inspect the current capability snapshot and policy.",
+        "- get_session_state() — inspect session and permissions before UI work.",
+        "- describe(topic=...) — request the detailed guide for an enabled tool group.",
+    ]
+    if snapshot.is_ready("mac.ui"):
+        lines.extend([
+            "",
+            "UI INSPECTION:",
+            "- Prefer get_ui_tree() and its stable refs over coordinate guessing.",
+            "- Use get_screen_layout() for a cheap window survey, then perform_ui_action(ref=...) when a ref exists.",
+        ])
+        if snapshot.is_ready("mac.screenOcr"):
+            lines.append("- Use get_screen_text() as the OCR fallback for custom-drawn content.")
+        # The macro tool is registered with mac.ui; keep this line concise.
+        lines.append("- Batch tightly related safe UI actions with execute_macro() when appropriate.")
+    if snapshot.is_ready("mac.files.read"):
+        lines.extend([
+            "",
+            "LOCAL SEARCH:",
+            "- Use find_file() for Spotlight keyword/exact-content search.",
+            _local_search_instruction(snapshot),
+            "- Use list_directory() for browsing by date or size.",
+        ])
+    if snapshot.is_ready("meridian.search"):
+        lines.extend([
+            "",
+            "- Use vector_search() for semantic search only when it is registered.",
+        ])
+    if snapshot.is_ready("mac.shell"):
+        lines.extend([
+            "",
+            "- Use run_terminal_command() only for an explicit task; use capability diagnostics rather than shell repair.",
+        ])
+    if snapshot.is_ready("mac.files.write"):
+        lines.append("- File writes are available only within the current policy boundary.")
+    if not snapshot.is_ready("mac.ui"):
+        lines.extend([
+            "",
+            "UI operation is not enabled in this snapshot. Ask the user to open Mac Orchestrator if it is needed.",
+        ])
+    lines.extend([
+        "",
+        "Disabled integrations are configured by the user through Mac Orchestrator; do not edit secrets or start services yourself.",
+    ])
+    return "\n".join(lines)
 
-Once you have a ref from get_ui_tree(), prefer perform_ui_action(ref=...) over a
-blind mouse_action() coordinate click: it targets the exact element you saw
-(coordinates can drift if the window moves) and tells you what actually changed.
 
-If get_ui_tree() returns empty or errors, call get_session_state() before assuming
-the app has no UI — it may be a permission or locked-session issue instead.""",
-    "coordinate_system": """All screen tools agree on ONE coordinate space: logical points, not raw pixels.
+def _describe_topics(snapshot: CapabilitySnapshot) -> Dict[str, str]:
+    topics = {"overview": build_server_instructions(snapshot)}
+    if snapshot.is_ready("mac.ui"):
+        topics["macro_actions"] = _macro_actions_text(snapshot)
+        ui_text = """Three ways to find something on screen, in order of preference:
 
-get_screen_size() returns logical_width/logical_height — pass these (not
-pixel_width/pixel_height) to mouse_action(). get_screen_text() and get_ui_tree()
-both already return positions in logical space. On a Retina display, logical
-values are about half the raw pixel values — mixing the two silently misplaces
-every click. If in doubt, get bounds from get_ui_tree()/get_screen_layout()/
-get_screen_text() and use them directly rather than computing coordinates by hand.""",
-}
+1. get_ui_tree(app=...) — the accessibility tree. Precise, gives you a stable ref
+   for perform_ui_action(). Use role_filter/actionable_only to narrow a busy window.
+2. get_screen_layout() — a cheap top-level window survey with no children.
+"""
+        if snapshot.is_ready("mac.screenOcr"):
+            ui_text += "3. get_screen_text() — OCR fallback for custom-drawn content; it is slower and coordinate-based.\n"
+        ui_text += """
+Prefer a ref from get_ui_tree() over blind coordinate clicks. If the tree is empty
+or errors, call get_session_state() before assuming the app has no UI."""
+        topics["ui_inspection"] = ui_text
+        topics["coordinate_system"] = """All screen tools use logical points, not raw pixels.
 
-@mcp.tool()
+get_screen_size() returns logical dimensions for mouse_action(). Positions from
+get_ui_tree() and OCR are already in logical space. Do not mix Retina pixel values
+with logical coordinates."""
+    if snapshot.is_ready("mac.files.read"):
+        search_text = f"""find_file() uses Spotlight keyword matching (mdfind), not semantic search.
+
+Use filename/content keywords or Spotlight metadata queries such as "kind:pdf".
+Use list_directory() for browsing by date or size and Local Pattern Search
+(smart_search()) for regex content search inside {_local_search_scope(snapshot)}."""
+        if snapshot.is_ready("meridian.search"):
+            search_text += "\nUse vector_search() for semantic search when the registered integration is ready."
+        topics["find_file_query_syntax"] = search_text
+    return topics
+
+
+def describe_for_snapshot(snapshot: CapabilitySnapshot, topic: str = "overview") -> str:
+    return _describe_topics(snapshot).get(topic, "")
+
 def describe(topic: str = "overview") -> Dict[str, Any]:
     """Get the full-length guide for a topic that tool descriptions only summarize.
 
     Args:
-        topic: One of "overview", "macro_actions", "find_file_query_syntax",
-              "ui_inspection", "coordinate_system". Unknown topics return the
-              available list instead of an error.
+        topic: A topic advertised by this server's current capability snapshot.
+               Unknown or unavailable topics return the available list instead of
+               an error.
     """
-    if topic not in _DESCRIBE_TOPICS:
-        return _ok(f"Unknown topic '{topic}'.", available_topics=sorted(_DESCRIBE_TOPICS.keys()))
-    return _ok(f"describe({topic!r})", topic=topic, text=_DESCRIBE_TOPICS[topic])
+    topics = _describe_topics(_runtime().snapshot)
+    if topic not in topics:
+        return _ok(f"Unknown or unavailable topic '{topic}'.", available_topics=sorted(topics))
+    return _ok(f"describe({topic!r})", topic=topic, text=topics[topic])
+
+
+def get_capabilities() -> Dict[str, Any]:
+    """Report the compact, nonsecret capability and policy state."""
+    report = capability_report(_runtime().snapshot)
+    return _ok(
+        "Capability snapshot loaded; disabled integrations are user-managed.",
+        **report,
+    )
 
 
 # ── 1. Keyboard ───────────────────────────────────────────────────────────────
 
-@mcp.tool()
 def press_keystroke(key: str, modifiers: list[str] = []) -> Dict[str, Any]:
     """Press a single key, optionally with modifier keys held down.
 
@@ -549,7 +1093,6 @@ def press_keystroke(key: str, modifiers: list[str] = []) -> Dict[str, Any]:
 
 # ── 2. Mouse ──────────────────────────────────────────────────────────────────
 
-@mcp.tool()
 def mouse_action(x: int, y: int, action: str = "click",
                  hold_keys: list[str] = [],
                  end_x: int = None, end_y: int = None) -> Dict[str, Any]:
@@ -573,7 +1116,6 @@ def mouse_action(x: int, y: int, action: str = "click",
 
 # ── 3. Text Input ────────────────────────────────────────────────────────────
 
-@mcp.tool()
 def type_text(text: str, use_clipboard: Optional[bool] = None) -> Dict[str, Any]:
     """Type a string of text into the focused input field.
 
@@ -594,7 +1136,6 @@ def type_text(text: str, use_clipboard: Optional[bool] = None) -> Dict[str, Any]
 
 # ── 4. Scrolling ─────────────────────────────────────────────────────────────
 
-@mcp.tool()
 def scroll(dx: int = 0, dy: int = 0) -> Dict[str, Any]:
     """Scroll at the current mouse position.
 
@@ -610,7 +1151,6 @@ def scroll(dx: int = 0, dy: int = 0) -> Dict[str, Any]:
 
 # ── 5. Macro Execution ───────────────────────────────────────────────────────
 
-@mcp.tool()
 def execute_macro(actions: list[dict], default_delay_ms: int = 750) -> Dict[str, Any]:
     """Run a sequence of UI actions as one batch, instead of a separate round-trip per step.
 
@@ -621,9 +1161,9 @@ def execute_macro(actions: list[dict], default_delay_ms: int = 750) -> Dict[str,
             {"action": "click", "x": 100, "y": 200}
             {"action": "focus_app", "app": "Notes"}
             {"action": "delay", "ms": 2000}
-            Also supported: double_click, right_click, move, drag, scroll, run_command,
-            write_file, read_file, set_clipboard — call describe(topic="macro_actions")
-            for the full parameter list of each.
+            Also supported: double_click, right_click, move, drag, and scroll. Optional
+            shell, file, and clipboard actions are policy-controlled; the registered
+            tool description is authoritative for which of those actions are available.
         default_delay_ms: Pause between actions in ms (default 750) so macOS UI has
                           time to animate. Increase for slow transitions.
 
@@ -634,6 +1174,9 @@ def execute_macro(actions: list[dict], default_delay_ms: int = 750) -> Dict[str,
               {"action": "keystroke", "key": "n", "modifiers": ["command"]},
               {"action": "type", "text": "Hello from AI!"}]
     """
+    denied = _policy_guard("mac.ui", "execute_macro")
+    if denied:
+        return denied
     if not actions:
         return _fail("actions list is empty")
 
@@ -667,60 +1210,42 @@ def execute_macro(actions: list[dict], default_delay_ms: int = 750) -> Dict[str,
                 res = _fail("run_command step requires 'command' key", error_code="INVALID_PARAM")
             else:
                 timeout_s = max(1, min(act.get("timeout_seconds", 30), 300))
-                try:
-                    r = subprocess.run(cmd, shell=True, capture_output=True,
-                                       text=True, timeout=timeout_s)
-                    stdout = r.stdout[:3000] + ("...[truncated]" if len(r.stdout) > 3000 else "")
-                    stderr = r.stderr[:500] + ("...[truncated]" if len(r.stderr) > 500 else "")
-                    if r.returncode == 0:
-                        res = _ok("Command completed", stdout=stdout, stderr=stderr, exit_code=0)
-                    else:
-                        res = _fail(f"Command failed (exit {r.returncode})",
-                                    error_code="EXEC_ERROR", stdout=stdout, stderr=stderr,
-                                    exit_code=r.returncode)
-                except subprocess.TimeoutExpired:
-                    res = _fail(f"Command timed out after {timeout_s}s", error_code="TIMEOUT")
-                except Exception as e:
-                    res = _fail(f"Command error: {e}", error_code="EXEC_ERROR")
+                res = run_terminal_command(
+                    cmd,
+                    timeout_seconds=timeout_s,
+                    run_in_background=False,
+                    max_output_chars=3500,
+                )
         elif action_type == "write_file":
             wf_path = act.get("path", "")
             if not wf_path:
                 res = _fail("write_file step requires 'path' key", error_code="INVALID_PARAM")
             else:
-                try:
-                    p = os.path.expanduser(wf_path)
-                    os.makedirs(os.path.dirname(os.path.abspath(p)), exist_ok=True)
-                    wf_mode = "a" if act.get("mode", "overwrite") == "append" else "w"
-                    wf_content = act.get("content", "")
-                    with open(p, wf_mode, encoding="utf-8") as f:
-                        f.write(wf_content)
-                    res = _ok(f"Wrote {len(wf_content)} chars to {p}")
-                except Exception as e:
-                    res = _fail(f"Write failed: {e}", error_code="EXEC_ERROR")
+                res = write_file(
+                    wf_path,
+                    act.get("content", ""),
+                    mode=act.get("mode", "overwrite"),
+                )
         elif action_type == "read_file":
             rf_path = act.get("path", "")
             if not rf_path:
                 res = _fail("read_file step requires 'path' key", error_code="INVALID_PARAM")
             else:
-                try:
-                    p = os.path.expanduser(rf_path)
+                res = read_file(rf_path)
+                if res.get("status") == "success":
                     max_c = max(100, min(act.get("max_chars", 4000), 20000))
-                    with open(p, "r", encoding="utf-8") as f:
-                        content = f.read(max_c)
-                    truncated = os.path.getsize(p) > max_c
-                    res = _ok(f"Read {len(content)} chars from {p}",
-                              content=content, truncated=truncated)
-                except FileNotFoundError:
-                    res = _fail(f"File not found: {rf_path}", error_code="NOT_FOUND")
-                except Exception as e:
-                    res = _fail(f"Read failed: {e}", error_code="EXEC_ERROR")
+                    content = res.get("content", "")
+                    truncated = len(content) > max_c
+                    if truncated:
+                        content = content[:max_c]
+                    res = _ok(
+                        f"Read {len(content)} chars from {rf_path}",
+                        content=content,
+                        truncated=truncated,
+                    )
         elif action_type == "set_clipboard":
             clip_content = act.get("content", "")
-            try:
-                subprocess.run(['pbcopy'], input=clip_content, text=True, timeout=5)
-                res = _ok(f"Clipboard set ({len(clip_content)} chars)")
-            except Exception as e:
-                res = _fail(f"Clipboard set failed: {e}", error_code="EXEC_ERROR")
+            res = clipboard(action="set", content=clip_content)
         else:
             res = _fail(f"Unknown action type: {action_type}", error_code="INVALID_PARAM")
 
@@ -766,7 +1291,6 @@ def execute_macro(actions: list[dict], default_delay_ms: int = 750) -> Dict[str,
 
 # ── 6. App Management ────────────────────────────────────────────────────────
 
-@mcp.tool()
 def focus_app(app_name: str, timeout: int = 30) -> Dict[str, Any]:
     """Bring an application to the foreground and wait for it to become active.
 
@@ -776,7 +1300,6 @@ def focus_app(app_name: str, timeout: int = 30) -> Dict[str, Any]:
     """
     return _do_focus_app(app_name, timeout)
 
-@mcp.tool()
 def get_available_apps() -> Dict[str, Any]:
     """List all currently running (non-background) applications.
 
@@ -788,6 +1311,9 @@ def get_available_apps() -> Dict[str, Any]:
     Filter apps_detail to activation_policy == "regular" for Dock-visible apps
     that are meaningful focus_app() targets.
     """
+    denied = _policy_guard("mac.ui", "get_available_apps")
+    if denied:
+        return denied
     if ACCESSIBILITY_AVAILABLE:
         try:
             apps_detail = _list_running_apps()
@@ -811,7 +1337,6 @@ def get_available_apps() -> Dict[str, Any]:
 
 # ── 6.5 Session & Permission Diagnostics ──────────────────────────────────────
 
-@mcp.tool()
 def get_session_state() -> Dict[str, Any]:
     """Check whether this Mac can currently do interactive GUI work, and whether the
     permissions UI automation depends on are actually granted (not just theoretically
@@ -824,8 +1349,9 @@ def get_session_state() -> Dict[str, Any]:
     - Accessibility or Screen Recording permission not granted → the specific tools
       that need each one.
 
-    File I/O, terminal commands, and clipboard access do not require an unlocked
-    session or these permissions and remain available regardless.
+    File I/O, terminal commands, and clipboard access are separate from TCC
+    permissions, but their availability is still controlled by the capability
+    snapshot and policy returned by get_capabilities().
     """
     session: Dict[str, Any] = {"on_console": None, "is_locked": None}
     try:
@@ -858,7 +1384,7 @@ def get_session_state() -> Dict[str, Any]:
     notes = []
     if session.get("is_locked"):
         notes.append("Screen is locked — mouse/keyboard/screen tools will fail or no-op. "
-                     "File, terminal, and clipboard tools still work.")
+                     "Background capabilities remain policy-controlled.")
     if session.get("on_console") is False:
         notes.append("This session is not the active console session (fast user switch or "
                      "remote/background session) — GUI actions target a session the user isn't "
@@ -869,9 +1395,13 @@ def get_session_state() -> Dict[str, Any]:
                      "will fail. Grant it to the running server process in System Settings → "
                      "Privacy & Security → Accessibility, then restart the server.")
     if screen_recording_granted is False:
-        notes.append("Screen Recording permission not granted — get_screen_text() "
-                     "(OCR/screenshot) will fail or return blank. Grant it in System Settings → "
-                     "Privacy & Security → Screen Recording, then restart the server.")
+        if _runtime().policy.allows("mac.screenOcr"):
+            notes.append("Screen Recording permission not granted — the registered OCR/screenshot "
+                         "capability will fail or return blank. Grant it in System Settings → "
+                         "Privacy & Security → Screen Recording, then restart the server.")
+        else:
+            notes.append("Screen Recording permission not granted, and the OCR capability is not "
+                         "registered in this snapshot. Ask the user to open Mac Orchestrator.")
 
     return _ok(
         "GUI interaction available" if gui_available else "GUI interaction constrained — see notes",
@@ -881,14 +1411,22 @@ def get_session_state() -> Dict[str, Any]:
             "accessibility": accessibility_granted,
             "screen_recording": screen_recording_granted,
         },
-        background_capabilities_available=True,
+        background_capabilities_available={
+            "file_read": _runtime().policy.allows("mac.files.read"),
+            "file_write": _runtime().policy.allows("mac.files.write"),
+            "shell": _runtime().policy.allows("mac.shell"),
+            "clipboard_read": True,
+            "clipboard_mutation": (
+                _runtime().policy.allows("mac.clipboard.write")
+                and _runtime().snapshot.policy.clipboard_mutation
+            ),
+        },
         notes=notes,
     )
 
 
 # ── 7. Screen Comprehension ──────────────────────────────────────────────────
 
-@mcp.tool()
 def get_screen_size() -> Dict[str, Any]:
     """Get screen dimensions in both logical and pixel coordinates.
 
@@ -897,6 +1435,9 @@ def get_screen_size() -> Dict[str, Any]:
     dimensions are only needed if you are processing raw screenshot images.
     Coordinates from get_screen_text() are already in logical space.
     """
+    denied = _policy_guard("mac.ui", "get_screen_size")
+    if denied:
+        return denied
     try:
         lw, lh = pyautogui.size()
         try:
@@ -1015,7 +1556,6 @@ def _resolve_app_pid(app: str = "", pid: Optional[int] = None) -> Dict[str, Any]
                      error_code="INVALID_PARAM", candidates=matches)
     return {"pid": matches[0]["pid"]}
 
-@mcp.tool()
 def get_screen_layout() -> Dict[str, Any]:
     """Get window titles and bounds for all visible apps via Accessibility APIs.
 
@@ -1026,6 +1566,9 @@ def get_screen_layout() -> Dict[str, Any]:
     this returns empty results or a PERMISSION error.
     Passwords in secure text fields are automatically redacted by macOS.
     """
+    denied = _policy_guard("mac.ui", "get_screen_layout")
+    if denied:
+        return denied
     if not ACCESSIBILITY_AVAILABLE:
         return _fail(
             "macOS Accessibility frameworks not available (pyobjc import failed). "
@@ -1286,7 +1829,6 @@ def _ax_walk_flat(elem, pid: int, depth_remaining: int, state: "_AXWalkState") -
                 if state.stop:
                     break
 
-@mcp.tool()
 def get_ui_tree(app: str = "", pid: Optional[int] = None, ref: str = "",
                 depth: int = AX_DEFAULT_DEPTH, role_filter: list[str] = [],
                 actionable_only: bool = False, limit: int = AX_DEFAULT_LIMIT,
@@ -1315,6 +1857,9 @@ def get_ui_tree(app: str = "", pid: Optional[int] = None, ref: str = "",
                            if the UI changed; a resumed page's bubbled-up elements may
                            appear without their original parent for context).
     """
+    denied = _policy_guard("mac.ui", "get_ui_tree")
+    if denied:
+        return denied
     if not ACCESSIBILITY_AVAILABLE:
         return _fail("macOS Accessibility frameworks not available (pyobjc import failed).",
                      error_code="GENERIC")
@@ -1408,7 +1953,6 @@ AX_ACTION_ALIASES = {
     "show_menu": "AXShowMenu",
 }
 
-@mcp.tool()
 def perform_ui_action(ref: str, action: str = "click", value: Optional[str] = None) -> Dict[str, Any]:
     """Act on an element previously returned by get_ui_tree(), then report what changed.
 
@@ -1427,6 +1971,9 @@ def perform_ui_action(ref: str, action: str = "click", value: Optional[str] = No
     Returns whether the action ran, and a lightweight before/after comparison of the
     element's label/value/focused state so you can tell if it actually took effect.
     """
+    denied = _policy_guard("mac.ui", "perform_ui_action")
+    if denied:
+        return denied
     elem = _ax_resolve(ref)
     if elem is None:
         return _fail(f"Unknown or expired ref '{ref}'. Call get_ui_tree(...) again for a fresh ref.",
@@ -1474,16 +2021,15 @@ def perform_ui_action(ref: str, action: str = "click", value: Optional[str] = No
     return _ok(f"Performed '{action}' on {ref}", changed=changed, current_state=after)
 
 
-@mcp.tool()
 def get_screen_text(screenshot: bool = False) -> Dict[str, Any]:
     """Read all text currently visible on screen using OCR, or capture a screenshot.
 
     Args:
         screenshot: If False (default), run OCR and return text elements with
                    coordinates. If True, skip OCR — capture a screenshot instead,
-                   save it to ~/Desktop/orchestrator_screenshot.png, and return
-                   the file path. Use screenshots when you need visual context
-                   that OCR cannot capture (charts, images, custom UI graphics).
+                   save it to a timestamped file on the Desktop, and return the
+                   file path. Use screenshots when you need visual context that
+                   OCR cannot capture (charts, images, custom UI graphics).
 
     Returns for screenshot=False: text_elements list with position data, full_text string.
     Returns for screenshot=True:  screenshot_path, width, height.
@@ -1492,12 +2038,25 @@ def get_screen_text(screenshot: bool = False) -> Dict[str, Any]:
     (matching what mouse_action() expects). On Retina displays, these are half
     the raw pixel values. First OCR call is slow (~5s) due to EasyOCR model load.
     """
+    denied = _policy_guard("mac.screenOcr", "get_screen_text")
+    if denied:
+        return denied
+    screenshot_path: Optional[Path] = None
+    if screenshot:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        requested_path = Path.home() / "Desktop" / f"orchestrator_screenshot_{ts}.png"
+        screenshot_path, path_error = _path_guard(
+            str(requested_path),
+            "mac.files.write",
+            "get_screen_text screenshot",
+        )
+        if path_error:
+            return path_error
     try:
         ss = pyautogui.screenshot()
 
         if screenshot:
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            save_path = os.path.expanduser(f"~/Desktop/orchestrator_screenshot_{ts}.png")
+            save_path = str(screenshot_path)
             ss.save(save_path)
             lw, lh = pyautogui.size()
             return _ok(
@@ -1534,7 +2093,6 @@ def get_screen_text(screenshot: bool = False) -> Dict[str, Any]:
 
 # ── 8. Terminal ───────────────────────────────────────────────────────────────
 
-@mcp.tool()
 def run_terminal_command(command: str, timeout_seconds: int = 30,
                          run_in_background: bool = False,
                          max_output_chars: int = 8000) -> Dict[str, Any]:
@@ -1550,6 +2108,9 @@ def run_terminal_command(command: str, timeout_seconds: int = 30,
                          Increase up to 50000 for commands with large output.
                          Set to 0 to disable truncation (use carefully).
     """
+    denied = _policy_guard("mac.shell", "run_terminal_command")
+    if denied:
+        return denied
     timeout_seconds = max(1, min(timeout_seconds, 300))
     try:
         if run_in_background:
@@ -1579,6 +2140,16 @@ def run_terminal_command(command: str, timeout_seconds: int = 30,
                 truncated = True
 
         extra = {"total_output_chars": len(r.stdout) + len(r.stderr)} if truncated else {}
+        if r.returncode != 0:
+            return _fail(
+                f"Command failed (exit {r.returncode})",
+                error_code="EXEC_ERROR",
+                stdout=stdout,
+                stderr=stderr,
+                exit_code=r.returncode,
+                truncated=truncated,
+                **extra,
+            )
         return _ok("Command completed",
                    stdout=stdout, stderr=stderr, exit_code=r.returncode,
                    truncated=truncated, **extra)
@@ -1590,13 +2161,11 @@ def run_terminal_command(command: str, timeout_seconds: int = 30,
 
 # ── 9. Spotlight File Search ─────────────────────────────────────────────────
 
-@mcp.tool()
 def find_file(query: str, search_dir: str = "", file_type: str = "", sort_by: str = "", limit: int = 50, include_source: bool = False) -> Dict[str, Any]:
     """Find files using macOS Spotlight (mdfind) — millisecond results across the whole drive.
 
-    Keyword matching only, NOT semantic (e.g. "python scripts" won't match .py files —
-    use vector_search() for meaning-based search, describe(topic="find_file_query_syntax")
-    for the full query-style guide including Spotlight metadata queries like "kind:pdf").
+    Keyword matching only, NOT semantic. Use describe(topic="find_file_query_syntax")
+    for the full query-style guide including Spotlight metadata queries like "kind:pdf".
 
     Args:
         query: Filename or content keyword, or a Spotlight metadata query (e.g. "kind:pdf").
@@ -1606,14 +2175,26 @@ def find_file(query: str, search_dir: str = "", file_type: str = "", sort_by: st
         limit: Max number of results to return (default 50).
         include_source: If True, fetches the source URL for each file. Slow — use with a low limit.
     """
+    denied = _policy_guard("mac.files.read", "find_file")
+    if denied:
+        return denied
     if not query:
         return _fail("query is required")
     try:
         cmd = ["mdfind"]
         if search_dir:
-            expanded = os.path.expanduser(search_dir)
-            if os.path.isdir(expanded):
-                cmd.extend(["-onlyin", expanded])
+            expanded, path_error = _path_guard(search_dir, "mac.files.read", "find_file")
+            if path_error:
+                return path_error
+            if not expanded.is_dir():
+                return _fail(f"Not a directory: {expanded}", error_code="NOT_FOUND")
+            cmd.extend(["-onlyin", str(expanded)])
+        elif _runtime().snapshot.control_profile == "guided":
+            return _fail(
+                "Guided file search requires an explicit approved search directory.",
+                error_code="POLICY_DENIED",
+                capability="mac.files.read",
+            )
         
         # Smart Query Construction
         if "kMDItem" in query or ":" in query:
@@ -1645,10 +2226,13 @@ def find_file(query: str, search_dir: str = "", file_type: str = "", sort_by: st
         files_data = []
         for p in paths:
             try:
-                st = os.stat(p)
+                canonical, path_error = _path_guard(p, "mac.files.read", "find_file result")
+                if path_error:
+                    return path_error
+                st = os.stat(canonical)
                 item = {
-                    "path": p,
-                    "name": os.path.basename(p),
+                    "path": str(canonical),
+                    "name": canonical.name,
                     "last_modified": datetime.fromtimestamp(st.st_mtime).isoformat(),
                     "size_kb": round(st.st_size / 1024, 2)
                 }
@@ -1673,7 +2257,7 @@ def find_file(query: str, search_dir: str = "", file_type: str = "", sort_by: st
         if include_source and files_data:
             for item in files_data:
                 try:
-                    mdls_r = subprocess.run(["mdls", "-name", "kMDItemWhereFroms", item["path"]], 
+                    mdls_r = subprocess.run(["mdls", "-name", "kMDItemWhereFroms", item["path"]],
                                             capture_output=True, text=True, timeout=1.5)
                     if mdls_r.returncode == 0:
                         urls = re.findall(r'"(https?://.*?)"', mdls_r.stdout)
@@ -1692,60 +2276,34 @@ def find_file(query: str, search_dir: str = "", file_type: str = "", sort_by: st
 
 # ── 9.5 Vector Search ─────────────────────────────────────────────────────────
 
-@mcp.tool()
 def vector_search(query: str) -> Dict[str, Any]:
     """Perform a semantic/vector search across indexed files.
 
-    This queries the configured indexing backend (see MAC_ORCHESTRATOR_WORKER_URL)
-    for files matching the meaning of the query, even if the exact keywords are not
-    present. Requires indexer.py to have been run first, and MAC_ORCHESTRATOR_WORKER_URL
-    to be set; otherwise this returns an INVALID_PARAM error.
+    This queries the configured indexing backend for files matching the meaning of
+    the query, even if the exact keywords are not present. Readiness and credentials
+    are supplied by Mac Orchestrator; this function never reads product config files.
 
     Args:
         query: The search query or question.
     """
+    denied = _policy_guard("meridian.search", "vector_search")
+    if denied:
+        return denied
     if not query:
         return _fail("query is required")
     try:
-        worker_url = os.getenv("MAC_ORCHESTRATOR_WORKER_URL", "").strip()
+        worker_url = _runtime().secrets.worker_url
         if not worker_url:
             return _fail(
-                "Vector search is not configured. Set MAC_ORCHESTRATOR_WORKER_URL "
-                "to the same backend indexer.py uploads to (see docs/ARCHITECTURE.md).",
-                error_code="INVALID_PARAM",
+                "Meridian search credentials were not supplied by Mac Orchestrator.",
+                error_code="NOT_CONFIGURED",
             )
         url = f"{worker_url.rstrip('/')}/search"
-        token = os.getenv("INGEST_TOKEN", "")
-        config_path = os.path.expanduser("~/.config/mac-orchestrator/config.json")
-        if os.path.exists(config_path):
-            try:
-                with open(config_path, "r") as f:
-                    config = json.load(f)
-                    token = config.get("INGEST_TOKEN", token)
-            except Exception:
-                pass
-        if not token:
-            keychain = subprocess.run(
-                [
-                    "/usr/bin/security",
-                    "find-generic-password",
-                    "-a",
-                    os.getenv("USER", ""),
-                    "-s",
-                    "com.jay.mac-orchestrator.ingest-token",
-                    "-w",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            if keychain.returncode == 0:
-                token = keychain.stdout.strip()
+        token = _runtime().secrets.meridian_ingest_token
         if not token:
             return _fail(
-                "Vector search is not configured. Store INGEST_TOKEN in "
-                "~/.config/mac-orchestrator/config.json or the "
-                "com.jay.mac-orchestrator.ingest-token Keychain item."
+                "Meridian search credentials were not supplied by Mac Orchestrator.",
+                error_code="NOT_CONFIGURED",
             )
         headers = {"Authorization": f"Bearer {token}"}
         resp = requests.get(url, params={"q": query}, headers=headers, timeout=10)
@@ -1758,7 +2316,6 @@ def vector_search(query: str) -> Dict[str, Any]:
 
 # ── 10. File I/O ─────────────────────────────────────────────────────────────
 
-@mcp.tool()
 def read_file(path: str, preview: bool = False, preview_size_kb: int = 1, preview_lines: Optional[int] = None) -> Dict[str, Any]:
     """Read a file's contents.
 
@@ -1768,9 +2325,10 @@ def read_file(path: str, preview: bool = False, preview_size_kb: int = 1, previe
         preview_size_kb: Size in KB to read from both head and tail in preview mode (default 1).
         preview_lines: If provided, returns the first N and last N lines using native tools.
     """
+    p, path_error = _path_guard(path, "mac.files.read", "read_file")
+    if path_error:
+        return path_error
     try:
-        p = os.path.expanduser(path)
-        
         # Adaptive Previewing (Subprocess Fast Path)
         if preview_lines is not None:
             try:
@@ -1812,7 +2370,6 @@ def read_file(path: str, preview: bool = False, preview_size_kb: int = 1, previe
     except Exception as e:
         return _fail(f"Read failed: {e}")
 
-@mcp.tool()
 def write_file(path: str, content: str, mode: str = "overwrite") -> Dict[str, Any]:
     """Write content to a file.
 
@@ -1822,9 +2379,11 @@ def write_file(path: str, content: str, mode: str = "overwrite") -> Dict[str, An
         mode: "overwrite" (default) replaces file contents entirely.
               "append" adds content to the end of an existing file (creates if absent).
     """
+    p, path_error = _path_guard(path, "mac.files.write", "write_file")
+    if path_error:
+        return path_error
     try:
-        p = os.path.expanduser(path)
-        os.makedirs(os.path.dirname(os.path.abspath(p)), exist_ok=True)
+        os.makedirs(p.parent, exist_ok=True)
         file_mode = "a" if mode == "append" else "w"
         with open(p, file_mode, encoding="utf-8") as f:
             f.write(content)
@@ -1833,7 +2392,6 @@ def write_file(path: str, content: str, mode: str = "overwrite") -> Dict[str, An
     except Exception as e:
         return _fail(f"Write failed: {e}")
 
-@mcp.tool()
 def list_directory(path: str, limit: int = 50, sort_by: str = "date_desc", summary_only: bool = False, offset: int = 0) -> Dict[str, Any]:
     """List contents of a directory.
     
@@ -1848,9 +2406,11 @@ def list_directory(path: str, limit: int = 50, sort_by: str = "date_desc", summa
         offset: Number of items to skip (default 0).
     """
     from collections import Counter
+    p, path_error = _path_guard(path, "mac.files.read", "list_directory")
+    if path_error:
+        return path_error
     try:
-        p = os.path.expanduser(path)
-        if not os.path.isdir(p):
+        if not p.is_dir():
             return _fail(f"Not a directory: {p}")
             
         # Summary Mode Guard (O(1) memory)
@@ -1865,6 +2425,11 @@ def list_directory(path: str, limit: int = 50, sort_by: str = "date_desc", summa
             with os.scandir(p) as it:
                 for entry in it:
                     try:
+                        _, entry_error = _path_guard(
+                            entry.path, "mac.files.read", "list_directory entry"
+                        )
+                        if entry_error:
+                            return entry_error
                         if entry.is_dir():
                             total_folders += 1
                         else:
@@ -1899,6 +2464,11 @@ def list_directory(path: str, limit: int = 50, sort_by: str = "date_desc", summa
         entries = []
         with os.scandir(p) as it:
             for entry in it:
+                _, entry_error = _path_guard(
+                    entry.path, "mac.files.read", "list_directory entry"
+                )
+                if entry_error:
+                    return entry_error
                 entries.append(entry)
                 
         needs_stat_for_sort = sort_by in ("date_desc", "date_asc", "size_desc", "size_asc")
@@ -1999,7 +2569,6 @@ def list_directory(path: str, limit: int = 50, sort_by: str = "date_desc", summa
 
 # ── 11. Regex Search ─────────────────────────────────────────────────────────
 
-@mcp.tool()
 def smart_search(directory: str, regex_pattern: str,
                  file_extension_filter: Optional[str] = None,
                  max_chars: int = 10000) -> Dict[str, Any]:
@@ -2012,9 +2581,11 @@ def smart_search(directory: str, regex_pattern: str,
         max_chars: Maximum total characters to return across all matches (default 10000).
                    Increase for larger codebases. Hard ceiling: 100000.
     """
+    d, path_error = _path_guard(directory, "mac.files.read", "smart_search")
+    if path_error:
+        return path_error
     try:
-        d = os.path.expanduser(directory)
-        if not os.path.isdir(d):
+        if not d.is_dir():
             return _fail(f"Not a directory: {d}")
         ignore = {".git", "node_modules", "venv", ".venv", "__pycache__", ".idea", ".vscode"}
         try:
@@ -2025,22 +2596,39 @@ def smart_search(directory: str, regex_pattern: str,
         char_count = 0
         MAX = max(1000, min(max_chars, 100000))
         for root, dirs, files in os.walk(d):
-            dirs[:] = [x for x in dirs if not x.startswith('.') and x not in ignore]
+            kept_dirs = []
+            for dirname in dirs:
+                if dirname.startswith('.') or dirname in ignore:
+                    continue
+                _, entry_error = _path_guard(
+                    os.path.join(root, dirname),
+                    "mac.files.read",
+                    "smart_search directory entry",
+                )
+                if entry_error:
+                    return entry_error
+                kept_dirs.append(dirname)
+            dirs[:] = kept_dirs
             for fname in files:
                 if fname.startswith('.'):
                     continue
                 if file_extension_filter and not fname.endswith(file_extension_filter):
                     continue
                 fp = os.path.join(root, fname)
+                canonical, entry_error = _path_guard(
+                    fp, "mac.files.read", "smart_search file entry"
+                )
+                if entry_error:
+                    return entry_error
                 try:
-                    with open(fp, "r", encoding="utf-8") as f:
+                    with open(canonical, "r", encoding="utf-8") as f:
                         lines = f.readlines()
                     matches = []
                     for i, line in enumerate(lines):
                         if pat.search(line):
                             matches.append({"line": i + 1, "content": line.strip()})
                     if matches:
-                        entry = {"file": fp, "matches": matches}
+                        entry = {"file": str(canonical), "matches": matches}
                         s = json.dumps(entry)
                         if char_count + len(s) > MAX:
                             results.append({"file": fp, "matches": matches[:3], "truncated": True})
@@ -2058,7 +2646,6 @@ def smart_search(directory: str, regex_pattern: str,
 
 # ── 12. Utility ──────────────────────────────────────────────────────────────
 
-@mcp.tool()
 def play_sound_for_user_prompt() -> Dict[str, Any]:
     """Play the macOS system bell sound to alert the user."""
     try:
@@ -2069,27 +2656,24 @@ def play_sound_for_user_prompt() -> Dict[str, Any]:
     except Exception as e:
         return _fail(f"Failed: {e}")
 
-@mcp.tool()
 def clipboard(action: str, content: str = "") -> Dict[str, Any]:
-    """Get or set the macOS clipboard (pasteboard) contents.
+    """Read the macOS clipboard; mutation is available only when policy allows it.
 
     Args:
-        action: "get" to read clipboard contents, "set" to write to clipboard.
+        action: "get" to read clipboard contents, "set" to request a clipboard write.
         content: Text to write to clipboard. Required for action="set".
                 Ignored for action="get". Supports all Unicode characters.
-
-    Examples:
-        clipboard(action="get")                          → returns current clipboard text
-        clipboard(action="set", content="Hello World")   → loads text into clipboard
-
-    After set, use press_keystroke(key="v", modifiers=["command"]) to paste.
-    After get, use the returned "content" field in your next action.
 
     Note: Only text content is accessible. Images or files in the clipboard
     will return an empty string from "get".
     """
     if action not in ("get", "set"):
         return _fail(f"Invalid action '{action}'. Use 'get' or 'set'.", error_code="INVALID_PARAM")
+    if action == "set":
+        try:
+            _runtime().policy.authorize_clipboard_mutation("clipboard set")
+        except PolicyDenied as exc:
+            return _fail(str(exc), error_code="POLICY_DENIED", capability="mac.clipboard.write")
     try:
         if action == "get":
             r = subprocess.run(['pbpaste'], capture_output=True, text=True, timeout=5)
@@ -2108,7 +2692,6 @@ def clipboard(action: str, content: str = "") -> Dict[str, Any]:
     except Exception as e:
         return _fail(f"Clipboard operation failed: {e}", error_code="EXEC_ERROR")
 
-@mcp.tool()
 def send_file_to_telegram(file_path: str, caption: str = "") -> Dict[str, Any]:
     """Send a file to the user via Telegram.
 
@@ -2116,26 +2699,35 @@ def send_file_to_telegram(file_path: str, caption: str = "") -> Dict[str, Any]:
         file_path: Path to the file to send.
         caption: Optional caption for the file.
     """
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return _fail("Telegram not configured. Restart and provide credentials.")
+    denied = _policy_guard("telegram.send", "send_file_to_telegram")
+    if denied:
+        return denied
+    p, path_error = _path_guard(file_path, "mac.files.read", "send_file_to_telegram file")
+    if path_error:
+        return path_error
+    secrets = _runtime().secrets
+    if not secrets.telegram_bot_token or not secrets.telegram_chat_id:
+        return _fail(
+            "Telegram credentials were not supplied by Mac Orchestrator.",
+            error_code="NOT_CONFIGURED",
+        )
     try:
-        p = os.path.expanduser(file_path)
-        if not os.path.exists(p):
+        if not p.exists():
             return _fail(f"File not found: {p}")
-        sz = os.path.getsize(p)
+        sz = p.stat().st_size
         if sz > 50 * 1024 * 1024:
             return _fail(f"File too large ({sz / 1048576:.1f}MB > 50MB limit)")
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
+        url = f"https://api.telegram.org/bot{secrets.telegram_bot_token}/sendDocument"
         with open(p, "rb") as f:
-            data = {"chat_id": TELEGRAM_CHAT_ID}
+            data = {"chat_id": secrets.telegram_chat_id}
             if caption:
                 data["caption"] = caption
             resp = requests.post(url, data=data, files={"document": f}, timeout=60)
         if resp.status_code == 200:
             return _ok(f"Sent '{os.path.basename(p)}' to Telegram")
-        return _fail(f"Telegram API error ({resp.status_code}): {resp.text}")
-    except Exception as e:
-        return _fail(f"Failed: {e}")
+        return _fail(f"Telegram API error ({resp.status_code}).")
+    except Exception:
+        return _fail("Telegram request failed.")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2144,51 +2736,198 @@ def send_file_to_telegram(file_path: str, caption: str = "") -> Dict[str, Any]:
 
 console = Console()
 
-def setup_telegram(interactive: bool = True):
-    """Sets up Telegram configuration securely."""
-    global TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
-    config_dir = os.path.expanduser("~/.config/mac-orchestrator")
-    config_path = os.path.join(config_dir, "config.json")
-    try:
-        if os.path.exists(config_path):
-            with open(config_path, "r") as f:
-                config = json.load(f)
-                TELEGRAM_BOT_TOKEN = config.get("TELEGRAM_BOT_TOKEN", "")
-                TELEGRAM_CHAT_ID = config.get("TELEGRAM_CHAT_ID", "")
-    except Exception:
-        pass
-    if interactive and (not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID):
-        setup = Prompt.ask("\n[bold cyan]Do you want to configure Telegram integration for file sending?[/bold cyan]", choices=["y", "n"], default="y")
-        if setup.lower() == 'y':
-            console.print(Panel.fit(
-                "You need your Telegram Bot Token and your personal Chat ID.\n"
-                "1. Bot Token (from BotFather)\n"
-                "2. Chat ID (from userinfobot or similar)",
-                title="[bold blue]Telegram Setup[/bold blue]", border_style="blue"
-            ))
-            bot_token = Prompt.ask("[bold green]Enter your Telegram Bot Token[/bold green]").strip()
-            chat_id = Prompt.ask("[bold green]Enter your Telegram Chat ID[/bold green]").strip()
-            if bot_token and chat_id:
-                TELEGRAM_BOT_TOKEN = bot_token
-                TELEGRAM_CHAT_ID = chat_id
-                try:
-                    os.makedirs(config_dir, exist_ok=True)
-                    config_data = {}
-                    if os.path.exists(config_path):
-                        with open(config_path, "r") as f:
-                            try: config_data = json.load(f)
-                            except: pass
-                    config_data["TELEGRAM_BOT_TOKEN"] = TELEGRAM_BOT_TOKEN
-                    config_data["TELEGRAM_CHAT_ID"] = TELEGRAM_CHAT_ID
-                    with open(config_path, "w") as f:
-                        json.dump(config_data, f, indent=4)
-                    console.print("[green]✓ Telegram credentials saved![/green]")
-                except Exception as e:
-                    console.print(f"[yellow]Could not save config: {e}[/yellow]")
+def setup_telegram(interactive: bool = False) -> bool:
+    """Return whether explicit in-memory Telegram credentials are available.
+
+    The old interactive/config-file persistence path is intentionally gone.
+    Swift supplies managed credentials through the dedicated child environment
+    variables documented by RuntimeSecrets; local development uses the same
+    environment-only contract.
+    """
+    secrets = _runtime().secrets
+    return bool(secrets.telegram_bot_token and secrets.telegram_chat_id)
+
+
+def _bind_tool(fn: Callable[..., Any], runtime: ServerRuntime) -> Callable[..., Any]:
+    """Bind one immutable runtime to a tool without changing its MCP signature."""
+    @functools.wraps(fn)
+    def bound(*args, **kwargs):
+        token = _RUNTIME_CONTEXT.set(runtime)
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            _RUNTIME_CONTEXT.reset(token)
+
+    return bound
+
+
+def _session_tool_description(snapshot: CapabilitySnapshot) -> str:
+    return (
+        "Inspect active-console/lock state and current Accessibility and Screen Recording "
+        "permission observations before UI work. Capability and policy availability is "
+        "reported by get_capabilities()."
+    )
+
+
+def _screen_size_tool_description(snapshot: CapabilitySnapshot) -> str:
+    return (
+        "Get logical and physical screen dimensions for coordinate-aware UI work. "
+        "Use logical coordinates for mouse actions."
+    )
+
+
+def _ui_tree_tool_description(snapshot: CapabilitySnapshot) -> str:
+    return (
+        "Inspect the macOS Accessibility tree and return stable refs for precise UI actions. "
+        "Use role_filter, actionable_only, and pagination to keep inspection focused."
+    )
+
+
+def _type_tool_description(snapshot: CapabilitySnapshot) -> str:
+    clipboard_note = (
+        "Clipboard fallback for Unicode is allowed by the current policy."
+        if snapshot.policy.clipboard_mutation and snapshot.is_ready("mac.clipboard.write")
+        else "If clipboard mutation would be required (for example Unicode fallback), the call returns POLICY_DENIED."
+    )
+    return (
+        "Type text into the focused input field using direct key synthesis when possible. "
+        + clipboard_note
+    )
+
+
+def _clipboard_tool_description(snapshot: CapabilitySnapshot) -> str:
+    if snapshot.policy.clipboard_mutation and snapshot.is_ready("mac.clipboard.write"):
+        return "Read or set the macOS text clipboard; clipboard mutation is enabled by the current policy."
+    return (
+        "Read the macOS text clipboard. Clipboard mutation is disabled by the current policy; "
+        "action='set' returns POLICY_DENIED."
+    )
+
+
+def _find_file_tool_description(snapshot: CapabilitySnapshot) -> str:
+    description = (
+        "Find files using macOS Spotlight keyword and metadata queries. In Guided Control, "
+        "provide an explicit approved search directory."
+    )
+    if snapshot.is_ready("meridian.search"):
+        description += " Semantic search is available through the registered Meridian tool."
+    return description
+
+
+def _describe_tool_description(snapshot: CapabilitySnapshot) -> str:
+    topics = ", ".join(sorted(_describe_topics(snapshot)))
+    return (
+        "Get detailed guidance for the capability groups registered by this server. "
+        f"Available topics in this snapshot: {topics}."
+    )
+
+
+def _file_tool_description(snapshot: CapabilitySnapshot, operation: str) -> str:
+    boundary = (
+        " In Guided Control, the path must resolve inside an approved file root."
+        if snapshot.control_profile == "guided"
+        else " Full Control permits broader paths when the capability is ready."
+    )
+    return f"{operation}.{boundary}"
+
+
+def _telegram_tool_description(snapshot: CapabilitySnapshot) -> str:
+    return (
+        "Send a file through the user-configured Telegram integration. "
+        "The file must pass the current file-read and path policy."
+    )
+
+
+def _screen_text_tool_description(snapshot: CapabilitySnapshot) -> str:
+    return (
+        "Read visible screen text with OCR. screenshot=True captures a screenshot only when "
+        "the file-write capability and path policy authorize the destination."
+    )
+
+
+def build_mcp(
+    validated_snapshot: CapabilitySnapshot,
+    secrets: Optional[RuntimeSecrets] = None,
+) -> FastMCP:
+    """Construct one isolated FastMCP server from a validated capability snapshot."""
+    if not isinstance(validated_snapshot, CapabilitySnapshot):
+        raise TypeError("build_mcp requires a validated CapabilitySnapshot")
+    runtime = ServerRuntime(
+        validated_snapshot,
+        secrets if secrets is not None else RuntimeSecrets.from_environment(),
+    )
+    server = FastMCP(
+        "AutoMac MCP - macOS UI Automation",
+        host="127.0.0.1",
+        port=SERVER_PORT,
+        streamable_http_path=MCP_PATH,
+        transport_security=transport_security,
+        instructions=build_server_instructions(validated_snapshot),
+    )
+    server.custom_route("/__mac_orchestrator_health", methods=["GET"])(_health_check)
+
+    def add(fn: Callable[..., Any], *, description: Optional[str] = None) -> None:
+        server.add_tool(_bind_tool(fn, runtime), description=description)
+
+    # Orientation and harmless local diagnostics are always visible after the
+    # snapshot itself has been validated.
+    add(describe, description=_describe_tool_description(validated_snapshot))
+    add(get_capabilities)
+    add(get_session_state, description=_session_tool_description(validated_snapshot))
+    add(play_sound_for_user_prompt)
+    add(clipboard, description=_clipboard_tool_description(validated_snapshot))
+
+    if validated_snapshot.is_ready("mac.ui"):
+        for fn in (
+            get_available_apps,
+            get_screen_size,
+            get_screen_layout,
+            get_ui_tree,
+            focus_app,
+            press_keystroke,
+            type_text,
+            mouse_action,
+            scroll,
+            perform_ui_action,
+        ):
+            if fn is get_screen_size:
+                add(fn, description=_screen_size_tool_description(validated_snapshot))
+            elif fn is get_ui_tree:
+                add(fn, description=_ui_tree_tool_description(validated_snapshot))
+            elif fn is type_text:
+                add(fn, description=_type_tool_description(validated_snapshot))
             else:
-                console.print("[red]Incomplete Telegram setup. File sending will not work.[/red]")
-        else:
-            console.print("[yellow]Skipping Telegram setup.[/yellow]")
+                add(fn)
+        add(execute_macro, description=_macro_actions_text(validated_snapshot))
+
+    if validated_snapshot.is_ready("mac.screenOcr"):
+        add(get_screen_text, description=_screen_text_tool_description(validated_snapshot))
+
+    if validated_snapshot.is_ready("mac.shell"):
+        add(run_terminal_command)
+
+    if validated_snapshot.is_ready("mac.files.read"):
+        add(find_file, description=_find_file_tool_description(validated_snapshot))
+        add(read_file, description=_file_tool_description(validated_snapshot, "Read a file"))
+        add(list_directory, description=_file_tool_description(validated_snapshot, "List a directory"))
+        add(smart_search, description=_file_tool_description(validated_snapshot, "Run Local Pattern Search"))
+
+    if validated_snapshot.is_ready("mac.files.write"):
+        add(write_file)
+
+    if validated_snapshot.is_ready("telegram.send"):
+        add(send_file_to_telegram, description=_telegram_tool_description(validated_snapshot))
+
+    if validated_snapshot.is_ready("meridian.search"):
+        add(vector_search)
+
+    return server
+
+
+# The default runtime is the only server process actually served. Tests and
+# callers can create additional isolated FastMCP instances through build_mcp.
+mcp = build_mcp(DEFAULT_SNAPSHOT, DEFAULT_SECRETS)
+SERVER_INSTRUCTIONS = build_server_instructions(DEFAULT_SNAPSHOT)
 
 # NOTE: there is deliberately no interactive "expose via ngrok" flow here.
 # That used to live in a setup_ngrok() function called from main() for
@@ -2230,7 +2969,6 @@ def main():
         "Your local MCP server for macOS UI automation.",
         border_style="magenta"
     ))
-    setup_telegram(interactive=not MANAGED_MODE)
     if MANAGED_MODE:
         console.print("\n[bold green]Mac Orchestrator is starting in managed mode.[/bold green]")
         console.print("The authenticated connector URL is available from the menu-bar app.")

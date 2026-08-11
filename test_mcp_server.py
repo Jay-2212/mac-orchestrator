@@ -7,6 +7,40 @@ import json
 import time
 
 
+def _managed_snapshot_json():
+    """Build the minimal valid Wave-1 snapshot used by path/liveness probes."""
+    capabilities = {
+        capability_id: {
+            "desired": capability_id == "core.session",
+            "configured": capability_id == "core.session",
+            "ready": capability_id == "core.session",
+            "health": "ready" if capability_id == "core.session" else "disabled",
+            "dependencies": [],
+            "reason": None,
+        }
+        for capability_id in (
+            "core.session",
+            "mac.ui",
+            "mac.screenOcr",
+            "mac.files.read",
+            "mac.files.write",
+            "mac.shell",
+            "mac.clipboard.write",
+            "telegram.send",
+            "meridian.search",
+            "meridian.telegram",
+            "remote.connector",
+        )
+    }
+    return json.dumps({
+        "snapshotSchemaVersion": 1,
+        "configGeneration": 1,
+        "controlProfile": "guided",
+        "capabilities": capabilities,
+        "policy": {"approvedFileRoots": [], "clipboardMutation": False},
+    })
+
+
 class _TestOutcome:
     """Collect genuine failures without allowing them to disappear in output."""
 
@@ -66,14 +100,14 @@ def test_mcp_server():
             outcome.fail("FastMCP instance not found")
             return False
             
-        # Check for the current tool set (24 tools)
+        # Check the ordinary implementations and the default local tool set.
         v2_tools = [
-            'describe', 'press_keystroke', 'mouse_action', 'type_text', 'scroll',
+            'describe', 'get_capabilities', 'press_keystroke', 'mouse_action', 'type_text', 'scroll',
             'execute_macro', 'focus_app', 'get_available_apps', 'get_session_state',
             'get_screen_size', 'get_screen_layout', 'get_ui_tree', 'perform_ui_action',
-            'get_screen_text', 'run_terminal_command', 'find_file', 'vector_search',
+            'get_screen_text', 'run_terminal_command', 'find_file',
             'read_file', 'write_file', 'list_directory', 'smart_search',
-            'play_sound_for_user_prompt', 'clipboard', 'send_file_to_telegram'
+            'play_sound_for_user_prompt', 'clipboard',
         ]
         
         for func_name in v2_tools:
@@ -83,7 +117,17 @@ def test_mcp_server():
                 outcome.fail(f"Tool {func_name} not found")
                 return False
         
-        print(f"\n   Total tools verified: {len(v2_tools)}")
+        import asyncio
+        registered_tools = [tool.name for tool in asyncio.run(automac_mcp.mcp.list_tools())]
+        expected_registered_tools = set(v2_tools) - {"vector_search", "send_file_to_telegram"}
+        if set(registered_tools) == expected_registered_tools and len(registered_tools) == len(set(registered_tools)):
+            print(f"\n   Registered FastMCP tools verified: {len(registered_tools)}")
+        else:
+            outcome.fail(
+                f"Unexpected registered tool surface: {registered_tools}; "
+                f"expected {sorted(expected_registered_tools)}"
+            )
+            return False
         
         # Verify old tools are REMOVED
         old_tools = [
@@ -296,17 +340,15 @@ def test_mcp_server():
         else:
             outcome.fail(f"find_file failed: {result}")
             
-        # Test vector_search — no MAC_ORCHESTRATOR_WORKER_URL is configured in this
-        # test environment (there's no built-in default backend), so the correct,
-        # testable behavior is a clean INVALID_PARAM failure, not a network call.
+        # Optional Meridian is intentionally absent from the default local snapshot.
         result = automac_mcp.vector_search("test")
-        if os.getenv("MAC_ORCHESTRATOR_WORKER_URL"):
+        if automac_mcp.DEFAULT_SNAPSHOT.is_ready("meridian.search"):
             if result and result.get("status") == "success":
                 print(f"✓ vector_search: {result.get('message')} (Found {len(result.get('results', []))} matches)")
             else:
                 outcome.fail(f"vector_search failed: {result}")
-        elif result.get("status") == "error" and result.get("error_code") == "INVALID_PARAM":
-            print("✓ vector_search: fails cleanly with INVALID_PARAM when MAC_ORCHESTRATOR_WORKER_URL is unset")
+        elif result.get("status") == "error" and result.get("error_code") == "POLICY_DENIED":
+            print("✓ vector_search: direct optional operation is denied when Meridian is absent")
         else:
             outcome.fail(f"vector_search unconfigured-backend handling failed: {result}")
             return False
@@ -424,6 +466,7 @@ def test_mcp_server():
         managed_env.update({
             "MAC_ORCHESTRATOR_MANAGED": "1",
             "MAC_ORCHESTRATOR_CONNECTOR_TOKEN": "a" * 64,
+            "MAC_ORCHESTRATOR_CAPABILITY_SNAPSHOT": _managed_snapshot_json(),
             "PYTHONDONTWRITEBYTECODE": "1",
         })
         managed = subprocess.run(
@@ -516,6 +559,7 @@ def test_mcp_server():
             "MAC_ORCHESTRATOR_PORT": "8794",
             "MAC_ORCHESTRATOR_MANAGED": "1",
             "MAC_ORCHESTRATOR_CONNECTOR_TOKEN": live_token,
+            "MAC_ORCHESTRATOR_CAPABILITY_SNAPSHOT": _managed_snapshot_json(),
             "PYTHONDONTWRITEBYTECODE": "1",
         })
         live_proc = subprocess.Popen(

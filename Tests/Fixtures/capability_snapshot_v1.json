@@ -1,0 +1,121 @@
+{
+  "capabilities": {
+    "core.session": {
+      "configured": true,
+      "dependencies": [],
+      "desired": true,
+      "health": "ready",
+      "ready": true,
+      "reason": null
+    },
+    "mac.clipboard.write": {
+      "configured": true,
+      "dependencies": [
+        "core.session"
+      ],
+      "desired": false,
+      "health": "disabled",
+      "ready": false,
+      "reason": "Not enabled."
+    },
+    "mac.files.read": {
+      "configured": true,
+      "dependencies": [
+        "core.session"
+      ],
+      "desired": true,
+      "health": "ready",
+      "ready": true,
+      "reason": null
+    },
+    "mac.files.write": {
+      "configured": false,
+      "dependencies": [
+        "mac.files.read"
+      ],
+      "desired": false,
+      "health": "disabled",
+      "ready": false,
+      "reason": "Not enabled."
+    },
+    "mac.screenOcr": {
+      "configured": true,
+      "dependencies": [
+        "mac.ui"
+      ],
+      "desired": true,
+      "health": "degraded",
+      "ready": false,
+      "reason": "The local OCR payload is not ready."
+    },
+    "mac.shell": {
+      "configured": false,
+      "dependencies": [
+        "core.session"
+      ],
+      "desired": false,
+      "health": "disabled",
+      "ready": false,
+      "reason": "Not enabled."
+    },
+    "mac.ui": {
+      "configured": true,
+      "dependencies": [
+        "core.session"
+      ],
+      "desired": true,
+      "health": "ready",
+      "ready": true,
+      "reason": null
+    },
+    "meridian.search": {
+      "configured": false,
+      "dependencies": [
+        "core.session"
+      ],
+      "desired": false,
+      "health": "disabled",
+      "ready": false,
+      "reason": "Not enabled."
+    },
+    "meridian.telegram": {
+      "configured": false,
+      "dependencies": [
+        "meridian.search"
+      ],
+      "desired": false,
+      "health": "disabled",
+      "ready": false,
+      "reason": "Not enabled."
+    },
+    "remote.connector": {
+      "configured": false,
+      "dependencies": [
+        "core.session"
+      ],
+      "desired": false,
+      "health": "disabled",
+      "ready": false,
+      "reason": "Not enabled."
+    },
+    "telegram.send": {
+      "configured": false,
+      "dependencies": [
+        "core.session"
+      ],
+      "desired": true,
+      "health": "unavailable",
+      "ready": false,
+      "reason": "Telegram credentials are not configured."
+    }
+  },
+  "configGeneration": 7,
+  "controlProfile": "guided",
+  "policy": {
+    "approvedFileRoots": [
+      "/tmp/mac-orchestrator-fixture/approved"
+    ],
+    "clipboardMutation": true
+  },
+  "snapshotSchemaVersion": 1
+}

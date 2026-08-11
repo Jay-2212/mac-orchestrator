@@ -51,6 +51,24 @@ final class MigrationTests: XCTestCase {
         XCTAssertFalse(configuration.onboarding.migrationMarkers.contains("legacy-control-profile-v1"))
     }
 
+    func testPersistedLegacyValuesOverrideProcessWideRegisteredDefaults() throws {
+        let defaults = makeIsolatedDefaults()
+        defaults.register(defaults: [
+            "serverDesired": true,
+            "tunnelDesired": false,
+        ])
+        defaults.set("owner-legacy", forKey: "ownerID")
+        defaults.set(false, forKey: "serverDesired")
+        defaults.set(true, forKey: "tunnelDesired")
+        let store = try makeStore()
+
+        let configuration = try UserDefaultsMigrator.migrate(userDefaults: defaults, store: store)
+
+        XCTAssertEqual(configuration.ownerID, "owner-legacy")
+        XCTAssertFalse(configuration.process.serverDesired)
+        XCTAssertTrue(configuration.process.tunnelDesired)
+    }
+
     func testRunningUserDefaultsMigrationTwiceDoesNotResetOrDuplicateMarkers() throws {
         let defaults = makeIsolatedDefaults()
         defaults.set("owner-legacy", forKey: "ownerID")

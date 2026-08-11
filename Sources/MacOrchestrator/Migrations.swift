@@ -39,22 +39,28 @@ enum UserDefaultsMigrator {
             return userDefaults.object(forKey: key)
         }
         let isLegacyInstall = legacyKeys.contains { persistedLegacyValue(forKey: $0) != nil }
+        func legacyValue(forKey key: String) -> Any? {
+            guard isLegacyInstall else {
+                return nil
+            }
+            return userDefaults.object(forKey: key)
+        }
         var changed = false
 
-        if let ownerID = persistedLegacyValue(forKey: "ownerID") as? String,
+        if let ownerID = legacyValue(forKey: "ownerID") as? String,
            !ownerID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
            configuration.ownerID != ownerID {
             configuration.ownerID = ownerID
             changed = true
         }
 
-        if let serverDesired = persistedLegacyValue(forKey: "serverDesired") as? Bool,
+        if let serverDesired = legacyValue(forKey: "serverDesired") as? Bool,
            configuration.process.serverDesired != serverDesired {
             configuration.process.serverDesired = serverDesired
             changed = true
         }
 
-        if let tunnelDesired = persistedLegacyValue(forKey: "tunnelDesired") as? Bool {
+        if let tunnelDesired = legacyValue(forKey: "tunnelDesired") as? Bool {
             if configuration.process.tunnelDesired != tunnelDesired {
                 configuration.process.tunnelDesired = tunnelDesired
                 changed = true

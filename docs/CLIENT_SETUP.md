@@ -113,19 +113,23 @@ recheck the status. Ad-hoc replacement builds can lose TCC grants. Gatekeeper
 and TCC behavior in Phase 2 is intentionally documented as a limitation, not
 hidden or bypassed.
 
-## Rotate a leaked URL or token
+## If a connector URL leaks
 
 If the URL appears in a log, screenshot, browser history, chat, or untrusted
 client:
 
 1. disable Remote in the helper;
-2. use the supported Keychain/token reset control;
-3. restart the helper and complete local activation again;
-4. enable Remote only if needed and copy the newly discovered URL; and
-5. remove the old URL from every client and trusted copy.
+2. remove the old URL from every client and trusted copy; and
+3. treat the connector credential as compromised and wait for the later
+   supported rotation/revocation workflow before re-enabling Remote.
+
+Phase 2 does not expose a user-facing connector-capability-token
+rotation/revocation control. The current terminal surface can clear the ngrok
+authtoken, but that does not rotate the connector capability token.
 
 Do not try to repair a leaked URL by editing only its hostname. The capability
-path contains the credential, and a fresh URL is required after rotation.
+path contains the credential, and a fresh URL is required after supported
+rotation.
 
 ## Troubleshooting checklist
 

@@ -21,15 +21,11 @@ release page; do not substitute a branch URL or an unverified script.
 
 ## Install the public-core release
 
-When a Phase 2 release is published, its release page will include the
-generated `install-command.sh`. Copy that command from the same release; it
-contains the exact version, immutable bootstrap URL, bootstrap SHA-256,
-manifest URL, and manifest SHA-256. Do not hand-edit those values:
-
-```bash
-# Paste the exact contents of install-command.sh from the tagged release.
-./install-command.sh
-```
+When a Phase 2 release is published, copy the generated installation command
+directly from the tagged release page and paste it into Terminal. It contains
+the exact version, immutable bootstrap URL, bootstrap SHA-256, manifest URL,
+and manifest SHA-256. `install-command.sh` is also attached as a convenience
+artifact. Do not hand-edit those values.
 
 The generated command verifies the bootstrap before executing it and passes
 both external trust anchors to the bootstrap. The bootstrap verifies the
@@ -162,9 +158,10 @@ interrupted promotion for the next invocation to recover.
 - If the connector stops working after restart or network change, request the
   current URL again. Free ngrok endpoints can change, and only the live
   `/api/endpoints` result is authoritative.
-- If the token may have leaked, disable remote mode, rotate/delete the Keychain
-  item through the helper's supported onboarding controls, restart, and update
-  every trusted client with the newly displayed URL.
+- If the connector URL may have leaked, disable remote mode immediately. Phase 2
+  does not expose connector credential rotation or revocation; treat the URL as
+  compromised, remove it from every client and trusted copy, and wait for the
+  later supported rotation workflow before re-enabling remote access.
 
 Logs are stored under `~/Library/Logs/Mac Orchestrator/`. Redact connector URLs,
 tokens, local file contents, and personal paths before sharing diagnostics.

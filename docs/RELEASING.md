@@ -29,6 +29,14 @@ activation. The release manifest is an integrity chain, not a project-owned
 signature against a compromised release account. Developer ID signing and
 notarization are deferred.
 
+The bootstrap keeps filesystem recovery armed only through verified staging,
+payload promotion, promoted-install validation, and LaunchAgent installation.
+After that installation transaction commits, TCC approval, local activation,
+profile selection, and optional remote setup are resumable onboarding steps.
+Their failure may leave the command nonzero, but it must not restore the
+successfully installed helper/runtime; genuine pre-commit installation failure
+still restores the previous payload.
+
 The helper is ad-hoc signed, arm64, installed below the user's Application
 Support directory, and does not contain ngrok. The bootstrap obtains ngrok from
 the vendor, verifies its original Developer ID authority/team, and never
@@ -139,11 +147,15 @@ Do not create a tag first and rely on a later push workflow to find a failure.
    the core payload, downloads the exact vendor ngrok ZIP for temporary
    validation, checks its digest and original signature, and asks
    `script/build_release_artifacts.sh` to emit `bootstrap.sh`, `manifest.json`,
-   `install-command.sh`, `SHA256SUMS`, and the release payloads. The ngrok ZIP
-   itself is not copied into or uploaded as a project release asset.
+   `install-command.sh`, the pinned `release-body.md` snippet, `SHA256SUMS`,
+   and the release payloads. The ngrok ZIP itself is not copied into or
+   uploaded as a project release asset.
 6. Publication depends on validation, required CI, and asset assembly. It
    rechecks the SHA, current remote `main`, and tag absence before uploading the
    assembled assets with GitHub's release command and `--target "$RELEASE_SHA"`.
+   The generated release body is supplied as the leading `--notes` content
+   while GitHub-generated notes remain enabled, so the release page itself
+   contains the supported one-copy-paste command.
 
 The current workflow does not dispatch a release, create a tag, or claim that a
 public artifact exists. Dispatch remains maintainer-controlled and requires

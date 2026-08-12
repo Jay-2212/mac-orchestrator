@@ -198,6 +198,7 @@ jobs:
           test -f "$release_tmp/output/bootstrap.sh"
           test -f "$release_tmp/output/manifest.json"
           test -x "$release_tmp/output/install-command.sh"
+          test -f "$release_tmp/output/release-body.md"
           test -f "$release_tmp/output/SHA256SUMS"
           (cd "$release_tmp/output" && /usr/bin/shasum -a 256 -c SHA256SUMS)
           if /usr/bin/find "$release_tmp/output" -iname '*ngrok*.zip' -print -quit | /usr/bin/grep -q .; then
@@ -256,9 +257,12 @@ jobs:
           RELEASE_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
+          release_notes="$(/bin/cat release-assets/release-body.md)"
+          test -n "$release_notes"
           gh release create "$RELEASE_TAG" \
             --target "$RELEASE_SHA" \
             --title "$RELEASE_TAG" \
+            --notes "$release_notes" \
             --generate-notes \
             release-assets/bootstrap.sh \
             release-assets/manifest.json \

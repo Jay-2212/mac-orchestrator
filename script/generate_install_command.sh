@@ -7,11 +7,13 @@ BOOTSTRAP_SHA256=""
 MANIFEST_URL=""
 MANIFEST_SHA256=""
 OUTPUT_PATH=""
+RELEASE_BODY_PATH=""
 
 usage() {
   cat <<'EOF'
 Usage: generate_install_command.sh --product-version VERSION --bootstrap-url URL \
-  --bootstrap-sha256 SHA256 --manifest-url URL --manifest-sha256 SHA256 --output PATH
+  --bootstrap-sha256 SHA256 --manifest-url URL --manifest-sha256 SHA256 --output PATH \
+  [--release-body PATH]
 EOF
 }
 
@@ -67,6 +69,11 @@ while (($# > 0)); do
       OUTPUT_PATH="$2"
       shift 2
       ;;
+    --release-body)
+      (($# >= 2)) || die "--release-body requires a value"
+      RELEASE_BODY_PATH="$2"
+      shift 2
+      ;;
     --help|-h)
       usage
       exit 0
@@ -87,7 +94,8 @@ require_release_url "manifest URL" "$MANIFEST_URL" "manifest.json"
 output_dir="$(dirname "$OUTPUT_PATH")"
 mkdir -p "$output_dir"
 tmp_path="$(mktemp "${OUTPUT_PATH}.tmp.XXXXXX")" || die "could not create a temporary install command"
-trap 'rm -f "$tmp_path"' EXIT
+body_tmp=""
+trap 'rm -f "$tmp_path" "$body_tmp"' EXIT
 
 cat > "$tmp_path" <<EOF
 #!/usr/bin/env bash
@@ -114,5 +122,38 @@ exit "\$status"
 EOF
 chmod 755 "$tmp_path"
 mv "$tmp_path" "$OUTPUT_PATH"
+if [ -n "$RELEASE_BODY_PATH" ]; then
+  body_dir="$(dirname "$RELEASE_BODY_PATH")"
+  mkdir -p "$body_dir"
+  body_tmp="$(mktemp "${RELEASE_BODY_PATH}.tmp.XXXXXX")" || die "could not create a temporary release body"
+  cat > "$body_tmp" <<EOF
+## Install Mac Orchestrator
+
+Copy and paste this command into Terminal:
+
+~~~bash
+(
+  set -euo pipefail
+  tmp_bootstrap="\$(mktemp -t mac-orchestrator-bootstrap.XXXXXX)"
+  trap 'rm -f "\$tmp_bootstrap"' EXIT
+  curl --fail --location --proto '=https' --tlsv1.2 --silent --show-error '$BOOTSTRAP_URL' -o "\$tmp_bootstrap"
+  printf '%s  %s\n' '$BOOTSTRAP_SHA256' "\$tmp_bootstrap" | shasum -a 256 -c - >/dev/null
+  chmod 700 "\$tmp_bootstrap"
+  bash "\$tmp_bootstrap" \\
+    --manifest '$MANIFEST_URL' \\
+    --manifest-sha256 '$MANIFEST_SHA256' \\
+    --bootstrap-sha256 '$BOOTSTRAP_SHA256' \\
+    --release-version '$PRODUCT_VERSION'
+)
+~~~
+
+The command verifies the immutable bootstrap before executing it. The
+bootstrap then downloads and verifies the immutable manifest before reading
+release payload metadata.
+EOF
+  chmod 644 "$body_tmp"
+  mv "$body_tmp" "$RELEASE_BODY_PATH"
+  body_tmp=""
+fi
 trap - EXIT
 printf '%s\n' "$OUTPUT_PATH"

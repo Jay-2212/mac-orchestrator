@@ -281,7 +281,7 @@ enum TerminalCommand {
             }
         }
 
-        print("Local connection is not ready; the previous installation remains in place.")
+        print("Local connection is not ready; the installed helper remains in place.")
         printPermissionGuidance(configuration: configuration)
         throw TerminalCommandError.agentRequestFailed(
             "local activation did not complete within 90 seconds (\(lastError))."

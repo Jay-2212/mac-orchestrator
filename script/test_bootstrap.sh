@@ -383,7 +383,7 @@ test_interrupted_promotion_recovers_previous_runtime() {
   fi
 }
 
-test_post_promotion_failure_recovers_previous_installation() {
+test_pre_commit_failure_recovers_previous_installation() {
   make_case post-promotion || return 1
   /bin/mkdir -p "$CASE_DIR/support/runtime" "$CASE_DIR/support/app" "$CASE_DIR/support/remote/ngrok" "$CASE_DIR/support/install"
   printf '%s\n' 'previous-runtime' > "$CASE_DIR/support/runtime/.release-marker"
@@ -395,6 +395,75 @@ test_post_promotion_failure_recovers_previous_installation() {
   assert_content "$CASE_DIR/support/app/helper-artifact" "previous-helper" || return 1
   assert_content "$CASE_DIR/support/remote/ngrok/ngrok" "previous-ngrok" || return 1
   [ ! -e "$CASE_DIR/support/install/promotion.marker" ] || return 1
+}
+
+test_structural_failure_after_promotion_recovers_previous_installation() {
+  make_case structural-failure || return 1
+  /bin/mkdir -p "$CASE_DIR/support/runtime" "$CASE_DIR/support/app" "$CASE_DIR/support/remote/ngrok" "$CASE_DIR/support/install"
+  printf '%s\n' 'previous-runtime' > "$CASE_DIR/support/runtime/.release-marker"
+  printf '%s\n' 'previous-helper' > "$CASE_DIR/support/app/helper-artifact"
+  printf '%s\n' 'previous-ngrok' > "$CASE_DIR/support/remote/ngrok/ngrok"
+  capture_bootstrap_with_env "$CASE_DIR" MAC_ORCHESTRATOR_TEST_BREAK_PROMOTED_INSTALLATION
+  [ "$BOOTSTRAP_RC" -ne 0 ] || return 1
+  assert_content "$CASE_DIR/support/runtime/.release-marker" "previous-runtime" || return 1
+  assert_content "$CASE_DIR/support/app/helper-artifact" "previous-helper" || return 1
+  assert_content "$CASE_DIR/support/remote/ngrok/ngrok" "previous-ngrok" || return 1
+  [ ! -e "$CASE_DIR/support/install/promotion.marker" ] || return 1
+}
+
+test_launch_agent_failure_before_commit_recovers_previous_installation() {
+  make_case launch-agent-failure || return 1
+  /bin/mkdir -p "$CASE_DIR/support/runtime" "$CASE_DIR/support/app" "$CASE_DIR/support/remote/ngrok" "$CASE_DIR/support/install"
+  printf '%s\n' 'previous-runtime' > "$CASE_DIR/support/runtime/.release-marker"
+  printf '%s\n' 'previous-helper' > "$CASE_DIR/support/app/helper-artifact"
+  printf '%s\n' 'previous-ngrok' > "$CASE_DIR/support/remote/ngrok/ngrok"
+  capture_bootstrap_with_env "$CASE_DIR" MAC_ORCHESTRATOR_TEST_FAIL_LAUNCH_AGENT
+  [ "$BOOTSTRAP_RC" -ne 0 ] || return 1
+  assert_content "$CASE_DIR/support/runtime/.release-marker" "previous-runtime" || return 1
+  assert_content "$CASE_DIR/support/app/helper-artifact" "previous-helper" || return 1
+  assert_content "$CASE_DIR/support/remote/ngrok/ngrok" "previous-ngrok" || return 1
+  [ ! -e "$CASE_DIR/support/install/promotion.marker" ] || return 1
+}
+
+test_onboarding_failure_after_install_commit_preserves_new_installation() {
+  make_case onboarding-failure || return 1
+  /bin/mkdir -p "$CASE_DIR/support/runtime" "$CASE_DIR/support/app" "$CASE_DIR/support/remote/ngrok" "$CASE_DIR/support/install"
+  printf '%s\n' 'previous-runtime' > "$CASE_DIR/support/runtime/.release-marker"
+  printf '%s\n' 'previous-helper' > "$CASE_DIR/support/app/helper-artifact"
+  printf '%s\n' 'previous-ngrok' > "$CASE_DIR/support/remote/ngrok/ngrok"
+  capture_bootstrap_with_env "$CASE_DIR" MAC_ORCHESTRATOR_TEST_FAIL_AFTER_INSTALL_COMMIT
+  [ "$BOOTSTRAP_RC" -ne 0 ] || return 1
+  assert_content "$CASE_DIR/support/runtime/.release-marker" "0.3.0-fixture" || return 1
+  assert_content "$CASE_DIR/support/app/helper-artifact" "fixture-helper" || return 1
+  assert_content "$CASE_DIR/support/remote/ngrok/archive.zip" "fixture-ngrok-archive" || return 1
+  assert_content "$CASE_DIR/support/install/runtime.previous/.release-marker" "previous-runtime" || return 1
+  assert_content "$CASE_DIR/support/install/app.previous/helper-artifact" "previous-helper" || return 1
+  assert_content "$CASE_DIR/support/install/remote.previous/ngrok" "previous-ngrok" || return 1
+  [ ! -e "$CASE_DIR/support/install/promotion.marker" ] || return 1
+}
+
+test_requested_remote_failure_after_install_commit_preserves_local_installation() {
+  make_case remote-failure || return 1
+  /bin/mkdir -p "$CASE_DIR/support/runtime" "$CASE_DIR/support/app" "$CASE_DIR/support/remote/ngrok" "$CASE_DIR/support/install"
+  printf '%s\n' 'previous-runtime' > "$CASE_DIR/support/runtime/.release-marker"
+  printf '%s\n' 'previous-helper' > "$CASE_DIR/support/app/helper-artifact"
+  printf '%s\n' 'previous-ngrok' > "$CASE_DIR/support/remote/ngrok/ngrok"
+  capture_bootstrap_with_env "$CASE_DIR" MAC_ORCHESTRATOR_TEST_FAIL_REMOTE_ONBOARDING --remote
+  [ "$BOOTSTRAP_RC" -ne 0 ] || return 1
+  assert_contains "$BOOTSTRAP_OUTPUT" "remote" || return 1
+  assert_content "$CASE_DIR/support/runtime/.release-marker" "0.3.0-fixture" || return 1
+  assert_content "$CASE_DIR/support/app/helper-artifact" "fixture-helper" || return 1
+  assert_content "$CASE_DIR/support/remote/ngrok/archive.zip" "fixture-ngrok-archive" || return 1
+  assert_content "$CASE_DIR/support/install/runtime.previous/.release-marker" "previous-runtime" || return 1
+  [ ! -e "$CASE_DIR/support/install/promotion.marker" ] || return 1
+}
+
+test_requested_remote_success_path_remains_available() {
+  make_case remote-success || return 1
+  capture_bootstrap "$CASE_DIR" --remote
+  [ "$BOOTSTRAP_RC" -eq 0 ] || { echo "$BOOTSTRAP_OUTPUT" >&2; return 1; }
+  assert_contains "$BOOTSTRAP_OUTPUT" "Remote access enabled; waiting for a live connector." || return 1
+  assert_contains "$BOOTSTRAP_OUTPUT" "Mac Orchestrator is ready." || return 1
 }
 
 test_next_run_recovers_promotion_marker() {
@@ -695,6 +764,101 @@ test_generated_install_command_contains_all_trust_anchors() {
   assert_not_contains "$command_text" "refs/heads/main" || return 1
 }
 
+test_generated_release_body_contains_pinned_install_command() {
+  body_output="$TEST_ROOT/release-body.md"
+  output="$(bash "$PROJECT_DIR/script/generate_install_command.sh" \
+    --product-version "0.3.0" \
+    --bootstrap-url "https://github.com/Jay-2212/mac-orchestrator/releases/download/v0.3.0/bootstrap.sh" \
+    --bootstrap-sha256 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" \
+    --manifest-url "https://github.com/Jay-2212/mac-orchestrator/releases/download/v0.3.0/manifest.json" \
+    --manifest-sha256 "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" \
+    --output "$TEST_ROOT/install-command-body.sh" \
+    --release-body "$body_output" 2>&1)"
+  rc=$?
+  [ "$rc" -eq 0 ] || { echo "$output" >&2; return 1; }
+  assert_file "$body_output" || return 1
+  body_text="$(/bin/cat "$body_output")" || return 1
+  assert_contains "$body_text" "releases/download/v0.3.0/bootstrap.sh" || return 1
+  assert_contains "$body_text" "releases/download/v0.3.0/manifest.json" || return 1
+  assert_contains "$body_text" "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" || return 1
+  assert_contains "$body_text" "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" || return 1
+  assert_contains "$body_text" "shasum -a 256 -c -" || return 1
+  assert_contains "$body_text" 'bash "$tmp_bootstrap"' || return 1
+  assert_contains "$body_text" $'bash "$tmp_bootstrap" \\\n    --manifest' || return 1
+  verification_line="$(printf '%s\n' "$body_text" | /usr/bin/awk '/shasum -a 256 -c -/{print NR; exit}')"
+  execution_line="$(printf '%s\n' "$body_text" | /usr/bin/awk '/bash "\$tmp_bootstrap"/{print NR; exit}')"
+  [ -n "$verification_line" ] && [ -n "$execution_line" ] || return 1
+  [ "$verification_line" -lt "$execution_line" ] || return 1
+}
+
+test_generated_release_body_changes_with_manifest_digest() {
+  first_body="$TEST_ROOT/release-body-first.md"
+  second_body="$TEST_ROOT/release-body-second.md"
+  first_manifest="$TEST_ROOT/manifest-first.json"
+  second_manifest="$TEST_ROOT/manifest-second.json"
+  printf '%s\n' '{"product":{"version":"0.3.0"},"marker":"first"}' > "$first_manifest"
+  printf '%s\n' '{"product":{"version":"0.3.0"},"marker":"second"}' > "$second_manifest"
+  first_manifest_sha="$(sha256 "$first_manifest")" || return 1
+  second_manifest_sha="$(sha256 "$second_manifest")" || return 1
+  [ "$first_manifest_sha" != "$second_manifest_sha" ] || return 1
+  common_args=(
+    --product-version "0.3.0"
+    --bootstrap-url "https://github.com/Jay-2212/mac-orchestrator/releases/download/v0.3.0/bootstrap.sh"
+    --bootstrap-sha256 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    --manifest-url "https://github.com/Jay-2212/mac-orchestrator/releases/download/v0.3.0/manifest.json"
+    --output "$TEST_ROOT/install-command-first.sh"
+  )
+  bash "$PROJECT_DIR/script/generate_install_command.sh" "${common_args[@]}" \
+    --manifest-sha256 "$first_manifest_sha" \
+    --release-body "$first_body" >/dev/null || return 1
+  common_args[9]="$TEST_ROOT/install-command-second.sh"
+  bash "$PROJECT_DIR/script/generate_install_command.sh" "${common_args[@]}" \
+    --manifest-sha256 "$second_manifest_sha" \
+    --release-body "$second_body" >/dev/null || return 1
+  first_text="$(/bin/cat "$first_body")" || return 1
+  second_text="$(/bin/cat "$second_body")" || return 1
+  [ "$first_text" != "$second_text" ] || return 1
+  assert_contains "$first_text" "$first_manifest_sha" || return 1
+  assert_contains "$second_text" "$second_manifest_sha" || return 1
+}
+
+test_release_body_rejects_untrusted_inputs() {
+  mutable_branch="main"
+  output="$(bash "$PROJECT_DIR/script/generate_install_command.sh" \
+    --product-version "0.3.0" \
+    --bootstrap-url "https://github.com/Jay-2212/mac-orchestrator/releases/download/v0.3.0/bootstrap.sh" \
+    --bootstrap-sha256 "0000000000000000000000000000000000000000000000000000000000000000" \
+    --manifest-url "https://github.com/Jay-2212/mac-orchestrator/releases/refs/heads/$mutable_branch/manifest.json" \
+    --manifest-sha256 "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" \
+    --output "$TEST_ROOT/install-command-untrusted.sh" \
+    --release-body "$TEST_ROOT/release-body-untrusted.md" 2>&1)"
+  rc=$?
+  [ "$rc" -ne 0 ] || return 1
+  assert_contains "$output" "must not be all zeroes" || return 1
+
+  output="$(bash "$PROJECT_DIR/script/generate_install_command.sh" \
+    --product-version "0.3.0" \
+    --bootstrap-url "https://github.com/Jay-2212/mac-orchestrator/releases/download/v0.3.0/bootstrap.sh" \
+    --bootstrap-sha256 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" \
+    --manifest-url "https://github.com/Jay-2212/mac-orchestrator/releases/refs/heads/$mutable_branch/manifest.json" \
+    --manifest-sha256 "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" \
+    --output "$TEST_ROOT/install-command-mutable.sh" \
+    --release-body "$TEST_ROOT/release-body-mutable.md" 2>&1)"
+  rc=$?
+  [ "$rc" -ne 0 ] || return 1
+  assert_contains "$output" "immutable GitHub release asset URL" || return 1
+}
+
+test_release_publication_consumes_generated_body() {
+  builder_contents="$(/bin/cat "$PROJECT_DIR/script/build_release_artifacts.sh")" || return 1
+  release_contents="$(/bin/cat "$PROJECT_DIR/.github/workflows/release.yml")" || return 1
+  assert_contains "$builder_contents" "--release-body" || return 1
+  assert_contains "$builder_contents" "release-body.md" || return 1
+  assert_contains "$release_contents" "release-body.md" || return 1
+  assert_contains "$release_contents" '--notes "$release_notes"' || return 1
+  assert_contains "$release_contents" "--generate-notes" || return 1
+}
+
 test_package_app_helper_contract() {
   package_contents="$(/bin/cat "$PROJECT_DIR/script/package_app.sh")" || return 1
   assert_contains "$package_contents" "arm64" || return 1
@@ -718,6 +882,12 @@ test_bootstrap_completion_is_activation_gated() {
   assert_contains "$bootstrap_contents" "--wait-for-local-activation" || return 1
   assert_contains "$bootstrap_contents" "local-activation-confirmed" || return 1
   assert_contains "$bootstrap_contents" "remote-activation-confirmed" || return 1
+}
+
+test_activation_timeout_guidance_refers_to_installed_helper() {
+  terminal_contents="$(/bin/cat "$PROJECT_DIR/Sources/MacOrchestrator/TerminalCommand.swift")" || return 1
+  assert_contains "$terminal_contents" "the installed helper remains in place" || return 1
+  assert_not_contains "$terminal_contents" "the previous installation remains in place" || return 1
 }
 
 run_test() {
@@ -758,7 +928,12 @@ run_test "minimum macOS rejection" test_old_macos_rejected
 run_test "repeat promotion is idempotent" test_repeat_promotion_is_idempotent
 run_test "failed download preserves previous state" test_failed_download_preserves_previous_state
 run_test "interrupted promotion recovers previous runtime" test_interrupted_promotion_recovers_previous_runtime
-run_test "post-promotion failure recovers previous installation" test_post_promotion_failure_recovers_previous_installation
+run_test "pre-commit failure recovers previous installation" test_pre_commit_failure_recovers_previous_installation
+run_test "structural failure after promotion recovers previous installation" test_structural_failure_after_promotion_recovers_previous_installation
+run_test "LaunchAgent failure before commit recovers previous installation" test_launch_agent_failure_before_commit_recovers_previous_installation
+run_test "onboarding failure after install commit preserves new installation" test_onboarding_failure_after_install_commit_preserves_new_installation
+run_test "requested remote failure preserves local installation" test_requested_remote_failure_after_install_commit_preserves_local_installation
+run_test "requested remote success path remains available" test_requested_remote_success_path_remains_available
 run_test "next run recovers promotion marker" test_next_run_recovers_promotion_marker
 run_test "symlinked support root is rejected" test_symlinked_support_root_rejected
 run_test "symlinked support parent is rejected" test_symlinked_support_parent_rejected
@@ -773,9 +948,14 @@ run_test "artifact builder rejects linked helper archive" test_artifact_builder_
 run_test "artifact builder rejects undeclared core file" test_artifact_builder_rejects_core_boundary_extra
 run_test "artifact builder rejects core special entry" test_artifact_builder_rejects_core_special_entry
 run_test "generated install command contains trust anchors" test_generated_install_command_contains_all_trust_anchors
+run_test "generated release body contains pinned install command" test_generated_release_body_contains_pinned_install_command
+run_test "generated release body changes with manifest digest" test_generated_release_body_changes_with_manifest_digest
+run_test "release body rejects untrusted inputs" test_release_body_rejects_untrusted_inputs
+run_test "release publication consumes generated body" test_release_publication_consumes_generated_body
 run_test "package helper contract" test_package_app_helper_contract
 run_test "release output does not redistribute ngrok" test_release_output_does_not_redistribute_ngrok
 run_test "bootstrap completion waits for activation" test_bootstrap_completion_is_activation_gated
+run_test "activation timeout guidance names installed helper" test_activation_timeout_guidance_refers_to_installed_helper
 
 if [ "$FAILURES" -ne 0 ]; then
   echo "$FAILURES bootstrap fixture test(s) failed" >&2

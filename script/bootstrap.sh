@@ -36,6 +36,10 @@ FIXTURE_MODE="${MAC_ORCHESTRATOR_FIXTURE_MODE:-0}"
 FIXTURE_LOCK_PATH="${MAC_ORCHESTRATOR_FIXTURE_LOCK_PATH:-}"
 TEST_FAIL_AFTER_PROMOTION="${MAC_ORCHESTRATOR_TEST_FAIL_AFTER_PROMOTION:-0}"
 TEST_FAIL_AFTER_POST_PROMOTION="${MAC_ORCHESTRATOR_TEST_FAIL_AFTER_POST_PROMOTION:-0}"
+TEST_BREAK_PROMOTED_INSTALLATION="${MAC_ORCHESTRATOR_TEST_BREAK_PROMOTED_INSTALLATION:-0}"
+TEST_FAIL_LAUNCH_AGENT="${MAC_ORCHESTRATOR_TEST_FAIL_LAUNCH_AGENT:-0}"
+TEST_FAIL_AFTER_INSTALL_COMMIT="${MAC_ORCHESTRATOR_TEST_FAIL_AFTER_INSTALL_COMMIT:-0}"
+TEST_FAIL_REMOTE_ONBOARDING="${MAC_ORCHESTRATOR_TEST_FAIL_REMOTE_ONBOARDING:-0}"
 TEST_EXIT_AFTER_RECOVERY="${MAC_ORCHESTRATOR_TEST_EXIT_AFTER_RECOVERY:-0}"
 VERBOSE="0"
 PROFILE="guided"
@@ -66,6 +70,7 @@ stage() {
     digests-verified) echo "Verified release payloads." ;;
     staged) echo "Prepared a safe staged installation." ;;
     promoted) echo "Installed Mac Orchestrator." ;;
+    installation-committed) echo "Installation committed; onboarding can resume without replacing installed files." ;;
     starting-helper) echo "Starting Mac Orchestrator..." ;;
     profile-guided-default) echo "Guided Control is enabled by default." ;;
     profile-full-selected) echo "Full Control selected explicitly." ;;
@@ -927,6 +932,26 @@ promote() {
   stage "promoted"
 }
 
+validate_promoted_installation() {
+  [ ! -L "$RUNTIME_DIR" ] || die "promoted runtime directory must not be a symlink"
+  [ ! -L "$APP_DIR" ] || die "promoted helper directory must not be a symlink"
+  [ ! -L "$REMOTE_DIR" ] || die "promoted remote directory must not be a symlink"
+  if [ "$FIXTURE_MODE" = "1" ]; then
+    [ -f "$RUNTIME_DIR/.release-marker" ] || die "promoted runtime marker is missing"
+    [ -f "$APP_DIR/helper-artifact" ] || die "promoted helper fixture is missing"
+    [ -f "$REMOTE_DIR/archive.zip" ] || die "promoted remote fixture is missing"
+    return 0
+  fi
+  [ -f "$RUNTIME_DIR/automac_mcp.py" ] || die "promoted runtime is missing automac_mcp.py"
+  [ -f "$RUNTIME_DIR/pyproject.toml" ] || die "promoted runtime is missing pyproject.toml"
+  [ -f "$RUNTIME_DIR/uv.lock" ] || die "promoted runtime is missing uv.lock"
+  [ -x "$RUNTIME_DIR/.venv/bin/python" ] || die "promoted managed Python executable is missing"
+  [ -x "$APP_DIR/Mac Orchestrator.app/Contents/MacOS/MacOrchestrator" ] ||
+    die "promoted helper executable is missing"
+  [ -x "$REMOTE_DIR/$NGROK_EXECUTABLE" ] || die "promoted ngrok executable is missing"
+  [ -f "$REMOTE_DIR/ngrok.yml" ] || die "promoted ngrok configuration is missing"
+}
+
 finalize_promotion() {
   [ ! -L "$PROMOTION_MARKER" ] || die "promotion marker must not be a symlink"
   /bin/rm -f "$PROMOTION_MARKER"
@@ -934,6 +959,9 @@ finalize_promotion() {
 }
 
 write_launch_agent() {
+  if [ "$TEST_FAIL_LAUNCH_AGENT" = "1" ]; then
+    die "simulated LaunchAgent installation failure"
+  fi
   [ "$FIXTURE_MODE" = "1" ] && return 0
   [ ! -L "$LAUNCH_AGENTS_DIR" ] || die "LaunchAgents directory must not be a symlink"
   [ ! -L "$LAUNCH_AGENT_PATH" ] || die "LaunchAgent file must not be a symlink"
@@ -950,8 +978,19 @@ write_launch_agent() {
   /bin/launchctl bootstrap "gui/$(id -u)" "$LAUNCH_AGENT_PATH"
 }
 
-wait_for_activation() {
+restart_installed_helper() {
   [ "$FIXTURE_MODE" = "1" ] && return 0
+  /bin/launchctl kickstart -k "gui/$(id -u)/$LAUNCH_AGENT_LABEL" ||
+    die "could not restart the installed helper after onboarding configuration"
+}
+
+wait_for_activation() {
+  if [ "$FIXTURE_MODE" = "1" ]; then
+    if [ "$REMOTE_REQUESTED" = "1" ] && [ "$TEST_FAIL_REMOTE_ONBOARDING" = "1" ]; then
+      die "simulated remote onboarding failure"
+    fi
+    return 0
+  fi
   helper_executable="$APP_DIR/Mac Orchestrator.app/Contents/MacOS/MacOrchestrator"
   [ -x "$helper_executable" ] || die "installed helper executable is missing"
   stage "local-activation-pending"
@@ -959,6 +998,9 @@ wait_for_activation() {
     die "installed helper did not complete the authenticated local activation probe"
   stage "local-activation-confirmed"
   if [ "$REMOTE_REQUESTED" = "1" ]; then
+    if [ "$TEST_FAIL_REMOTE_ONBOARDING" = "1" ]; then
+      die "simulated remote onboarding failure"
+    fi
     stage "remote-activation-pending"
     "$helper_executable" --wait-for-remote-connector ||
       die "remote opt-in was requested but no live HTTPS connector was confirmed"
@@ -1019,9 +1061,21 @@ main() {
   if [ "$TEST_FAIL_AFTER_POST_PROMOTION" = "1" ]; then
     die "simulated interruption after complete promotion"
   fi
-  configure_installed_helper
+  if [ "$TEST_BREAK_PROMOTED_INSTALLATION" = "1" ]; then
+    cleanup_path "$APP_DIR" || die "could not simulate a broken promoted installation"
+  fi
+  validate_promoted_installation
   stage "starting-helper"
   write_launch_agent
+  finalize_promotion
+  stage "installation-committed"
+  if [ "$TEST_FAIL_AFTER_INSTALL_COMMIT" = "1" ]; then
+    die "simulated onboarding failure after installation commit"
+  fi
+  configure_installed_helper
+  if [ "$PROFILE" = "full" ] || [ "$REMOTE_REQUESTED" = "1" ]; then
+    restart_installed_helper
+  fi
   if [ "$PROFILE" = "full" ]; then
     stage "profile-full-selected"
   else
@@ -1033,7 +1087,6 @@ main() {
     stage "remote-optional"
   fi
   wait_for_activation
-  finalize_promotion
   stage "complete"
 }
 

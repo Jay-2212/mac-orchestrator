@@ -462,7 +462,8 @@ main() {
     --bootstrap-sha256 "$BOOTSTRAP_SHA256" \
     --manifest-url "$MANIFEST_URL" \
     --manifest-sha256 "$manifest_sha256" \
-    --output "$OUTPUT_DIR/install-command.sh" >/dev/null
+    --output "$OUTPUT_DIR/install-command.sh" \
+    --release-body "$OUTPUT_DIR/release-body.md" >/dev/null
   write_checksums
   echo "$OUTPUT_DIR/manifest.json"
 }

@@ -24,4 +24,25 @@ final class MenuControllerTests: XCTestCase {
             "MCP client refresh/reconnection required",
         ])
     }
+
+    @MainActor
+    func testRuntimeStatusTitlesExplainPendingPermissionGuidance() {
+        var snapshot = ServiceSnapshot(
+            server: .running,
+            tunnel: .stopped,
+            connectorURL: nil,
+            error: nil,
+            controlProfile: .guided,
+            readyCapabilityCount: 2,
+            totalCapabilityCount: 11,
+            clientRefreshRequired: false
+        )
+        snapshot.pendingPermissions = ["Accessibility", "Screen Recording or OCR payload"]
+
+        XCTAssertTrue(
+            MenuController.runtimeStatusTitles(for: snapshot).contains(
+                "Permissions pending: Accessibility, Screen Recording or OCR payload"
+            )
+        )
+    }
 }

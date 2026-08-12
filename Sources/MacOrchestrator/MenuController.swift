@@ -44,6 +44,7 @@ final class MenuController: NSObject {
         menu.addItem(action("Restart", #selector(restart)))
         menu.addItem(.separator())
         menu.addItem(action("Open Logs", #selector(openLogs)))
+        menu.addItem(action("Open Privacy & Security Settings (then Restart)", #selector(openPrivacySettings)))
         menu.addItem(label("Launch at Login: Enabled"))
         menu.addItem(.separator())
         menu.addItem(action("Quit Mac Orchestrator", #selector(quit)))
@@ -74,6 +75,9 @@ final class MenuController: NSObject {
             titles.append(
                 "Capabilities ready: \(snapshot.readyCapabilityCount)/\(snapshot.totalCapabilityCount)"
             )
+            if !snapshot.pendingPermissions.isEmpty {
+                titles.append("Permissions pending: \(snapshot.pendingPermissions.joined(separator: ", "))")
+            }
         }
         if let error = snapshot.error {
             titles.append("Error: \(String(error.prefix(70)))")
@@ -108,5 +112,6 @@ final class MenuController: NSObject {
     @objc private func disableConnector() { supervisor.disableConnectorRequested() }
     @objc private func restart() { supervisor.restartRequested() }
     @objc private func openLogs() { supervisor.openLogs() }
+    @objc private func openPrivacySettings() { supervisor.openPrivacySettings() }
     @objc private func quit() { NSApp.terminate(nil) }
 }

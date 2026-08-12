@@ -883,5 +883,43 @@ class DiscoveryRedactionTests(unittest.TestCase):
         self.assertNotIn("vector_search", result["disabled"][0].get("reason", ""))
 
 
+class ManagedPermissionProbeTests(unittest.TestCase):
+    def test_core_only_session_probe_does_not_trigger_unrequested_automation_probe(self):
+        snapshot = make_snapshot([])
+        with patch.object(automac_mcp, "CGSessionCopyCurrentDictionary", return_value={}), patch.object(
+            automac_mcp, "AXIsProcessTrusted", return_value=False
+        ), patch.object(
+            automac_mcp, "CGPreflightScreenCaptureAccess", return_value=False
+        ), patch.object(automac_mcp, "_probe_automation_permission") as automation_probe:
+            with automac_mcp.use_runtime(snapshot):
+                result = automac_mcp.get_session_state()
+
+        automation_probe.assert_not_called()
+        self.assertIsNone(result["permissions"]["automation"])
+
+    def test_permission_probe_returns_redacted_machine_readable_truth(self):
+        result = subprocess.run(
+            [sys.executable, "-B", "automac_mcp.py", "--permission-probe"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["status"], "success")
+        self.assertIn("permissions", payload)
+        self.assertEqual(
+            set(payload["permissions"]),
+            {"accessibility", "screen_recording", "automation"},
+        )
+        self.assertIn("session", payload)
+        self.assertEqual(
+            set(payload["session"]) & {"on_console", "is_locked"},
+            {"on_console", "is_locked"},
+        )
+        self.assertNotIn("MAC_ORCHESTRATOR_CONNECTOR_TOKEN", result.stdout)
+        self.assertNotIn("authtoken", result.stdout.lower())
+
+
 if __name__ == "__main__":
     unittest.main()

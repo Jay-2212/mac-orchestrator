@@ -42,6 +42,79 @@ jobs:
       - name: Swift test suite (required)
         run: swift test
 
+  phase2-contract-gate:
+    name: Phase 2 bootstrap contract gate (required)
+    runs-on: macos-14
+    steps:
+      - name: Check out exact workflow commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.checkout_ref || github.sha }}
+          fetch-depth: 1
+
+      - name: Set up pinned uv and Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.12.3"
+          python-version: "3.13.14"
+          enable-cache: false
+
+      - name: Validate manifest and bootstrap syntax (required)
+        run: |
+          set -euo pipefail
+          required_files=(
+            release/manifest.schema.json
+            release/manifest.template.json
+            script/bootstrap.sh
+            script/build_release_artifacts.sh
+            script/generate_install_command.sh
+            script/test_bootstrap.sh
+          )
+          for item in "${required_files[@]}"; do
+            test -f "$item" || { echo "Missing Phase 2 contract file: $item" >&2; exit 1; }
+          done
+          test -x script/bootstrap.sh
+          test -x script/build_release_artifacts.sh
+          test -x script/generate_install_command.sh
+          test -x script/test_bootstrap.sh
+          python3 -m json.tool release/manifest.schema.json >/dev/null
+          python3 -m json.tool release/manifest.template.json >/dev/null
+          bash -n script/bootstrap.sh script/build_release_artifacts.sh script/generate_install_command.sh script/test_bootstrap.sh
+
+      - name: Verify immutable payload boundary (required)
+        run: |
+          set -euo pipefail
+          contract_files=(
+            release/manifest.schema.json
+            release/manifest.template.json
+            script/bootstrap.sh
+            script/build_release_artifacts.sh
+            script/generate_install_command.sh
+          )
+          if git grep -nE '(raw\.githubusercontent\.com|github\.com/[^[:space:]]+)/(main|master)(/|$)' -- "${contract_files[@]}"; then
+            echo "Mutable branch URL found in the release/bootstrap contract." >&2
+            exit 1
+          fi
+          if git grep -nE '(/Users/|/private/var/|DerivedData|(^|[^[:alnum:]])/tmp/)' -- "${contract_files[@]}"; then
+            echo "Build-machine or transient absolute path found in the release/bootstrap contract." >&2
+            exit 1
+          fi
+          if git grep -nE '(package_app\.sh|distribute\.sh|bootstrap_ngrok\.sh|swift[[:space:]]+build|xcodebuild|brew[[:space:]]+install|git[[:space:]]+clone)' -- script/bootstrap.sh; then
+            echo "Source-build prerequisite leaked into the public bootstrap path." >&2
+            exit 1
+          fi
+          if git grep -nE '(cp|ditto|install|rsync|tar)[^[:cntrl:]]*indexer\.py' -- script/bootstrap.sh script/build_release_artifacts.sh; then
+            echo "The core bootstrap/artifact path includes indexer.py." >&2
+            exit 1
+          fi
+          if git grep -nE '(release-assets/ngrok-arm64\.zip|output/ngrok-arm64\.zip|OUTPUT_DIR/ngrok)' -- script/build_release_artifacts.sh .github/workflows/release.yml; then
+            echo "The project release path must not redistribute the vendor ngrok archive." >&2
+            exit 1
+          fi
+
+      - name: Run clean/repeat/interrupted bootstrap harness (required)
+        run: bash script/test_bootstrap.sh
+
   python-hygiene-gate:
     name: Python hygiene gate (required)
     runs-on: macos-14
@@ -83,11 +156,11 @@ jobs:
       - name: Secret / personal-data scan (required)
         run: |
           set -euo pipefail
-          if git grep -InE '(ghp_[A-Za-z0-9]{36}|sk-[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,})' -- . ':!*.lock'; then
+          if git grep -InE '(-----BEGIN (RSA|EC|OPENSSH|PRIVATE) KEY-----|gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|NGROK_AUTHTOKEN[[:space:]]*[:=][[:space:]]*[A-Za-z0-9._-]{24,})' -- . ':!*.lock'; then
             echo "Possible committed secret found." >&2
             exit 1
           fi
-          if git grep -InE '/Users/[a-z0-9_-]+/(Documents|Desktop|Downloads)' -- . ':!*.lock' ':!.github/workflows/ci.yml'; then
+          if git grep -InE '(/Users/[a-z0-9_-]+/(Documents|Desktop|Downloads)|/private/var/[^[:space:]]+|/Users/[^[:space:]]+/Library/Developer/Xcode/DerivedData)' -- . ':!*.lock' ':!.github/workflows/ci.yml'; then
             echo "Possible hardcoded personal absolute path found." >&2
             exit 1
           fi
@@ -128,6 +201,13 @@ jobs:
 
       - name: Run capability and policy tests (required)
         run: PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -B test_capabilities.py
+
+      - name: Verify lock and dependency partition (required)
+        run: |
+          set -euo pipefail
+          uv lock --check
+          test -f test_dependency_partition.py
+          PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -B test_dependency_partition.py
 
       - name: Verify locked native dependencies import
         run: |
@@ -177,6 +257,7 @@ jobs:
       - swift-build-gate
       - python-hygiene-gate
       - python-dependency-gate
+      - phase2-contract-gate
     runs-on: ubuntu-24.04
     steps:
       - name: Fail closed unless every required gate succeeded
@@ -184,12 +265,14 @@ jobs:
           SWIFT_RESULT: ${{ needs.swift-build-gate.result }}
           PYTHON_HYGIENE_RESULT: ${{ needs.python-hygiene-gate.result }}
           PYTHON_DEPENDENCY_RESULT: ${{ needs.python-dependency-gate.result }}
+          PHASE2_CONTRACT_RESULT: ${{ needs.phase2-contract-gate.result }}
         run: |
           set -euo pipefail
           printf 'swift-build-gate=%s\n' "$SWIFT_RESULT"
           printf 'python-hygiene-gate=%s\n' "$PYTHON_HYGIENE_RESULT"
           printf 'python-dependency-gate=%s\n' "$PYTHON_DEPENDENCY_RESULT"
-          if [[ "$SWIFT_RESULT" != success || "$PYTHON_HYGIENE_RESULT" != success || "$PYTHON_DEPENDENCY_RESULT" != success ]]; then
+          printf 'phase2-contract-gate=%s\n' "$PHASE2_CONTRACT_RESULT"
+          if [[ "$SWIFT_RESULT" != success || "$PYTHON_HYGIENE_RESULT" != success || "$PYTHON_DEPENDENCY_RESULT" != success || "$PHASE2_CONTRACT_RESULT" != success ]]; then
             echo "One or more required release gates did not succeed." >&2
             exit 1
           fi

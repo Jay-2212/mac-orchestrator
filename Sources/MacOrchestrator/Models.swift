@@ -17,6 +17,7 @@ struct ServiceSnapshot {
     var controlProfile: ControlProfile?
     var readyCapabilityCount: Int = 0
     var totalCapabilityCount: Int = CapabilityRegistry.capabilityIDs.count
+    var pendingPermissions: [String] = []
     var clientRefreshRequired: Bool = false
 
     var isHealthy: Bool {
@@ -30,7 +31,19 @@ struct ServiceSnapshot {
         controlProfile = contract.capabilitySnapshot.controlProfile
         readyCapabilityCount = contract.capabilitySnapshot.capabilities.values.filter(\.ready).count
         totalCapabilityCount = contract.capabilitySnapshot.capabilities.count
+        pendingPermissions = Self.pendingPermissions(in: contract.capabilitySnapshot)
         clientRefreshRequired = clientRefreshRequired || requiresClientRefresh
+    }
+
+    private static func pendingPermissions(in snapshot: CapabilitySnapshot) -> [String] {
+        var permissions = [String]()
+        if let ui = snapshot.capabilities["mac.ui"], ui.desired, !ui.ready {
+            permissions.append("Accessibility")
+        }
+        if let screenOcr = snapshot.capabilities["mac.screenOcr"], screenOcr.desired, !screenOcr.ready {
+            permissions.append("Screen Recording or OCR payload")
+        }
+        return permissions
     }
 }
 

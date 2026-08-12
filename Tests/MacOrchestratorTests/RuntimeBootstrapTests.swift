@@ -63,6 +63,56 @@ final class RuntimeBootstrapTests: XCTestCase {
             contract.capabilitySnapshot
         )
     }
+
+    @MainActor
+    func testPhase2CompletionRequiresCurrentManagedUIReadiness() async throws {
+        let testID = UUID().uuidString
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("runtime-completion-\(testID)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let defaultsName = "runtime-completion-\(testID)"
+        let defaults = UserDefaults(suiteName: defaultsName)!
+        defer { defaults.removePersistentDomain(forName: defaultsName) }
+        let store = ConfigurationStore(
+            directoryURL: directory.appendingPathComponent("support", isDirectory: true),
+            ownerIDProvider: { "completion-owner" }
+        )
+        _ = try store.loadOrCreate()
+        let keychain = KeychainStore(
+            client: BootstrapKeychainClient(),
+            meridianAccount: "runtime-completion"
+        )
+        var uiReady = false
+        let coordinator = NativeRuntimeCoordinator(
+            store: store,
+            userDefaults: defaults,
+            keychain: keychain,
+            legacyConfigurationURL: directory.appendingPathComponent("legacy-config.json"),
+            runtimeDirectory: directory.appendingPathComponent("runtime", isDirectory: true),
+            readinessEvaluator: { _, _, _ in
+                CapabilityReadinessFacts(
+                    coreSessionReady: true,
+                    localUIReady: uiReady
+                )
+            }
+        )
+
+        do {
+            _ = try await coordinator.markPhase2Completed()
+            XCTFail("Phase 2 must remain pending while the required UI requester is unavailable.")
+        } catch let error as OnboardingCompletionError {
+            XCTAssertEqual(error, .requiredCapabilityPending("mac.ui"))
+        }
+        XCTAssertFalse(try store.load().onboarding.completed)
+
+        uiReady = true
+        _ = try await coordinator.markPhase2Completed()
+        let completed = try store.load()
+        XCTAssertTrue(completed.onboarding.completed)
+        XCTAssertEqual(completed.onboarding.phase2State, .completed)
+    }
 }
 
 private final class BootstrapKeychainClient: KeychainClient {

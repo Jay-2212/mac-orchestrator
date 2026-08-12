@@ -7,6 +7,32 @@ protocol CapabilityPermissionChecking {
     func screenRecordingIsGranted() -> Bool
 }
 
+struct ManagedPermissionProbeFacts: Equatable, Sendable {
+    let accessibility: Bool
+    let screenRecording: Bool
+    let automation: Bool
+    let activeConsole: Bool
+    let unlocked: Bool
+
+    init(
+        accessibility: Bool,
+        screenRecording: Bool,
+        automation: Bool = true,
+        activeConsole: Bool = true,
+        unlocked: Bool = true
+    ) {
+        self.accessibility = accessibility
+        self.screenRecording = screenRecording
+        self.automation = automation
+        self.activeConsole = activeConsole
+        self.unlocked = unlocked
+    }
+}
+
+protocol ManagedPermissionChecking {
+    func probe(runtimeDirectory: URL) -> ManagedPermissionProbeFacts?
+}
+
 struct SystemCapabilityPermissionChecker: CapabilityPermissionChecking {
     func accessibilityIsGranted() -> Bool {
         AXIsProcessTrusted()
@@ -17,11 +43,61 @@ struct SystemCapabilityPermissionChecker: CapabilityPermissionChecking {
     }
 }
 
+struct SystemManagedPermissionChecker: ManagedPermissionChecking {
+    private let fileManager: FileManager
+
+    init(fileManager: FileManager = .default) {
+        self.fileManager = fileManager
+    }
+
+    func probe(runtimeDirectory: URL) -> ManagedPermissionProbeFacts? {
+        let python = runtimeDirectory.appendingPathComponent(".venv/bin/python")
+        let server = runtimeDirectory.appendingPathComponent("automac_mcp.py")
+        guard fileManager.isExecutableFile(atPath: python.path),
+              fileManager.fileExists(atPath: server.path) else {
+            return nil
+        }
+
+        let process = Process()
+        let output = Pipe()
+        process.executableURL = python
+        process.arguments = [server.path, "--permission-probe"]
+        process.currentDirectoryURL = runtimeDirectory
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+            let deadline = Date().addingTimeInterval(15)
+            while process.isRunning && Date() < deadline {
+                RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+            }
+            guard !process.isRunning else {
+                process.terminate()
+                return nil
+            }
+            guard process.terminationStatus == 0 else { return nil }
+            let data = output.fileHandleForReading.readDataToEndOfFile()
+            let envelope = try JSONDecoder().decode(PermissionProbeEnvelope.self, from: data)
+            guard envelope.status == "success" else { return nil }
+            return ManagedPermissionProbeFacts(
+                accessibility: envelope.permissions.accessibility == true,
+                screenRecording: envelope.permissions.screenRecording == true,
+                automation: envelope.permissions.automation == true,
+                activeConsole: envelope.session.onConsole == true,
+                unlocked: envelope.session.isLocked == false
+            )
+        } catch {
+            return nil
+        }
+    }
+}
+
 @MainActor
 final class CapabilityReadinessCoordinator {
     private let session: URLSession
     private let fileManager: FileManager
     private let permissionChecker: CapabilityPermissionChecking
+    private let managedPermissionChecker: ManagedPermissionChecking?
 
     init(
         session: URLSession = .shared,
@@ -30,6 +106,7 @@ final class CapabilityReadinessCoordinator {
         self.session = session
         self.fileManager = fileManager
         self.permissionChecker = SystemCapabilityPermissionChecker()
+        self.managedPermissionChecker = SystemManagedPermissionChecker(fileManager: fileManager)
     }
 
     init(
@@ -40,6 +117,19 @@ final class CapabilityReadinessCoordinator {
         self.session = session
         self.fileManager = fileManager
         self.permissionChecker = permissionChecker
+        self.managedPermissionChecker = nil
+    }
+
+    init(
+        session: URLSession,
+        fileManager: FileManager,
+        permissionChecker: CapabilityPermissionChecking,
+        managedPermissionChecker: ManagedPermissionChecking
+    ) {
+        self.session = session
+        self.fileManager = fileManager
+        self.permissionChecker = permissionChecker
+        self.managedPermissionChecker = managedPermissionChecker
     }
 
     func evaluate(
@@ -48,8 +138,16 @@ final class CapabilityReadinessCoordinator {
         runtimeDirectory: URL
     ) async -> CapabilityReadinessFacts {
         let coreSessionReady = localRuntimeIsReady(at: runtimeDirectory)
-        let localUIReady = permissionChecker.accessibilityIsGranted()
-        let screenOcrReady = permissionChecker.screenRecordingIsGranted()
+        let managedPermissions = managedPermissionChecker?.probe(runtimeDirectory: runtimeDirectory)
+        let accessibilityGranted = managedPermissions?.accessibility
+            ?? (managedPermissionChecker == nil ? permissionChecker.accessibilityIsGranted() : false)
+        let screenRecordingGranted = managedPermissions?.screenRecording
+            ?? (managedPermissionChecker == nil ? permissionChecker.screenRecordingIsGranted() : false)
+        let managedSessionReady = managedPermissions.map {
+            $0.automation && $0.activeConsole && $0.unlocked
+        } ?? (managedPermissionChecker == nil)
+        let localUIReady = accessibilityGranted && managedSessionReady
+        let screenOcrReady = screenRecordingGranted && managedSessionReady
             && localOCRPayloadIsReady(at: runtimeDirectory)
 
         let normalizedRoots = try? ApprovedFileRootNormalizer.normalize(configuration.approvedFileRoots)
@@ -220,6 +318,34 @@ final class CapabilityReadinessCoordinator {
     private static let telegramTokenCharacters = CharacterSet(
         charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789:_-"
     )
+}
+
+private struct PermissionProbeEnvelope: Decodable {
+    let status: String
+    let permissions: PermissionProbeValues
+    let session: PermissionProbeSession
+}
+
+private struct PermissionProbeValues: Decodable {
+    let accessibility: Bool?
+    let screenRecording: Bool?
+    let automation: Bool?
+
+    private enum CodingKeys: String, CodingKey {
+        case accessibility
+        case screenRecording = "screen_recording"
+        case automation
+    }
+}
+
+private struct PermissionProbeSession: Decodable {
+    let onConsole: Bool?
+    let isLocked: Bool?
+
+    private enum CodingKeys: String, CodingKey {
+        case onConsole = "on_console"
+        case isLocked = "is_locked"
+    }
 }
 
 private struct TelegramAPIEnvelope<Result: Decodable>: Decodable {

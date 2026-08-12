@@ -32,6 +32,22 @@ final class ProcessSupervisor {
     private var ownerID = ""
     private var serverDesired = false
     private var tunnelDesired = false
+    private var activationSucceeded = false
+    private var activationInFlight = false
+
+    private var ngrokDirectory: URL {
+        supportDirectory
+            .appendingPathComponent("remote", isDirectory: true)
+            .appendingPathComponent("ngrok", isDirectory: true)
+    }
+
+    private var ngrokBinaryURL: URL {
+        ngrokDirectory.appendingPathComponent("ngrok", isDirectory: false)
+    }
+
+    private var ngrokConfigURL: URL {
+        ngrokDirectory.appendingPathComponent("ngrok.yml", isDirectory: false)
+    }
 
     init(runtimeCoordinator: NativeRuntimeCoordinator) throws {
         self.runtimeCoordinator = runtimeCoordinator
@@ -55,6 +71,8 @@ final class ProcessSupervisor {
     }
 
     func launch(with contract: ManagedRuntimeLaunchContract) {
+        activationSucceeded = false
+        activationInFlight = false
         install(contract, requiresClientRefresh: false)
         appLog.write("Supervisor launched")
         cleanStaleOwnedProcesses()
@@ -150,6 +168,13 @@ final class ProcessSupervisor {
         NSWorkspace.shared.open(logsDirectory)
     }
 
+    func openPrivacySettings() {
+        guard let url = URL(
+            string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+        ) else { return }
+        NSWorkspace.shared.open(url)
+    }
+
     private func updateConfiguration(
         _ update: (inout AppConfiguration) throws -> Void
     ) async {
@@ -182,6 +207,8 @@ final class ProcessSupervisor {
                 replacement,
                 requiresClientRefresh: transition.requiresClientRefresh
             )
+            activationSucceeded = false
+            activationInFlight = false
             serverFailures.removeAll()
             tunnelFailures.removeAll()
             serverRetryNotBefore = .distantPast
@@ -230,7 +257,7 @@ final class ProcessSupervisor {
         let script = runtimeDirectory.appendingPathComponent("automac_mcp.py")
         guard FileManager.default.isExecutableFile(atPath: python.path),
               FileManager.default.fileExists(atPath: script.path) else {
-            fail("Installed Python runtime is missing. Run script/distribute.sh.")
+            fail("Installed Python runtime is missing. Run the terminal bootstrap again.")
             return
         }
         if portIsOccupied(contract.port) {
@@ -241,6 +268,8 @@ final class ProcessSupervisor {
 
         snapshot.server = .starting
         snapshot.error = nil
+        activationSucceeded = false
+        activationInFlight = false
         let process = Process()
         process.executableURL = python
         process.arguments = [script.path, "--managed-owner", ownerID]
@@ -284,24 +313,37 @@ final class ProcessSupervisor {
         guard !quitting, tunnelDesired, snapshot.server == .running, tunnelProcess == nil,
               Date() >= tunnelRetryNotBefore,
               let contract = activeContract else { return }
-        guard let ngrok = Bundle.main.url(forResource: "ngrok", withExtension: nil),
-              FileManager.default.isExecutableFile(atPath: ngrok.path) else {
-            fail("Bundled ngrok agent is missing. Reinstall Mac Orchestrator.")
+        guard FileManager.default.isExecutableFile(atPath: ngrokBinaryURL.path) else {
+            fail("Installed ngrok agent is missing. Run the terminal bootstrap again.")
+            return
+        }
+        guard FileManager.default.fileExists(atPath: ngrokConfigURL.path) else {
+            fail("Installed ngrok configuration is missing. Run the terminal bootstrap again.")
+            return
+        }
+        guard contract.ngrokAuthtoken != nil else {
+            fail("ngrok authentication is not configured. Store an authtoken before enabling remote access.")
             return
         }
         snapshot.tunnel = .starting
         snapshot.connectorURL = nil
         let process = Process()
-        process.executableURL = ngrok
+        process.executableURL = ngrokBinaryURL
         process.arguments = [
             "http", contract.tunnelTarget,
+            "--config", ngrokConfigURL.path,
             "--log", "stdout",
             "--log-format", "json",
             "--log-level", "info",
             "--inspect=true",
             "--metadata", "mac-orchestrator-owner=\(ownerID)",
         ]
-        attachOutput(of: process, to: tunnelLog)
+        process.environment = contract.ngrokEnvironment()
+        attachOutput(
+            of: process,
+            to: tunnelLog,
+            redacting: contract.redactedSecrets
+        )
         process.terminationHandler = { [weak self] terminated in
             let processID = ObjectIdentifier(terminated)
             let terminationStatus = terminated.terminationStatus
@@ -333,6 +375,8 @@ final class ProcessSupervisor {
 
     private func stopServer() {
         restartWorkItem?.cancel()
+        activationSucceeded = false
+        activationInFlight = false
         guard let process = serverProcess else {
             snapshot.server = .stopped
             return
@@ -388,26 +432,29 @@ final class ProcessSupervisor {
 
     private func checkHealth() {
         if let process = serverProcess, process.isRunning, let contract = activeContract {
-            let processID = ObjectIdentifier(process)
-            var request = URLRequest(url: contract.healthURL)
-            request.timeoutInterval = 1
-            URLSession.shared.dataTask(with: request) { [weak self, processID] _, response, _ in
-                Task { @MainActor [weak self, processID] in
-                    guard let self,
-                          let current = self.serverProcess,
-                          ObjectIdentifier(current) == processID else { return }
-                    if response != nil {
-                        if self.snapshot.server != .running {
-                            self.snapshot.server = .running
-                            self.serverRetryNotBefore = .distantPast
-                            self.appLog.write("Server health check passed")
-                        }
-                        if self.tunnelDesired { self.startTunnel() }
-                    } else if self.snapshot.server == .running {
-                        self.snapshot.server = .starting
-                    }
+            if self.activationSucceeded {
+                checkLightweightHealth(
+                    processID: ObjectIdentifier(process),
+                    healthURL: contract.healthURL
+                )
+                if snapshot.server != .running {
+                    snapshot.server = .running
+                    serverRetryNotBefore = .distantPast
                 }
-            }.resume()
+                if tunnelDesired { startTunnel() }
+            } else if !activationInFlight {
+                guard let connectorToken = contract.environment["MAC_ORCHESTRATOR_CONNECTOR_TOKEN"],
+                      !connectorToken.isEmpty else {
+                    fail("The managed connector token is unavailable; activation is blocked.")
+                    return
+                }
+                activationInFlight = true
+                runActivationProbe(
+                    processID: ObjectIdentifier(process),
+                    port: contract.port,
+                    capabilityToken: connectorToken
+                )
+            }
         } else if serverDesired && !quitting {
             startServer()
         }
@@ -417,28 +464,102 @@ final class ProcessSupervisor {
         }
     }
 
-    private func queryTunnelURL() {
-        var request = URLRequest(url: URL(string: "http://127.0.0.1:4040/api/tunnels")!)
+    private func checkLightweightHealth(processID: ObjectIdentifier, healthURL: URL) {
+        var request = URLRequest(url: healthURL)
         request.timeoutInterval = 1
-        guard let process = tunnelProcess, process.isRunning,
-              let contract = activeContract,
-              let connectorToken = contract.environment["MAC_ORCHESTRATOR_CONNECTOR_TOKEN"] else { return }
+        NoRedirectURLSession.make().dataTask(with: request) { [weak self, processID] data, response, _ in
+            Task { @MainActor [weak self, processID] in
+                guard let self,
+                      let current = self.serverProcess,
+                      ObjectIdentifier(current) == processID else { return }
+                let expectedBody = Data(#"{"status":"ok"}"#.utf8)
+                let isHealthy = (response as? HTTPURLResponse)?.statusCode == 200 &&
+                    (response as? HTTPURLResponse)?.url == healthURL &&
+                    data == expectedBody
+                guard !isHealthy else { return }
+                self.activationSucceeded = false
+                self.snapshot.server = .starting
+                self.stopTunnel()
+                self.appLog.write("Server health check failed after activation")
+            }
+        }.resume()
+    }
+
+    private func runActivationProbe(
+        processID: ObjectIdentifier,
+        port: Int,
+        capabilityToken: String
+    ) {
+        Task { @MainActor [weak self, processID] in
+            guard let self else { return }
+            do {
+                try await LocalActivationProbe().run(
+                    port: port,
+                    capabilityToken: capabilityToken,
+                    requiresInteractiveUI: self.activeContract?.capabilitySnapshot.capabilities["mac.ui"]?.desired == true
+                )
+                guard let process = self.serverProcess,
+                      process.isRunning,
+                      ObjectIdentifier(process) == processID else {
+                    self.activationInFlight = false
+                    return
+                }
+                do {
+                    try await self.runtimeCoordinator.markPhase2Completed()
+                } catch {
+                    self.activationInFlight = false
+                    self.fail("Activation succeeded but onboarding state could not be saved: \(error.localizedDescription)")
+                    return
+                }
+                self.activationInFlight = false
+                self.activationSucceeded = true
+                self.snapshot.server = .running
+                self.snapshot.error = nil
+                self.serverRetryNotBefore = .distantPast
+                self.appLog.write("Server activation probe passed")
+                if self.tunnelDesired { self.startTunnel() }
+            } catch {
+                self.activationInFlight = false
+                guard let process = self.serverProcess,
+                      process.isRunning,
+                      ObjectIdentifier(process) == processID else { return }
+                self.snapshot.server = .starting
+                self.appLog.write("Server activation probe pending: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func queryTunnelURL() {
+        var request = URLRequest(url: URL(string: "http://127.0.0.1:4040/api/endpoints")!)
+        request.timeoutInterval = 1
+        guard let process = tunnelProcess, process.isRunning else { return }
+        guard let contract = activeContract,
+              let connectorToken = contract.environment["MAC_ORCHESTRATOR_CONNECTOR_TOKEN"] else {
+            snapshot.connectorURL = nil
+            snapshot.tunnel = .reconnecting
+            snapshot.error = "Remote connector identity is unavailable."
+            return
+        }
         let processID = ObjectIdentifier(process)
-        URLSession.shared.dataTask(with: request) { [weak self, processID] data, _, _ in
+        NoRedirectURLSession.make().dataTask(with: request) { [weak self, processID] data, response, _ in
             Task { @MainActor [weak self, processID] in
                 guard let self, let process = self.tunnelProcess, process.isRunning,
-                      ObjectIdentifier(process) == processID,
+                      ObjectIdentifier(process) == processID else { return }
+                guard (response as? HTTPURLResponse)?.statusCode == 200,
+                      (response as? HTTPURLResponse)?.url == request.url,
                       let data,
-                      let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                      let tunnels = object["tunnels"] as? [[String: Any]],
-                      let ownedTunnel = tunnels.first(where: {
-                          guard let config = $0["config"] as? [String: Any],
-                                let address = config["addr"] as? String else { return false }
-                          return contract.matchesTunnelAddress(address)
-                      }),
-                      let publicURL = ownedTunnel["public_url"] as? String,
-                      publicURL.hasPrefix("https://"),
-                      let base = URL(string: publicURL) else { return }
+                      let base = NgrokEndpointParser.publicURL(
+                          from: data,
+                          matching: contract.tunnelTarget
+                      ) else {
+                    // A previously observed public URL is never current
+                    // evidence. Clear it until the owned tunnel is confirmed
+                    // again by the Agent API.
+                    self.snapshot.connectorURL = nil
+                    self.snapshot.tunnel = .reconnecting
+                    self.snapshot.error = "Remote connector endpoint is not currently confirmed."
+                    return
+                }
                 self.snapshot.connectorURL = ConnectorURLBuilder.make(
                     publicURL: base.absoluteString,
                     capabilityToken: connectorToken
@@ -500,20 +621,22 @@ final class ProcessSupervisor {
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = pipe
+        let redactor = LockedStreamingLogRedactor(secrets: secrets)
+        let writeSafeLine: @Sendable (String) -> Void = { line in
+            guard !line.isEmpty else { return }
+            guard !fragments.contains(where: line.contains) else { return }
+            log.write(line)
+        }
         pipe.fileHandleForReading.readabilityHandler = { handle in
             let data = handle.availableData
-            guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
-            for line in text.split(whereSeparator: \.isNewline) {
-                var safeLine = String(line)
-                if fragments.contains(where: safeLine.contains) { continue }
-                for secret in secrets where !secret.isEmpty {
-                    safeLine = safeLine.replacingOccurrences(of: secret, with: "<redacted>")
-                }
-                log.write(safeLine)
+            if data.isEmpty {
+                redactor.append("", flush: true).forEach(writeSafeLine)
+                return
             }
+            guard let text = String(data: data, encoding: .utf8) else { return }
+            redactor.append(text, flush: false).forEach(writeSafeLine)
         }
     }
-
     private func portIsOccupied(_ port: Int) -> Bool {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
@@ -525,7 +648,9 @@ final class ProcessSupervisor {
             process.waitUntilExit()
             return process.terminationStatus == 0
         } catch {
-            return false
+            // If ownership cannot be checked, fail closed rather than
+            // claiming that another process is not listening.
+            return true
         }
     }
 

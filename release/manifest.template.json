@@ -1,0 +1,69 @@
+{
+  "$schema": "./manifest.schema.json",
+  "schemaVersion": 1,
+  "product": {
+    "name": "Mac Orchestrator",
+    "version": "REPLACE_WITH_PRODUCT_VERSION"
+  },
+  "bootstrap": {
+    "version": "REPLACE_WITH_BOOTSTRAP_VERSION",
+    "url": "https://example.invalid/mac-orchestrator/REPLACE/bootstrap.sh",
+    "sha256": "REPLACE_WITH_BOOTSTRAP_SHA256"
+  },
+  "platform": {
+    "architecture": "arm64",
+    "minimumMacOS": "13.0"
+  },
+  "helper": {
+    "url": "https://example.invalid/mac-orchestrator/REPLACE/Mac-Orchestrator-arm64.zip",
+    "sha256": "REPLACE_WITH_HELPER_SHA256",
+    "architecture": "arm64",
+    "bundleIdentifier": "com.jay.mac-orchestrator",
+    "version": "REPLACE_WITH_PRODUCT_VERSION",
+    "signing": {
+      "mode": "adhoc"
+    }
+  },
+  "runtime": {
+    "schemaVersion": 1,
+    "uv": {
+      "version": "0.12.3",
+      "url": "https://example.invalid/uv/REPLACE/uv-arm64",
+      "sha256": "REPLACE_WITH_UV_SHA256"
+    },
+    "python": {
+      "managedVersion": "3.13.14"
+    },
+    "lockSha256": "REPLACE_WITH_LOCK_SHA256",
+    "corePayload": {
+      "url": "https://example.invalid/mac-orchestrator/REPLACE/core-payload.tar.gz",
+      "sha256": "REPLACE_WITH_CORE_PAYLOAD_SHA256",
+      "format": "tar.gz",
+      "files": [
+        "automac_mcp.py",
+        "pyproject.toml",
+        "uv.lock"
+      ]
+    }
+  },
+  "ngrok": {
+    "version": "REPLACE_WITH_NGROK_VERSION",
+    "archiveUrl": "https://example.invalid/ngrok/REPLACE/ngrok-arm64.zip",
+    "archiveSha256": "REPLACE_WITH_NGROK_ARCHIVE_SHA256",
+    "archiveFormat": "zip",
+    "executableName": "ngrok",
+    "developerIdAuthority": "Developer ID Application: ngrok, Inc. (REPLACE_TEAM)",
+    "developerIdTeam": "REPLACE_TEAM",
+    "agentApiVersion": "v3"
+  },
+  "compatibility": {
+    "runtimeSchema": {
+      "minimum": 1,
+      "maximum": 1
+    },
+    "configurationSchema": {
+      "minimum": 1,
+      "maximum": 1
+    }
+  }
+}

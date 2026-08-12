@@ -1,5 +1,16 @@
 import Foundation
 
+enum OnboardingCompletionError: Error, Equatable, LocalizedError, Sendable {
+    case requiredCapabilityPending(String)
+
+    var errorDescription: String? {
+        switch self {
+        case let .requiredCapabilityPending(capability):
+            return "Required onboarding capability is still pending: \(capability)."
+        }
+    }
+}
+
 @MainActor
 final class NativeRuntimeCoordinator {
     typealias ReadinessEvaluator = @MainActor (
@@ -15,6 +26,7 @@ final class NativeRuntimeCoordinator {
     let runtimeDirectory: URL
     private let inheritedEnvironment: [String: String]
     private let readinessEvaluator: ReadinessEvaluator
+    private let portIsOccupied: (Int) -> Bool
 
     init(
         store: ConfigurationStore,
@@ -23,6 +35,7 @@ final class NativeRuntimeCoordinator {
         legacyConfigurationURL: URL,
         runtimeDirectory: URL,
         inheritedEnvironment: [String: String] = ProcessInfo.processInfo.environment,
+        portIsOccupied: @escaping (Int) -> Bool = LocalPortAllocator.isOccupied,
         readinessEvaluator: @escaping ReadinessEvaluator
     ) {
         self.store = store
@@ -31,6 +44,7 @@ final class NativeRuntimeCoordinator {
         self.legacyConfigurationURL = legacyConfigurationURL
         self.runtimeDirectory = runtimeDirectory
         self.inheritedEnvironment = inheritedEnvironment
+        self.portIsOccupied = portIsOccupied
         self.readinessEvaluator = readinessEvaluator
     }
 
@@ -42,11 +56,23 @@ final class NativeRuntimeCoordinator {
             keychain: keychain,
             store: store
         ).migrate()
-        return try await makeLaunchContract(configuration: store.load())
+        var configuration = try store.load()
+        let state = OnboardingStateClassifier.classify(configuration)
+        if state == .fresh {
+            configuration = try store.update { configuration in
+                configuration.onboarding.phase2State = .interrupted
+            }
+        }
+        configuration = try allocatePortIfNeeded(configuration, state: state)
+        return try await makeLaunchContract(configuration: configuration)
     }
 
     func reload() async throws -> ManagedRuntimeLaunchContract {
-        try await makeLaunchContract(configuration: store.load())
+        let configuration = try store.load()
+        let state = OnboardingStateClassifier.classify(configuration)
+        return try await makeLaunchContract(
+            configuration: allocatePortIfNeeded(configuration, state: state)
+        )
     }
 
     func updateConfiguration(
@@ -54,6 +80,31 @@ final class NativeRuntimeCoordinator {
     ) async throws -> ManagedRuntimeLaunchContract {
         let configuration = try store.update(update)
         return try await makeLaunchContract(configuration: configuration)
+    }
+
+    @discardableResult
+    func markPhase2Completed() async throws -> AppConfiguration {
+        let configuration = try store.load()
+        let facts = await readinessEvaluator(configuration, keychain, runtimeDirectory)
+        let snapshot = CapabilityRegistry(
+            configuration: configuration,
+            facts: facts
+        ).snapshot()
+
+        guard snapshot.capabilities["core.session"]?.ready == true else {
+            throw OnboardingCompletionError.requiredCapabilityPending("core session")
+        }
+        for capabilityID in ["mac.ui", "mac.screenOcr"] {
+            guard configuration.desiredCapabilities[capabilityID] == true else { continue }
+            guard snapshot.capabilities[capabilityID]?.ready == true else {
+                throw OnboardingCompletionError.requiredCapabilityPending(capabilityID)
+            }
+        }
+
+        return try store.update { configuration in
+            configuration.onboarding.completed = true
+            configuration.onboarding.phase2State = .completed
+        }
     }
 
     static func defaultLegacyConfigurationURL(fileManager: FileManager = .default) -> URL {
@@ -77,5 +128,24 @@ final class NativeRuntimeCoordinator {
             keychain: keychain,
             inheritedEnvironment: inheritedEnvironment
         )
+    }
+
+    private func allocatePortIfNeeded(
+        _ configuration: AppConfiguration,
+        state: Phase2OnboardingState
+    ) throws -> AppConfiguration {
+        guard state == .fresh || state == .interrupted else {
+            return configuration
+        }
+        let selectedPort = try LocalPortAllocator.select(
+            preferred: configuration.localMCPPort,
+            isOccupied: portIsOccupied
+        )
+        guard selectedPort != configuration.localMCPPort else {
+            return configuration
+        }
+        return try store.update { configuration in
+            configuration.localMCPPort = selectedPort
+        }
     }
 }

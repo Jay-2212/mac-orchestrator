@@ -467,13 +467,15 @@ final class ProcessSupervisor {
     private func checkLightweightHealth(processID: ObjectIdentifier, healthURL: URL) {
         var request = URLRequest(url: healthURL)
         request.timeoutInterval = 1
-        URLSession.shared.dataTask(with: request) { [weak self, processID] data, response, _ in
+        NoRedirectURLSession.make().dataTask(with: request) { [weak self, processID] data, response, _ in
             Task { @MainActor [weak self, processID] in
                 guard let self,
                       let current = self.serverProcess,
                       ObjectIdentifier(current) == processID else { return }
                 let expectedBody = Data(#"{"status":"ok"}"#.utf8)
-                let isHealthy = (response as? HTTPURLResponse)?.statusCode == 200 && data == expectedBody
+                let isHealthy = (response as? HTTPURLResponse)?.statusCode == 200 &&
+                    (response as? HTTPURLResponse)?.url == healthURL &&
+                    data == expectedBody
                 guard !isHealthy else { return }
                 self.activationSucceeded = false
                 self.snapshot.server = .starting
@@ -539,11 +541,12 @@ final class ProcessSupervisor {
             return
         }
         let processID = ObjectIdentifier(process)
-        URLSession.shared.dataTask(with: request) { [weak self, processID] data, response, _ in
+        NoRedirectURLSession.make().dataTask(with: request) { [weak self, processID] data, response, _ in
             Task { @MainActor [weak self, processID] in
                 guard let self, let process = self.tunnelProcess, process.isRunning,
                       ObjectIdentifier(process) == processID else { return }
                 guard (response as? HTTPURLResponse)?.statusCode == 200,
+                      (response as? HTTPURLResponse)?.url == request.url,
                       let data,
                       let base = NgrokEndpointParser.publicURL(
                           from: data,

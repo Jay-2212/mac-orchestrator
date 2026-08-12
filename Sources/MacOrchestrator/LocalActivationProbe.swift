@@ -1,17 +1,5 @@
 import Foundation
 
-private final class NoRedirectURLSessionDelegate: NSObject, URLSessionTaskDelegate {
-    func urlSession(
-        _ session: URLSession,
-        task: URLSessionTask,
-        willPerformHTTPRedirection response: HTTPURLResponse,
-        newRequest request: URLRequest,
-        completionHandler: @escaping (URLRequest?) -> Void
-    ) {
-        completionHandler(nil)
-    }
-}
-
 enum LocalActivationProbeError: Error, Equatable, LocalizedError, Sendable {
     case healthCheckFailed(status: Int, body: String)
     case transport(String)
@@ -53,12 +41,7 @@ struct LocalActivationProbe: Sendable {
     }
 
     private static func makeDefaultSession() -> URLSession {
-        let configuration = URLSessionConfiguration.ephemeral
-        return URLSession(
-            configuration: configuration,
-            delegate: NoRedirectURLSessionDelegate(),
-            delegateQueue: nil
-        )
+        NoRedirectURLSession.make()
     }
 
     func run(

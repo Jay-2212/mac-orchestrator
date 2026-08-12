@@ -420,7 +420,7 @@ enum TerminalCommand {
         let semaphore = DispatchSemaphore(value: 0)
         let resultLock = NSLock()
         var result: Result<Data, Error>?
-        URLSession.shared.dataTask(with: request) { data, response, error in
+        NoRedirectURLSession.make().dataTask(with: request) { data, response, error in
             defer { semaphore.signal() }
             if let error {
                 resultLock.lock()
@@ -429,6 +429,7 @@ enum TerminalCommand {
                 return
             }
             guard let httpResponse = response as? HTTPURLResponse,
+                  httpResponse.url == request.url,
                   httpResponse.statusCode == 200,
                   let data else {
                 let status = (response as? HTTPURLResponse)?.statusCode ?? -1

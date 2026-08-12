@@ -690,11 +690,12 @@ recover_pending_promotion() {
 prepare_directories() {
   ensure_safe_directory "$SUPPORT_DIR" "support directory"
   ensure_safe_directory "$INSTALL_DIR" "installation directory"
+  ensure_safe_directory "$SUPPORT_DIR/python" "managed Python directory"
   ensure_safe_directory "$REMOTE_PARENT_DIR" "remote directory"
   if [ "$FIXTURE_MODE" != "1" ]; then
     ensure_safe_directory "$LAUNCH_AGENTS_DIR" "LaunchAgents directory"
   fi
-  /bin/chmod 700 "$SUPPORT_DIR" "$INSTALL_DIR"
+  /bin/chmod 700 "$SUPPORT_DIR" "$INSTALL_DIR" "$SUPPORT_DIR/python"
   recover_pending_promotion || die "could not recover an interrupted promotion"
   if [ "$TEST_EXIT_AFTER_RECOVERY" = "1" ]; then
     exit 0

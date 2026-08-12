@@ -454,6 +454,17 @@ test_symlinked_support_parent_rejected() {
   [ ! -e "$outside/child" ] || return 1
 }
 
+test_symlinked_managed_python_directory_rejected() {
+  make_case symlinked-python || return 1
+  outside="$CASE_DIR/python-outside"
+  /bin/mkdir -p "$outside"
+  /bin/ln -s "$outside" "$CASE_DIR/support/python"
+  capture_bootstrap "$CASE_DIR"
+  [ "$BOOTSTRAP_RC" -ne 0 ] || return 1
+  assert_contains "$BOOTSTRAP_OUTPUT" "managed Python directory" || return 1
+  [ ! -e "$outside/cpython-3.13.14" ] || return 1
+}
+
 test_malformed_promotion_marker_fails_closed() {
   make_case malformed-marker || return 1
   /bin/mkdir -p "$CASE_DIR/support/install" "$CASE_DIR/support/runtime"
@@ -751,6 +762,7 @@ run_test "post-promotion failure recovers previous installation" test_post_promo
 run_test "next run recovers promotion marker" test_next_run_recovers_promotion_marker
 run_test "symlinked support root is rejected" test_symlinked_support_root_rejected
 run_test "symlinked support parent is rejected" test_symlinked_support_parent_rejected
+run_test "symlinked managed Python directory is rejected" test_symlinked_managed_python_directory_rejected
 run_test "malformed promotion marker fails closed" test_malformed_promotion_marker_fails_closed
 run_test "missing recovery backup fails closed" test_missing_recovery_backup_fails_closed
 run_test "unmoved backups marker recovers" test_backups_marker_with_unmoved_previous_paths_recovers

@@ -132,3 +132,32 @@ current Mac Orchestrator core.
   execution by the installed Command Line Tools (`CapabilityReadinessCoordinatorTests.swift:2:8 unable to resolve module dependency: 'XCTest'`).
 - `git diff --check` and the no-repair/no-mutation/scope scans passed; tracked
   worktree was clean after commit.
+
+## Fresh Luna Task 5 fix-round: selective Doctor Keychain provider
+
+- Fix commit: `3850fcf00b01ecb7d8ee2437478afff91acc055a`
+  (`fix: add selective doctor keychain provider`).
+- `SystemDoctorKeychainPresenceProvider` is owned by `DoctorEngine.swift`, is
+  directly injectable through `DoctorDependencies`, defaults to
+  `SystemKeychainPresenceQuery()`, intersects requests with the four current
+  core items, constructs `KeychainPresenceQuery` with `requestsData: false`,
+  and returns only `KeychainPresenceFacts` states. Meridian items remain
+  excluded. The unavailable default stub was removed.
+- `DoctorEngineTests` adds a recording-query regression test covering
+  connector/ngrok selection, Meridian exclusion, false data-request flags, and
+  exact presence-only facts.
+- `swift build`: passed with exit code 0; existing Command Line Tools linker
+  search-path warnings remain.
+- `swiftc -parse` passed for `DoctorEngine.swift`,
+  `DoctorEngineTests.swift`, and the untouched `DiagnosticProviders.swift`.
+- A fresh out-of-repository XCTest shim typechecked the exact final
+  `DoctorEngineTests.swift` against a freshly compiled testable production
+  module with exit code 0. A disposable executable behavior probe passed the
+  same selective-query and presence-only assertions.
+- `swift test --filter DoctorEngineTests`: remains blocked before XCTest
+  execution by the installed Command Line Tools
+  (`CapabilityReadinessCoordinatorTests.swift:2:8 unable to resolve module
+  dependency: XCTest`).
+- `git diff --check`, the prohibited-file scope check, and the DoctorEngine
+  no-value/no-mutation scan passed. Only the two Task 5-owned tracked files
+  were staged and committed; the tracked worktree is clean.

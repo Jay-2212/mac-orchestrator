@@ -77,6 +77,38 @@ protocol DoctorKeychainPresenceProviding {
     func inspect(items: Set<KeychainPresenceItem>) throws -> KeychainPresenceFacts
 }
 
+struct SystemDoctorKeychainPresenceProvider: DoctorKeychainPresenceProviding {
+    private let querying: KeychainPresenceQuerying
+
+    private static let currentCoreItems: Set<KeychainPresenceItem> = [
+        .connectorToken,
+        .ngrokAuthtoken,
+        .telegramSendBotToken,
+        .telegramSendChatID,
+    ]
+
+    init(querying: KeychainPresenceQuerying = SystemKeychainPresenceQuery()) {
+        self.querying = querying
+    }
+
+    func inspect(items: Set<KeychainPresenceItem>) throws -> KeychainPresenceFacts {
+        var states = [KeychainPresenceItem: KeychainPresence]()
+        for item in items.intersection(Self.currentCoreItems).sorted(by: { $0.rawValue < $1.rawValue }) {
+            guard let keychainItem = item.keychainItem else {
+                continue
+            }
+            let request = KeychainPresenceQuery(
+                item: item,
+                service: keychainItem.service,
+                account: keychainItem.account,
+                requestsData: false
+            )
+            states[item] = querying.query(request)
+        }
+        return KeychainPresenceFacts(states: states)
+    }
+}
+
 protocol DoctorAsyncLocalMCPDiagnosticProviding {
     func inspect() async throws -> LocalMCPFacts
 }
@@ -112,7 +144,7 @@ struct DoctorDependencies {
         configurationContextProvider: any DoctorConfigurationContextProviding = UnavailableConfigurationContextProvider(),
         installedReleaseProvider: any InstalledReleaseFactsProviding = UnavailableInstalledReleaseProvider(),
         permissionProvider: any PermissionFactsProviding = UnavailablePermissionProvider(),
-        keychainPresenceProvider: any DoctorKeychainPresenceProviding = UnavailableDoctorKeychainProvider(),
+        keychainPresenceProvider: any DoctorKeychainPresenceProviding = SystemDoctorKeychainPresenceProvider(),
         portProvider: any PortFactsProviding = UnavailablePortProvider(),
         localMCPProvider: any LocalMCPDiagnosticProviding = UnavailableLocalMCPProvider(),
         asyncLocalMCPProvider: (any DoctorAsyncLocalMCPDiagnosticProviding)? = nil,
@@ -282,12 +314,6 @@ private struct UnavailableInstalledReleaseProvider: InstalledReleaseFactsProvidi
 
 private struct UnavailablePermissionProvider: PermissionFactsProviding {
     func inspect() throws -> PermissionFacts { throw DiagnosticProviderError.unavailable }
-}
-
-private struct UnavailableDoctorKeychainProvider: DoctorKeychainPresenceProviding {
-    func inspect(items: Set<KeychainPresenceItem>) throws -> KeychainPresenceFacts {
-        throw DiagnosticProviderError.unavailable
-    }
 }
 
 private struct UnavailablePortProvider: PortFactsProviding {

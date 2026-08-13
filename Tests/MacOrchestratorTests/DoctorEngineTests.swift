@@ -454,6 +454,39 @@ final class DoctorEngineTests: XCTestCase {
         XCTAssertEqual(asyncProvider.calls, 0)
     }
 
+    func testSystemDoctorKeychainProviderSelectsRequestedCurrentCorePresenceOnly() throws {
+        let querying = RecordingKeychainPresenceQuery()
+        let dependencies = DoctorDependencies(
+            keychainPresenceProvider: SystemDoctorKeychainPresenceProvider(querying: querying)
+        )
+        let requested: Set<KeychainPresenceItem> = [
+            .connectorToken,
+            .ngrokAuthtoken,
+            .meridianTelegramBotToken,
+        ]
+
+        let facts = try dependencies.keychainPresenceProvider.inspect(items: requested)
+
+        XCTAssertEqual(
+            Set(querying.requests.map(\.item)),
+            Set<KeychainPresenceItem>([.connectorToken, .ngrokAuthtoken])
+        )
+        XCTAssertEqual(querying.requests.count, 2)
+        XCTAssertTrue(querying.requests.allSatisfy { !$0.requestsData })
+        XCTAssertEqual(
+            Set(facts.states.keys),
+            Set<KeychainPresenceItem>([.connectorToken, .ngrokAuthtoken])
+        )
+        XCTAssertEqual(
+            facts,
+            KeychainPresenceFacts(states: [
+                .connectorToken: .present,
+                .ngrokAuthtoken: .present,
+            ])
+        )
+        XCTAssertTrue(facts.states.values.allSatisfy { $0 == .present })
+    }
+
     func testPermissionProviderRequiresAConfiguredLocalProtectedConsumer() async {
         let disabled = DoctorFixture.make(serverDesired: false, remoteDesired: false)
         let disabledReport = await DoctorEngine(dependencies: disabled.dependencies).run()
@@ -789,5 +822,14 @@ private final class RecordingDoctorKeychainProvider: DoctorKeychainPresenceProvi
     func inspect(items: Set<KeychainPresenceItem>) throws -> KeychainPresenceFacts {
         requests.append(items)
         return KeychainPresenceFacts(states: Dictionary(uniqueKeysWithValues: items.map { ($0, .present) }))
+    }
+}
+
+private final class RecordingKeychainPresenceQuery: KeychainPresenceQuerying, @unchecked Sendable {
+    var requests: [KeychainPresenceQuery] = []
+
+    func query(_ request: KeychainPresenceQuery) -> KeychainPresence {
+        requests.append(request)
+        return .present
     }
 }

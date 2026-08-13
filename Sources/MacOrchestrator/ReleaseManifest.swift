@@ -338,7 +338,7 @@ struct ReleaseManifestV1: Codable, Equatable, Sendable {
         guard platform.architecture == architecture, helper.architecture == architecture else {
             throw ReleaseManifestValidationError.unsupportedArchitecture
         }
-        guard let minimumMacOS = try? SemanticVersion(platform.minimumMacOS), minimumMacOS <= operatingSystem else {
+        guard let minimumMacOS = platformMinimumVersion(platform.minimumMacOS), minimumMacOS <= operatingSystem else {
             throw ReleaseManifestValidationError.unsupportedOperatingSystem
         }
         guard helper.version == product.version else { throw ReleaseManifestValidationError.versionMismatch }
@@ -383,6 +383,12 @@ struct ReleaseManifestV1: Codable, Equatable, Sendable {
             throw ReleaseManifestValidationError.invalidNgrokTeam
         }
         return self
+    }
+
+    private func platformMinimumVersion(_ value: String) -> SemanticVersion? {
+        let components = value.split(separator: ".", omittingEmptySubsequences: false)
+        let normalized = components.count == 2 ? value + ".0" : value
+        return try? SemanticVersion(normalized)
     }
 
     private func validateDigest(_ value: String, field: String) throws {

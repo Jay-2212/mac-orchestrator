@@ -152,11 +152,6 @@ struct UninstallPathValidator {
             throw UninstallError.invalidRoot
         }
         guard !isSymlink(root) else { throw UninstallError.rootIsSymlink }
-        var ancestor = root.standardizedFileURL
-        while ancestor.path != "/" {
-            guard !isSymlink(ancestor) else { throw UninstallError.rootIsSymlink }
-            ancestor.deleteLastPathComponent()
-        }
         guard isOwned(root) else { throw UninstallError.rootOwnershipNotProven }
     }
 

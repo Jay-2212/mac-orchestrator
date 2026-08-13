@@ -56,9 +56,19 @@ mkdir -p "$output_dir"
 temporary_dir="$(mktemp -d -t mac-orchestrator-sign)"
 trap 'rm -f "$temporary_dir/signature.bin" "$temporary_dir/envelope.json"' EXIT
 
-"$OPENSSL_BIN" pkeyutl -sign -rawin -inkey "$PRIVATE_KEY_PATH" \
-  -in "$MANIFEST_PATH" -out "$temporary_dir/signature.bin" ||
-  die "Ed25519 signing failed"
+if "$OPENSSL_BIN" pkeyutl -help 2>&1 | grep -q -- '-rawin'; then
+  # OpenSSL 3 exposes -rawin; the flag makes the detached signature cover the
+  # manifest bytes directly instead of a digest.
+  "$OPENSSL_BIN" pkeyutl -sign -rawin -inkey "$PRIVATE_KEY_PATH" \
+    -in "$MANIFEST_PATH" -out "$temporary_dir/signature.bin" ||
+    die "Ed25519 signing failed"
+else
+  # macOS's system LibreSSL performs Ed25519 pkeyutl operations on raw input
+  # by default and does not recognize OpenSSL 3's -rawin option.
+  "$OPENSSL_BIN" pkeyutl -sign -inkey "$PRIVATE_KEY_PATH" \
+    -in "$MANIFEST_PATH" -out "$temporary_dir/signature.bin" ||
+    die "Ed25519 signing failed"
+fi
 
 SIGNATURE_B64="$($PYTHON_BIN - "$temporary_dir/signature.bin" <<'PY'
 import base64

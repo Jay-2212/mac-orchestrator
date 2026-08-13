@@ -898,8 +898,13 @@ assert envelope["keyID"] == "fixture-v1"
 pathlib.Path(sys.argv[2]).write_bytes(base64.b64decode(envelope["signature"], validate=True))
 PY
   openssl pkey -in "$key" -pubout -out "$TEST_ROOT/fixture-signing-key.pub" >/dev/null 2>&1 || return 1
-  openssl pkeyutl -verify -rawin -pubin -inkey "$TEST_ROOT/fixture-signing-key.pub" \
-    -in "$manifest" -sigfile "$TEST_ROOT/signature.bin" >/dev/null 2>&1 || return 1
+  if openssl pkeyutl -help 2>&1 | grep -q -- '-rawin'; then
+    openssl pkeyutl -verify -rawin -pubin -inkey "$TEST_ROOT/fixture-signing-key.pub" \
+      -in "$manifest" -sigfile "$TEST_ROOT/signature.bin" >/dev/null 2>&1 || return 1
+  else
+    openssl pkeyutl -verify -pubin -inkey "$TEST_ROOT/fixture-signing-key.pub" \
+      -in "$manifest" -sigfile "$TEST_ROOT/signature.bin" >/dev/null 2>&1 || return 1
+  fi
   output="$(bash "$PROJECT_DIR/script/sign_release_manifest.sh" \
     --manifest "$manifest" \
     --private-key "$PROJECT_DIR/script/bootstrap.sh" \

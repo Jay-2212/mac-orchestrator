@@ -75,8 +75,8 @@ import sys
 
 source, destination = sys.argv[1:]
 text = pathlib.Path(source).read_text(encoding="utf-8")
-	begin = "-----BEGIN " + "PRIVATE KEY-----"
-	end = "-----END " + "PRIVATE KEY-----"
+begin = "-----BEGIN " + "PRIVATE KEY-----"
+end = "-----END " + "PRIVATE KEY-----"
 if begin not in text or end not in text:
     raise SystemExit("unsupported private key PEM")
 body = text.split(begin, 1)[1].split(end, 1)[0]

@@ -28,6 +28,8 @@ BACKUP_DIR="$INSTALL_DIR/runtime.previous"
 APP_BACKUP_DIR="$INSTALL_DIR/app.previous"
 REMOTE_BACKUP_DIR="$INSTALL_DIR/remote.previous"
 PROMOTION_MARKER="$INSTALL_DIR/promotion.marker"
+RECEIPT_PATH="$INSTALL_DIR/receipt.json"
+RECEIPT_BACKUP_PATH="$INSTALL_DIR/receipt.previous.json"
 LAUNCH_AGENT_BACKUP_PATH="$INSTALL_DIR/launch-agent.previous.plist"
 LAUNCH_AGENTS_DIR="$HOME/Library/LaunchAgents"
 LAUNCH_AGENT_LABEL="com.jay.mac-orchestrator"
@@ -143,11 +145,12 @@ write_promotion_marker() {
   had_app="$3"
   had_remote="$4"
   had_launch_agent="$5"
+  had_receipt="$6"
   [ ! -L "$PROMOTION_MARKER" ] || die "promotion marker must not be a symlink"
   marker_tmp="$(mktemp "$INSTALL_DIR/promotion.marker.tmp-XXXXXX")" ||
     die "could not create the promotion marker"
-  if ! printf 'phase=%s\nhad_runtime=%s\nhad_app=%s\nhad_remote=%s\nhad_launch_agent=%s\n' \
-    "$phase" "$had_runtime" "$had_app" "$had_remote" "$had_launch_agent" > "$marker_tmp"; then
+  if ! printf 'phase=%s\nhad_runtime=%s\nhad_app=%s\nhad_remote=%s\nhad_launch_agent=%s\nhad_receipt=%s\n' \
+    "$phase" "$had_runtime" "$had_app" "$had_remote" "$had_launch_agent" "$had_receipt" > "$marker_tmp"; then
     /bin/rm -f "$marker_tmp"
     die "could not write the promotion marker"
   fi
@@ -661,13 +664,17 @@ recover_pending_promotion() {
     had_remote="$(/usr/bin/awk -F= '$1 == "had_remote" { print $2; exit }' "$PROMOTION_MARKER" 2>/dev/null || true)"
     had_launch_agent="$(/usr/bin/awk -F= '$1 == "had_launch_agent" { print $2; exit }' "$PROMOTION_MARKER" 2>/dev/null || true)"
     [ -n "$had_launch_agent" ] || had_launch_agent="0"
+    had_receipt="$(/usr/bin/awk -F= '$1 == "had_receipt" { print $2; exit }' "$PROMOTION_MARKER" 2>/dev/null || true)"
+    [ -n "$had_receipt" ] || had_receipt="0"
     [ "$had_runtime" = "0" ] || [ "$had_runtime" = "1" ] || return 1
     [ "$had_app" = "0" ] || [ "$had_app" = "1" ] || return 1
     [ "$had_remote" = "0" ] || [ "$had_remote" = "1" ] || return 1
     [ "$had_launch_agent" = "0" ] || [ "$had_launch_agent" = "1" ] || return 1
+    [ "$had_receipt" = "0" ] || [ "$had_receipt" = "1" ] || return 1
     restore_path "$RUNTIME_DIR" "$BACKUP_DIR" "$had_runtime" || return 1
     restore_path "$APP_DIR" "$APP_BACKUP_DIR" "$had_app" || return 1
     restore_path "$REMOTE_DIR" "$REMOTE_BACKUP_DIR" "$had_remote" || return 1
+    restore_path "$RECEIPT_PATH" "$RECEIPT_BACKUP_PATH" "$had_receipt" || return 1
     if [ "$FIXTURE_MODE" != "1" ]; then
       [ ! -L "$LAUNCH_AGENTS_DIR" ] || return 1
       [ ! -L "$LAUNCH_AGENT_PATH" ] || return 1
@@ -874,6 +881,7 @@ promote() {
   had_app="0"
   had_remote="0"
   had_launch_agent="0"
+  had_receipt="0"
   [ ! -L "$RUNTIME_DIR" ] || die "runtime directory must not be a symlink"
   [ ! -L "$APP_DIR" ] || die "app directory must not be a symlink"
   [ ! -L "$REMOTE_DIR" ] || die "remote directory must not be a symlink"
@@ -901,7 +909,16 @@ promote() {
     cleanup_path "$REMOTE_BACKUP_DIR" || die "could not clear the previous remote backup"
     had_remote="1"
   fi
-  write_promotion_marker "backups" "$had_runtime" "$had_app" "$had_remote" "$had_launch_agent"
+  [ ! -L "$RECEIPT_PATH" ] || die "installation receipt must not be a symlink"
+  [ ! -L "$RECEIPT_BACKUP_PATH" ] || die "previous installation receipt must not be a symlink"
+  if [ -e "$RECEIPT_PATH" ]; then
+    [ -f "$RECEIPT_PATH" ] || die "installation receipt must be a regular file"
+    cleanup_path "$RECEIPT_BACKUP_PATH" || die "could not clear the previous receipt backup"
+    /bin/cp -p "$RECEIPT_PATH" "$RECEIPT_BACKUP_PATH" || die "could not preserve the previous installation receipt"
+    /bin/chmod 600 "$RECEIPT_BACKUP_PATH"
+    had_receipt="1"
+  fi
+  write_promotion_marker "backups" "$had_runtime" "$had_app" "$had_remote" "$had_launch_agent" "$had_receipt"
   PROMOTION_ACTIVE="1"
 
   if [ "$had_runtime" = "1" ]; then
@@ -913,7 +930,7 @@ promote() {
   if [ "$had_remote" = "1" ]; then
     /bin/mv "$REMOTE_DIR" "$REMOTE_BACKUP_DIR" || die "could not preserve the previous remote payload"
   fi
-  write_promotion_marker "promoting" "$had_runtime" "$had_app" "$had_remote" "$had_launch_agent"
+  write_promotion_marker "promoting" "$had_runtime" "$had_app" "$had_remote" "$had_launch_agent" "$had_receipt"
   /bin/mv "$STAGING_DIR/runtime" "$RUNTIME_DIR" || die "could not promote the staged runtime"
 
   if [ "$TEST_FAIL_AFTER_PROMOTION" = "1" ]; then
@@ -956,6 +973,34 @@ finalize_promotion() {
   [ ! -L "$PROMOTION_MARKER" ] || die "promotion marker must not be a symlink"
   /bin/rm -f "$PROMOTION_MARKER"
   PROMOTION_ACTIVE="0"
+}
+
+write_installation_receipt() {
+  [ ! -L "$RECEIPT_PATH" ] || die "installation receipt must not be a symlink"
+  receipt_tmp="$(mktemp "$INSTALL_DIR/receipt.tmp-XXXXXX")" || die "could not create the installation receipt"
+  if ! "$PLUTIL_BIN" -create xml1 "$receipt_tmp"; then
+    /bin/rm -f "$receipt_tmp"
+    die "could not initialize the installation receipt"
+  fi
+  "$PLUTIL_BIN" -insert schemaVersion -integer 1 "$receipt_tmp" || die "could not write receipt schema"
+  "$PLUTIL_BIN" -insert productVersion -string "$PRODUCT_VERSION" "$receipt_tmp" || die "could not write receipt version"
+  "$PLUTIL_BIN" -insert manifestSHA256 -string "$MANIFEST_PINNED_DIGEST" "$receipt_tmp" || die "could not write receipt manifest digest"
+  "$PLUTIL_BIN" -insert helperPayloadSHA256 -string "$HELPER_DIGEST" "$receipt_tmp" || die "could not write receipt helper digest"
+  "$PLUTIL_BIN" -insert coreRuntimePayloadSHA256 -string "$CORE_PAYLOAD_DIGEST" "$receipt_tmp" || die "could not write receipt core digest"
+  "$PLUTIL_BIN" -insert runtimeLockSHA256 -string "$LOCK_DIGEST" "$receipt_tmp" || die "could not write receipt lock digest"
+  "$PLUTIL_BIN" -insert runtimeSchemaVersion -integer "$RUNTIME_SCHEMA_VERSION" "$receipt_tmp" || die "could not write receipt runtime schema"
+  "$PLUTIL_BIN" -insert configurationSchemaVersion -integer "$CONFIG_SCHEMA_MIN" "$receipt_tmp" || die "could not write receipt configuration schema"
+  "$PLUTIL_BIN" -insert installedAt -string "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$receipt_tmp" || die "could not write receipt timestamp"
+  case "$MANIFEST_SOURCE" in
+    https://*)
+      "$PLUTIL_BIN" -insert manifestURL -string "$MANIFEST_SOURCE" "$receipt_tmp" || die "could not write receipt manifest URL"
+      ;;
+  esac
+  receipt_json_tmp="$(mktemp "$INSTALL_DIR/receipt-json.tmp-XXXXXX")" || die "could not create the JSON receipt"
+  "$PLUTIL_BIN" -convert json -o "$receipt_json_tmp" "$receipt_tmp" || die "could not encode the installation receipt"
+  /bin/chmod 600 "$receipt_json_tmp"
+  /bin/mv "$receipt_json_tmp" "$RECEIPT_PATH" || die "could not install the installation receipt"
+  /bin/rm -f "$receipt_tmp"
 }
 
 write_launch_agent() {
@@ -1065,6 +1110,7 @@ main() {
     cleanup_path "$APP_DIR" || die "could not simulate a broken promoted installation"
   fi
   validate_promoted_installation
+  write_installation_receipt
   stage "starting-helper"
   write_launch_agent
   finalize_promotion

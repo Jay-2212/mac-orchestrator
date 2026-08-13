@@ -64,9 +64,11 @@ jobs:
           set -euo pipefail
           required_files=(
             release/manifest.schema.json
+            release/manifest.signature.schema.json
             release/manifest.template.json
             script/bootstrap.sh
             script/build_release_artifacts.sh
+            script/sign_release_manifest.sh
             script/generate_install_command.sh
             script/test_bootstrap.sh
           )
@@ -75,20 +77,24 @@ jobs:
           done
           test -x script/bootstrap.sh
           test -x script/build_release_artifacts.sh
+          test -x script/sign_release_manifest.sh
           test -x script/generate_install_command.sh
           test -x script/test_bootstrap.sh
           python3 -m json.tool release/manifest.schema.json >/dev/null
+          python3 -m json.tool release/manifest.signature.schema.json >/dev/null
           python3 -m json.tool release/manifest.template.json >/dev/null
-          bash -n script/bootstrap.sh script/build_release_artifacts.sh script/generate_install_command.sh script/test_bootstrap.sh
+          bash -n script/bootstrap.sh script/build_release_artifacts.sh script/sign_release_manifest.sh script/generate_install_command.sh script/test_bootstrap.sh
 
       - name: Verify immutable payload boundary (required)
         run: |
           set -euo pipefail
           contract_files=(
             release/manifest.schema.json
+            release/manifest.signature.schema.json
             release/manifest.template.json
             script/bootstrap.sh
             script/build_release_artifacts.sh
+            script/sign_release_manifest.sh
             script/generate_install_command.sh
           )
           if git grep -nE '(raw\.githubusercontent\.com|github\.com/[^[:space:]]+)/(main|master)(/|$)' -- "${contract_files[@]}"; then

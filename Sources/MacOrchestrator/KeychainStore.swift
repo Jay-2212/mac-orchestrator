@@ -5,6 +5,15 @@ protocol KeychainClient {
     func read(service: String, account: String) throws -> String?
     func create(value: String, service: String, account: String) throws
     func update(value: String, service: String, account: String) throws
+    func delete(service: String, account: String) throws
+}
+
+extension KeychainClient {
+    // Phase 2 test doubles that only exercise reads/writes remain source
+    // compatible; production and uninstall-capable clients override this.
+    func delete(service: String, account: String) throws {
+        throw KeychainStoreError.operationFailed(-1)
+    }
 }
 
 enum KeychainStoreError: Error, Equatable, LocalizedError, Sendable {
@@ -83,9 +92,21 @@ struct SystemKeychainClient: KeychainClient {
             throw KeychainStoreError.operationFailed(Int(status))
         }
     }
+
+    func delete(service: String, account: String) throws {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+        ]
+        let status = SecItemDelete(query as CFDictionary)
+        guard status == errSecSuccess || status == errSecItemNotFound else {
+            throw KeychainStoreError.operationFailed(Int(status))
+        }
+    }
 }
 
-enum KeychainItem: Equatable, Hashable, Sendable {
+enum KeychainItem: Codable, Equatable, Hashable, Sendable {
     case connectorToken
     case ngrokAuthtoken
     case telegramSendBotToken
@@ -179,6 +200,10 @@ struct KeychainStore {
             }
             throw error
         }
+    }
+
+    func delete(_ item: KeychainItem) throws {
+        try client.delete(service: item.service, account: item.account)
     }
 
     func connectorTokenValue() throws -> String {

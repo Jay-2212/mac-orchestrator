@@ -76,16 +76,18 @@ jobs:
       - name: Validate Phase 2 release contract before publication
         run: |
           set -euo pipefail
-          for item in release/manifest.schema.json release/manifest.template.json script/bootstrap.sh script/build_release_artifacts.sh script/generate_install_command.sh script/test_bootstrap.sh; do
+          for item in release/manifest.schema.json release/manifest.signature.schema.json release/manifest.template.json script/bootstrap.sh script/build_release_artifacts.sh script/sign_release_manifest.sh script/generate_install_command.sh script/test_bootstrap.sh; do
             test -f "$item" || { echo "Missing Phase 2 release input: $item" >&2; exit 1; }
           done
           test -x script/bootstrap.sh
           test -x script/build_release_artifacts.sh
+          test -x script/sign_release_manifest.sh
           test -x script/generate_install_command.sh
           test -x script/test_bootstrap.sh
           python3 -m json.tool release/manifest.schema.json >/dev/null
+          python3 -m json.tool release/manifest.signature.schema.json >/dev/null
           python3 -m json.tool release/manifest.template.json >/dev/null
-          bash -n script/bootstrap.sh script/build_release_artifacts.sh script/generate_install_command.sh script/test_bootstrap.sh
+          bash -n script/bootstrap.sh script/build_release_artifacts.sh script/sign_release_manifest.sh script/generate_install_command.sh script/test_bootstrap.sh
           python3 - <<'PY'
           import json
           from pathlib import Path
@@ -142,10 +144,31 @@ jobs:
           NGROK_SHA256: ${{ inputs.ngrok_sha256 }}
           NGROK_AUTHORITY: ${{ inputs.ngrok_authority }}
           NGROK_TEAM: ${{ inputs.ngrok_team }}
+          MANIFEST_SIGNING_KEY_PEM: ${{ secrets.MAC_ORCHESTRATOR_MANIFEST_SIGNING_KEY_PEM }}
         run: |
           set -euo pipefail
+          test -n "$MANIFEST_SIGNING_KEY_PEM" || { echo "The release signing secret is not configured; refusing to assemble unsigned assets." >&2; exit 1; }
           release_tmp="$RUNNER_TEMP/mac-orchestrator-release"
           /bin/mkdir -p "$release_tmp/core-source" "$release_tmp/output"
+          signing_key="$RUNNER_TEMP/mac-orchestrator-manifest-signing-key.pem"
+          signing_public="$RUNNER_TEMP/mac-orchestrator-manifest-signing-key.pub"
+          trap '/bin/rm -f "$signing_key" "$signing_public" "$release_tmp/manifest.sig.bin"' EXIT
+          umask 077
+          /usr/bin/printf '%s' "$MANIFEST_SIGNING_KEY_PEM" > "$signing_key"
+          /usr/bin/openssl pkey -in "$signing_key" -pubout -out "$signing_public" >/dev/null
+          embedded_public="$(python3 - <<'PY'
+          import base64
+          import re
+          from pathlib import Path
+
+          source = Path("Sources/MacOrchestrator/ReleaseManifest.swift").read_text()
+          match = re.search(r'Data\(base64Encoded: "([A-Za-z0-9+/=]+)"\)', source)
+          assert match, "embedded production public key is missing"
+          print(match.group(1))
+          PY
+          )"
+          derived_public="$(/usr/bin/openssl pkey -in "$signing_key" -pubout -outform DER | python3 -c 'import base64,sys; print(base64.b64encode(sys.stdin.buffer.read()[-32:]).decode())')"
+          test "$derived_public" = "$embedded_public" || { echo "The external signing key does not match the embedded trusted public key." >&2; exit 1; }
           product_version="${RELEASE_TAG#v}"
           asset_base="https://github.com/Jay-2212/mac-orchestrator/releases/download/${RELEASE_TAG}"
           manifest_url="$asset_base/manifest.json"
@@ -194,9 +217,29 @@ jobs:
             --ngrok-sha256 "$NGROK_SHA256" \
             --ngrok-authority "$NGROK_AUTHORITY" \
             --ngrok-team "$NGROK_TEAM" \
+            --manifest-signing-key "$signing_key" \
+            --manifest-key-id "production-v1" \
             --output-dir "$release_tmp/output"
           test -f "$release_tmp/output/bootstrap.sh"
           test -f "$release_tmp/output/manifest.json"
+          test -f "$release_tmp/output/manifest.sig"
+          python3 - "$release_tmp/output/manifest.sig" "$release_tmp/manifest.sig.bin" <<'PY'
+          import base64
+          import json
+          import pathlib
+          import sys
+
+          envelope = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          assert envelope == {
+              "algorithm": "ed25519",
+              "keyID": "production-v1",
+              "schemaVersion": 1,
+              "signature": envelope["signature"],
+          }
+          pathlib.Path(sys.argv[2]).write_bytes(base64.b64decode(envelope["signature"], validate=True))
+          PY
+          /usr/bin/openssl pkeyutl -verify -rawin -pubin -inkey "$signing_public" \
+            -in "$release_tmp/output/manifest.json" -sigfile "$release_tmp/manifest.sig.bin" >/dev/null
           test -x "$release_tmp/output/install-command.sh"
           test -f "$release_tmp/output/release-body.md"
           test -f "$release_tmp/output/SHA256SUMS"
@@ -266,6 +309,7 @@ jobs:
             --generate-notes \
             release-assets/bootstrap.sh \
             release-assets/manifest.json \
+            release-assets/manifest.sig \
             release-assets/Mac-Orchestrator-arm64.zip \
             release-assets/uv-arm64 \
             release-assets/core-payload.tar.gz \

@@ -768,12 +768,14 @@ enum VerifiedMacOSSystemAlias {
         default: return false
         }
 
-        var linkMetadata = stat()
-        guard lstat(url.path, &linkMetadata) == 0,
-              UInt32(linkMetadata.st_mode) & UInt32(S_IFMT) == UInt32(S_IFLNK),
-              url.resolvingSymlinksInPath().standardizedFileURL.path == expected else {
-            return false
+        var metadata = stat()
+        guard lstat(url.path, &metadata) == 0 else { return false }
+        let mode = UInt32(metadata.st_mode) & UInt32(S_IFMT)
+        if mode == UInt32(S_IFLNK) {
+            return url.resolvingSymlinksInPath().standardizedFileURL.path == expected
         }
-        return true
+        return path == "/var" || path == "/tmp"
+            ? mode == UInt32(S_IFDIR)
+            : false
     }
 }

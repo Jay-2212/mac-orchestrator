@@ -538,8 +538,8 @@ final class RepairEngineTests: XCTestCase {
             at: contract.launchAgentURL,
             withDestinationURL: unrelated
         )
-        let writeOutcome = await writer.writeExactManagedContract(contract)
-        XCTAssertEqual(writeOutcome, .refused)
+        let symlinkWriteOutcome = await writer.writeExactManagedContract(contract)
+        XCTAssertEqual(symlinkWriteOutcome, .refused)
         XCTAssertFalse(inspector.inspect(contract).exactPath)
     }
 

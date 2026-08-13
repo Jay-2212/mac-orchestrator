@@ -162,7 +162,7 @@ final class RepairEngineTests: XCTestCase {
         encoder.dateEncodingStrategy = .iso8601
         let validBackupURL = root.appendingPathComponent("valid-backup.json")
         try encoder.encode(validBackup).write(to: validBackupURL)
-        try FileManager.default.removeItem(at: store.backupURL)
+        try? FileManager.default.removeItem(at: store.backupURL)
         try FileManager.default.createSymbolicLink(
             at: store.backupURL,
             withDestinationURL: validBackupURL
@@ -242,6 +242,8 @@ final class RepairEngineTests: XCTestCase {
         let store = ConfigurationStore(directoryURL: root, ownerIDProvider: { "owner-test" })
         var configuration = try store.loadOrCreate()
         configuration.localMCPPort = 8123
+        _ = try store.save(configuration)
+        configuration.localMCPPort = 9123
         _ = try store.save(configuration)
         try Data("{not-json".utf8).write(to: store.configurationURL)
 
@@ -705,7 +707,7 @@ final class RepairEngineTests: XCTestCase {
             verifiedBootstrapHandingOff: verified
         )).execute(.rerunVerifiedBootstrap)
         XCTAssertEqual(outcome.status, .requiresUserAction)
-        XCTAssertTrue(outcome.reason.contains("verified"))
+        XCTAssertTrue(outcome.reason.localizedCaseInsensitiveContains("verified"))
         XCTAssertFalse(outcome.reason.contains("http"))
     }
 

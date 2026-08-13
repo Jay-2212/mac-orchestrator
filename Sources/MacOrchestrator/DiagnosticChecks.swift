@@ -196,7 +196,11 @@ enum DiagnosticChecks {
             return result("installation.runtime-architecture", "Managed runtime architecture", .fail, Text.providerUnavailable, repair: .rerunVerifiedBootstrap)
         }
         guard facts.runtime.runtimePresent else {
-            return result("installation.runtime-architecture", "Managed runtime architecture", .fail, Text.requiredMissing, repair: .rerunVerifiedBootstrap)
+            let status: DiagnosticStatus = facts.helperPresent ? .warn : .fail
+            let reason = facts.helperPresent
+                ? "The managed runtime architecture could not be determined."
+                : Text.requiredMissing
+            return result("installation.runtime-architecture", "Managed runtime architecture", status, reason, repair: status == .fail ? .rerunVerifiedBootstrap : nil)
         }
         guard let architecture = facts.runtime.architecture else {
             return result("installation.runtime-architecture", "Managed runtime architecture", .warn, "The managed runtime architecture could not be determined.")

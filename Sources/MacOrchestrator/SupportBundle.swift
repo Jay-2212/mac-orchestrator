@@ -312,7 +312,12 @@ struct DittoSupportBundleArchiveWriter: SupportBundleArchiveWriting {
             guard type == S_IFREG else {
                 throw SupportBundleError.archiveWriteFailed
             }
-            let relative = String(url.path.dropFirst(stagingDirectory.path.count + 1))
+            let stagingPath = stagingDirectory.resolvingSymlinksInPath().standardizedFileURL.path
+            let itemPath = url.resolvingSymlinksInPath().standardizedFileURL.path
+            guard itemPath.hasPrefix(stagingPath + "/") else {
+                throw SupportBundleError.archiveWriteFailed
+            }
+            let relative = String(itemPath.dropFirst(stagingPath.count + 1))
             let path = try validatedArchivePath(relative)
             guard actual[path] == nil else {
                 throw SupportBundleError.duplicateArchivePath(path)

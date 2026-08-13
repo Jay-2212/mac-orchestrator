@@ -128,7 +128,7 @@ struct ReadOnlyConfigurationDiagnosticProvider: ConfigurationDiagnosticProviding
         let backupURL = directoryURL.appendingPathComponent("config.json.backup", isDirectory: false)
 
         var corruptEvidenceCount = 0
-        if directoryMetadata.exists {
+        if directoryMetadata.exists && !directoryMetadata.isSymlink {
             do {
                 let entries = try fileManager.contentsOfDirectory(
                     at: directoryURL,
@@ -735,7 +735,7 @@ protocol UpdateAvailabilityProviding {
 enum DiagnosticPathSafety {
     static func isSafe(_ url: URL) -> Bool {
         let path = url.standardizedFileURL.path
-        guard path.hasPrefix("/") else { return false }
+        guard path.hasPrefix("/"), path != "/tmp" else { return false }
         let components = path.split(separator: "/", omittingEmptySubsequences: true)
         var current = URL(fileURLWithPath: "/", isDirectory: true)
         for (index, component) in components.enumerated() {
@@ -760,18 +760,26 @@ enum DiagnosticPathSafety {
 
 enum VerifiedMacOSSystemAlias {
     static func isAllowed(_ url: URL) -> Bool {
-        guard url.standardizedFileURL.path == "/var" else { return false }
+        let path = url.standardizedFileURL.path
+        let expected: String
+        switch path {
+        case "/var": expected = "/private/var"
+        case "/tmp": expected = "/private/tmp"
+        default: return false
+        }
 
         var linkMetadata = stat()
         guard lstat(url.path, &linkMetadata) == 0,
               UInt32(linkMetadata.st_mode) & UInt32(S_IFMT) == UInt32(S_IFLNK),
               let destination = try? FileManager.default.destinationOfSymbolicLink(atPath: url.path),
-              destination == "private/var" || destination == "/private/var" else {
+              destination == "private/var" || destination == "/private/var"
+                || destination == "private/tmp" || destination == "/private/tmp",
+              url.resolvingSymlinksInPath().standardizedFileURL.path == expected else {
             return false
         }
 
         var targetMetadata = stat()
-        return lstat("/private/var", &targetMetadata) == 0
+        return lstat(expected, &targetMetadata) == 0
             && UInt32(targetMetadata.st_mode) & UInt32(S_IFMT) == UInt32(S_IFDIR)
     }
 }

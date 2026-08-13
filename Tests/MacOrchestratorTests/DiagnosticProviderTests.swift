@@ -66,7 +66,8 @@ final class DiagnosticProviderTests: XCTestCase {
         var invalid = AppConfiguration.fresh(ownerID: "owner")
         invalid.localMCPPort = 0
         let primary = support.appendingPathComponent("config.json")
-        try JSONEncoder().encode(invalid).write(to: primary)
+        let originalBytes = try JSONEncoder().encode(invalid)
+        try originalBytes.write(to: primary)
         try Data("old-corrupt-primary".utf8).write(
             to: support.appendingPathComponent("config.json.corrupt-1")
         )
@@ -80,7 +81,7 @@ final class DiagnosticProviderTests: XCTestCase {
         XCTAssertEqual(facts.corruptEvidenceCount, 2)
         XCTAssertTrue(facts.primary.exists)
         XCTAssertFalse(facts.primary.isSymlink)
-        XCTAssertEqual(try Data(contentsOf: primary), try JSONEncoder().encode(invalid))
+        XCTAssertEqual(try Data(contentsOf: primary), originalBytes)
     }
 
     func testConfigurationProviderReportsSymlinkMetadataWithoutChangingTarget() throws {

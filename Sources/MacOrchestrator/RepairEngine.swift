@@ -1,4 +1,6 @@
 import Foundation
+import AppKit
+import Darwin
 
 enum RepairOutcomeStatus: String, Codable, CaseIterable, Equatable, Sendable {
     case repaired = "repaired"
@@ -18,20 +20,22 @@ struct RepairOutcome: Codable, Equatable, Sendable {
     init(action: RepairActionID, status: RepairOutcomeStatus, reason: String) {
         self.action = action
         self.status = status
-        self.reason = RepairOutcome.safeReason(reason)
+        self.reason = RepairOutcome.safeReason(action: action, status: status, reason: reason)
     }
 
-    private static func safeReason(_ reason: String) -> String {
-        // Outcomes created by RepairEngine use only fixed strings. Keep this
-        // initializer defensive for support tooling and test adapters too.
-        let lowercased = reason.lowercased()
-        let containsUnsafeValue = lowercased.contains("http://")
-            || lowercased.contains("https://")
-            || lowercased.contains("/users/")
-            || lowercased.contains("/private/")
-            || lowercased.contains("secret")
-            || lowercased.contains("token")
-        return containsUnsafeValue ? "The repair result was recorded without sensitive details." : reason
+    private static func safeReason(
+        action: RepairActionID,
+        status: RepairOutcomeStatus,
+        reason: String
+    ) -> String {
+        guard SafeRepairReasons.allowed(
+            reason,
+            for: action,
+            status: status
+        ) else {
+            return SafeRepairReasons.message(for: action, status: status, clientGuidance: false)
+        }
+        return String(reason.prefix(SafeRepairReasons.maximumLength))
     }
 }
 
@@ -78,8 +82,68 @@ enum PermissionSettingsPane: String, Codable, Equatable, Sendable {
     case automation
 }
 
+enum SystemSettingsPaneURLs {
+    static let accessibility = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!
+    static let screenRecording = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!
+    static let automation = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation")!
+
+    static func url(for pane: PermissionSettingsPane) -> URL {
+        switch pane {
+        case .accessibility:
+            return accessibility
+        case .screenRecording:
+            return screenRecording
+        case .automation:
+            return automation
+        }
+    }
+}
+
+protocol SystemSettingsURLOpening: Sendable {
+    func open(_ url: URL) async -> Bool
+}
+
+struct WorkspaceSystemSettingsURLOpener: @unchecked Sendable, SystemSettingsURLOpening {
+    func open(_ url: URL) async -> Bool {
+        NSWorkspace.shared.open(url)
+    }
+}
+
+struct SystemSettingsPermissionOpener: PermissionSettingsOpening {
+    let urlOpening: any SystemSettingsURLOpening
+
+    init(urlOpening: any SystemSettingsURLOpening = WorkspaceSystemSettingsURLOpener()) {
+        self.urlOpening = urlOpening
+    }
+
+    func open(_ pane: PermissionSettingsPane) async -> RepairAdapterResult {
+        let url = SystemSettingsPaneURLs.url(for: pane)
+        return await urlOpening.open(url) ? .requiresUserAction : .failed
+    }
+}
+
 protocol LifecycleRetrying: Sendable {
     func retry(_ target: LifecycleRepairTarget) async -> RepairAdapterResult
+}
+
+struct LifecycleOwnershipFacts: Equatable, Sendable {
+    let mcpServerOwned: Bool
+    let remoteConnectorOwned: Bool
+}
+
+struct OwnershipGuardedLifecycleHandoff: LifecycleRetrying {
+    let ownership: LifecycleOwnershipFacts
+
+    func retry(_ target: LifecycleRepairTarget) async -> RepairAdapterResult {
+        let owned: Bool
+        switch target {
+        case .mcpServer:
+            owned = ownership.mcpServerOwned
+        case .remoteConnector:
+            owned = ownership.remoteConnectorOwned
+        }
+        return owned ? .requiresUserAction : .refused
+    }
 }
 
 protocol PermissionSettingsOpening: Sendable {
@@ -112,7 +176,7 @@ struct RepairDependencies: Sendable {
 
     init(
         lifecycleRetrying: (any LifecycleRetrying)? = nil,
-        permissionSettingsOpening: (any PermissionSettingsOpening)? = nil,
+        permissionSettingsOpening: (any PermissionSettingsOpening)? = SystemSettingsPermissionOpener(),
         configurationBackupRestoring: (any ConfigurationBackupRestoring)? = nil,
         localPortReassigning: (any LocalPortReassigning)? = nil,
         launchAgentRepairing: (any LaunchAgentRepairing)? = nil,
@@ -242,6 +306,22 @@ struct RepairEngine: Sendable {
 }
 
 private enum SafeRepairReasons {
+    static let maximumLength = 160
+
+    static func allowed(
+        _ reason: String,
+        for action: RepairActionID,
+        status: RepairOutcomeStatus
+    ) -> Bool {
+        guard reason.count <= maximumLength else { return false }
+        if reason == message(for: action, status: status, clientGuidance: false) {
+            return true
+        }
+        return action == .reassignLocalPort
+            && status == .repaired
+            && reason == message(for: action, status: status, clientGuidance: true)
+    }
+
     static func message(
         for action: RepairActionID,
         status: RepairOutcomeStatus,
@@ -283,27 +363,33 @@ private enum SafeRepairReasons {
 
 struct ConfigurationStoreBackupRestorer: @unchecked Sendable, ConfigurationBackupRestoring {
     let store: ConfigurationStore
+    let expectedOwnerID: String
 
-    init(store: ConfigurationStore) {
+    init(store: ConfigurationStore, expectedOwnerID: String) {
         self.store = store
+        self.expectedOwnerID = expectedOwnerID
     }
 
     func restoreValidatedBackup() async -> RepairAdapterResult {
-        let provider = ReadOnlyConfigurationDiagnosticProvider(
-            directoryURL: store.configurationURL.deletingLastPathComponent()
-        )
-        guard let facts = try? provider.inspect() else {
-            return .failed
-        }
-        if facts.primary.state == .valid {
-            return .notNeeded
-        }
-        guard facts.backup.state == .valid else {
+        guard !expectedOwnerID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return .refused
         }
 
-        // ConfigurationStore.load() validates the backup before promotion and
-        // preserves a malformed primary as config.json.corrupt evidence.
+        let primary = readValidatedConfiguration(at: store.configurationURL)
+        let backup = readValidatedConfiguration(at: store.backupURL)
+        if primary != nil {
+            return .notNeeded
+        }
+        guard let backup else {
+            return .refused
+        }
+        guard backup.ownerID == expectedOwnerID else {
+            return .refused
+        }
+
+        // The read-only checks above establish the owner and validation boundary.
+        // ConfigurationStore.load() then performs its existing recovery semantics,
+        // including preserving malformed primary bytes as .corrupt evidence.
         do {
             _ = try store.load()
             return .repaired
@@ -311,12 +397,23 @@ struct ConfigurationStoreBackupRestorer: @unchecked Sendable, ConfigurationBacku
             return .failed
         }
     }
+
+    private func readValidatedConfiguration(at url: URL) -> AppConfiguration? {
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        guard let decoded = try? decoder.decode(AppConfiguration.self, from: data) else {
+            return nil
+        }
+        return try? decoded.validated()
+    }
 }
 
 enum LocalPortOccupancy: Equatable, Sendable {
     case free
     case occupiedUnrelated
     case occupiedOwned(ownerID: String)
+    case unknown
 }
 
 protocol LocalPortOccupancyChecking: Sendable {
@@ -331,13 +428,11 @@ struct LocalPortReassignmentRequest: Equatable, Sendable {
     let currentPort: Int
     let candidatePort: Int
     let expectedOwnerID: String
-    let observedOwnerID: String
 
-    init(currentPort: Int, candidatePort: Int, expectedOwnerID: String, observedOwnerID: String) {
+    init(currentPort: Int, candidatePort: Int, expectedOwnerID: String) {
         self.currentPort = currentPort
         self.candidatePort = candidatePort
         self.expectedOwnerID = expectedOwnerID
-        self.observedOwnerID = observedOwnerID
     }
 }
 
@@ -347,8 +442,7 @@ struct SafeLocalPortReassigner: LocalPortReassigning {
     let configuration: any CanonicalLocalPortUpdating
 
     func reassignLocalPort() async -> RepairAdapterResult {
-        guard request.expectedOwnerID == request.observedOwnerID,
-              !request.expectedOwnerID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        guard !request.expectedOwnerID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return .refused
         }
         guard (1...65535).contains(request.currentPort),
@@ -356,11 +450,16 @@ struct SafeLocalPortReassigner: LocalPortReassigning {
             return .refused
         }
         guard request.currentPort != request.candidatePort else {
-            return .notNeeded
+            return .refused
+        }
+        guard case let .occupiedOwned(ownerID) = await occupancy.inspect(port: request.currentPort),
+              ownerID == request.expectedOwnerID else {
+            return .refused
         }
         guard case .free = await occupancy.inspect(port: request.candidatePort) else {
-            // No process termination contract exists here by design. An
-            // occupied candidate is never made free by killing its listener.
+            return .refused
+        }
+        guard case .free = await occupancy.inspect(port: request.candidatePort) else {
             return .refused
         }
         do {
@@ -392,36 +491,174 @@ struct LaunchAgentOwnershipFacts: Equatable, Sendable {
         exactLabel: Bool,
         exactPath: Bool,
         exactContract: Bool,
-        ownedByMacOrchestrator: Bool = true
+        ownedByMacOrchestrator: Bool = false
     ) {
         self.exactLabel = exactLabel
         self.exactPath = exactPath
         self.exactContract = exactContract
         self.ownedByMacOrchestrator = ownedByMacOrchestrator
+            && exactLabel
+            && exactPath
+            && exactContract
+    }
+}
+
+struct ManagedLaunchAgentContract: Equatable, Sendable {
+    static let label = "com.jay.mac-orchestrator"
+    static let executablePath = "/Applications/Mac Orchestrator.app/Contents/MacOS/MacOrchestrator"
+
+    let homeDirectory: URL
+    let launchAgentURL: URL
+    let executableURL: URL
+    let launcherLogURL: URL
+
+    init(homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser) {
+        let normalizedHome = homeDirectory.standardizedFileURL
+        self.homeDirectory = normalizedHome
+        self.launchAgentURL = normalizedHome
+            .appendingPathComponent("Library/LaunchAgents", isDirectory: true)
+            .appendingPathComponent(Self.label + ".plist", isDirectory: false)
+        self.executableURL = URL(fileURLWithPath: Self.executablePath)
+        self.launcherLogURL = normalizedHome
+            .appendingPathComponent("Library/Logs/Mac Orchestrator", isDirectory: true)
+            .appendingPathComponent("launcher.log", isDirectory: false)
+    }
+
+    var propertyList: [String: Any] {
+        [
+            "Label": Self.label,
+            "ProgramArguments": [executableURL.path],
+            "RunAtLoad": true,
+            "KeepAlive": ["SuccessfulExit": false],
+            "ThrottleInterval": 5,
+            "ProcessType": "Interactive",
+            "LimitLoadToSessionType": "Aqua",
+            "StandardOutPath": launcherLogURL.path,
+            "StandardErrorPath": launcherLogURL.path,
+        ]
+    }
+
+    func matches(_ object: Any) -> Bool {
+        guard let plist = object as? [String: Any],
+              Set(plist.keys) == Set(propertyList.keys),
+              plist["Label"] as? String == Self.label,
+              plist["ProgramArguments"] as? [String] == [executableURL.path],
+              plist["RunAtLoad"] as? Bool == true,
+              plist["ThrottleInterval"] as? Int == 5,
+              plist["ProcessType"] as? String == "Interactive",
+              plist["LimitLoadToSessionType"] as? String == "Aqua",
+              plist["StandardOutPath"] as? String == launcherLogURL.path,
+              plist["StandardErrorPath"] as? String == launcherLogURL.path,
+              let keepAlive = plist["KeepAlive"] as? [String: Any],
+              Set(keepAlive.keys) == ["SuccessfulExit"],
+              keepAlive["SuccessfulExit"] as? Bool == false else {
+            return false
+        }
+        return true
+    }
+
+    func propertyListData() throws -> Data {
+        try PropertyListSerialization.data(fromPropertyList: propertyList, format: .xml, options: 0)
     }
 }
 
 protocol LaunchAgentOwnershipInspecting: Sendable {
-    func inspect() -> LaunchAgentOwnershipFacts
+    func inspect(_ contract: ManagedLaunchAgentContract) -> LaunchAgentOwnershipFacts
 }
 
 protocol ExactLaunchAgentContractWriting: Sendable {
-    func writeExactManagedContract() async -> RepairAdapterResult
+    func writeExactManagedContract(_ contract: ManagedLaunchAgentContract) async -> RepairAdapterResult
 }
 
 struct ManagedLaunchAgentRepairer: LaunchAgentRepairing {
+    let contract: ManagedLaunchAgentContract
     let ownership: any LaunchAgentOwnershipInspecting
     let writer: any ExactLaunchAgentContractWriting
 
+    init(
+        contract: ManagedLaunchAgentContract = ManagedLaunchAgentContract(),
+        ownership: any LaunchAgentOwnershipInspecting,
+        writer: any ExactLaunchAgentContractWriting
+    ) {
+        self.contract = contract
+        self.ownership = ownership
+        self.writer = writer
+    }
+
     func repairManagedLaunchAgent() async -> RepairAdapterResult {
-        let facts = ownership.inspect()
-        guard facts.exactLabel,
-              facts.exactPath,
-              facts.exactContract,
-              facts.ownedByMacOrchestrator else {
+        let facts = ownership.inspect(contract)
+        guard facts.ownedByMacOrchestrator else {
             return .refused
         }
-        return await writer.writeExactManagedContract()
+        return await writer.writeExactManagedContract(contract)
+    }
+}
+
+struct FileSystemLaunchAgentOwnershipInspector: @unchecked Sendable, LaunchAgentOwnershipInspecting {
+    let fileManager: FileManager
+
+    init(fileManager: FileManager = .default) {
+        self.fileManager = fileManager
+    }
+
+    func inspect(_ contract: ManagedLaunchAgentContract) -> LaunchAgentOwnershipFacts {
+        let parentURL = contract.launchAgentURL.deletingLastPathComponent()
+        let safeTargetPath = fileManager.fileExists(atPath: contract.launchAgentURL.path)
+            && !isSymlink(at: parentURL)
+            && !isSymlink(at: contract.launchAgentURL)
+        guard safeTargetPath,
+              let data = try? Data(contentsOf: contract.launchAgentURL),
+              let object = try? PropertyListSerialization.propertyList(from: data, format: nil) else {
+            return LaunchAgentOwnershipFacts(exactLabel: false, exactPath: false, exactContract: false)
+        }
+        let plist = object as? [String: Any]
+        let exactLabel = plist?["Label"] as? String == ManagedLaunchAgentContract.label
+        let exactPath = safeTargetPath
+            && plist?["ProgramArguments"] as? [String] == [contract.executableURL.path]
+        let exactContract = contract.matches(object)
+        return LaunchAgentOwnershipFacts(
+            exactLabel: exactLabel,
+            exactPath: exactPath,
+            exactContract: exactContract,
+            ownedByMacOrchestrator: exactLabel && exactPath && exactContract
+        )
+    }
+
+    private func isSymlink(at url: URL) -> Bool {
+        var metadata = stat()
+        guard lstat(url.path, &metadata) == 0 else { return false }
+        return UInt32(metadata.st_mode) & UInt32(S_IFMT) == UInt32(S_IFLNK)
+    }
+}
+
+struct FileSystemManagedLaunchAgentWriter: @unchecked Sendable, ExactLaunchAgentContractWriting {
+    let fileManager: FileManager
+
+    init(fileManager: FileManager = .default) {
+        self.fileManager = fileManager
+    }
+
+    func writeExactManagedContract(_ contract: ManagedLaunchAgentContract) async -> RepairAdapterResult {
+        let parentURL = contract.launchAgentURL.deletingLastPathComponent()
+        guard !isSymlink(at: parentURL), !isSymlink(at: contract.launchAgentURL) else {
+            return .refused
+        }
+        do {
+            try fileManager.createDirectory(at: parentURL, withIntermediateDirectories: true)
+            try fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: parentURL.path)
+            let data = try contract.propertyListData()
+            try data.write(to: contract.launchAgentURL, options: [.atomic])
+            try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: contract.launchAgentURL.path)
+            return .repaired
+        } catch {
+            return .failed
+        }
+    }
+
+    private func isSymlink(at url: URL) -> Bool {
+        var metadata = stat()
+        guard lstat(url.path, &metadata) == 0 else { return false }
+        return UInt32(metadata.st_mode) & UInt32(S_IFMT) == UInt32(S_IFLNK)
     }
 }
 

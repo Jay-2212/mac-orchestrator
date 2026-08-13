@@ -12,6 +12,7 @@ enum ServiceState: String {
 struct ServiceSnapshot {
     var server: ServiceState = .stopped
     var tunnel: ServiceState = .stopped
+    var productReadiness: ProductReadinessState = .needsAttention
     var connectorURL: URL?
     var error: String?
     var controlProfile: ControlProfile?
@@ -21,7 +22,46 @@ struct ServiceSnapshot {
     var clientRefreshRequired: Bool = false
 
     var isHealthy: Bool {
-        server == .running && (tunnel == .running || tunnel == .stopped)
+        if productReadiness == .ready {
+            return true
+        }
+        return server == .running && (tunnel == .running || tunnel == .stopped)
+    }
+
+    mutating func applyLifecycleSnapshot(_ lifecycle: LifecycleSnapshot) {
+        server = Self.serviceState(for: lifecycle.mcpServer)
+        tunnel = Self.serviceState(for: lifecycle.remoteConnector)
+        productReadiness = lifecycle.productReadiness
+        error = lifecycle.mcpServer.reason ?? lifecycle.remoteConnector.reason
+    }
+
+    func projected(from lifecycle: LifecycleSnapshot) -> ServiceSnapshot {
+        var projection = self
+        projection.applyLifecycleSnapshot(lifecycle)
+        return projection
+    }
+
+    private static func serviceState(
+        for component: ComponentLifecycleSnapshot
+    ) -> ServiceState {
+        switch component.lifecycle {
+        case .stopped:
+            return .stopped
+        case .waitingForPrerequisites:
+            return .reconnecting
+        case .starting:
+            return .starting
+        case .ready:
+            return component.isReady ? .running : .starting
+        case .degraded:
+            return component.id == .mcpServer ? .starting : .reconnecting
+        case .retrying:
+            return .reconnecting
+        case .circuitOpen, .failed:
+            return .failed
+        case .stopping:
+            return .stopping
+        }
     }
 
     mutating func applyRuntimeContract(

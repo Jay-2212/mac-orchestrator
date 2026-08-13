@@ -10,6 +10,10 @@ final class ProcessSupervisor {
         didSet { onSnapshot?(snapshot) }
     }
 
+    var lifecycleSnapshot: LifecycleSnapshot {
+        lifecycle.snapshot
+    }
+
     private let runtimeCoordinator: NativeRuntimeCoordinator
     private let supportDirectory: URL
     let logsDirectory: URL
@@ -18,22 +22,26 @@ final class ProcessSupervisor {
     private let appLog: RotatingLog
     private let serverLog: RotatingLog
     private let tunnelLog: RotatingLog
+    private let lifecycleScheduler: MainLifecycleScheduler
+    private let lifecycle: LifecycleStateMachine
 
     private var serverProcess: Process?
     private var tunnelProcess: Process?
     private var healthTimer: Timer?
-    private var restartWorkItem: DispatchWorkItem?
-    private var serverFailures: [Date] = []
-    private var tunnelFailures: [Date] = []
-    private var serverRetryNotBefore = Date.distantPast
-    private var tunnelRetryNotBefore = Date.distantPast
     private var quitting = false
     private var activeContract: ManagedRuntimeLaunchContract?
     private var ownerID = ""
-    private var serverDesired = false
-    private var tunnelDesired = false
     private var activationSucceeded = false
     private var activationInFlight = false
+    private var serverLaunchGeneration: UInt64 = 0
+
+    private var serverDesired: Bool {
+        lifecycle.desiredState(for: .mcpServer).isEnabled
+    }
+
+    private var tunnelDesired: Bool {
+        lifecycle.desiredState(for: .remoteConnector).isEnabled
+    }
 
     private var ngrokDirectory: URL {
         supportDirectory
@@ -68,6 +76,14 @@ final class ProcessSupervisor {
         appLog = RotatingLog(directory: logsDirectory, name: "app.log")
         serverLog = RotatingLog(directory: logsDirectory, name: "server.log")
         tunnelLog = RotatingLog(directory: logsDirectory, name: "tunnel.log")
+        lifecycleScheduler = MainLifecycleScheduler()
+        lifecycle = LifecycleStateMachine(scheduler: lifecycleScheduler)
+        lifecycle.onSnapshot = { [weak self] lifecycleSnapshot in
+            self?.applyLifecycleSnapshot(lifecycleSnapshot)
+        }
+        lifecycle.onEffect = { [weak self] effect in
+            self?.handleLifecycleEffect(effect)
+        }
     }
 
     func launch(with contract: ManagedRuntimeLaunchContract) {
@@ -78,13 +94,17 @@ final class ProcessSupervisor {
         cleanStaleOwnedProcesses()
         startHealthTimer()
         if serverDesired {
-            startServer()
+            lifecycle.setDesiredState(.enabled, for: .mcpServer)
+        }
+        if tunnelDesired {
+            lifecycle.setDesiredState(.enabled, for: .remoteConnector)
         }
     }
 
     func reportStartupFailure(_ error: Error) {
-        snapshot.server = .failed
-        fail("Configuration startup failed: \(error.localizedDescription)")
+        let message = "Configuration startup failed: \(error.localizedDescription)"
+        lifecycle.markStructuralFailure(for: .mcpServer, reason: message)
+        appLog.write("ERROR: \(message)")
     }
 
     func startServerRequested() {
@@ -96,10 +116,8 @@ final class ProcessSupervisor {
     }
 
     func stopServerRequested() {
-        serverDesired = false
-        tunnelDesired = false
-        stopTunnel()
-        stopServer()
+        lifecycle.setDesiredState(.disabled, for: .remoteConnector)
+        lifecycle.setDesiredState(.disabled, for: .mcpServer)
         Task { @MainActor [weak self] in
             await self?.updateConfiguration { configuration in
                 configuration.process.serverDesired = false
@@ -120,8 +138,7 @@ final class ProcessSupervisor {
     }
 
     func disableConnectorRequested() {
-        tunnelDesired = false
-        stopTunnel()
+        lifecycle.setDesiredState(.disabled, for: .remoteConnector)
         Task { @MainActor [weak self] in
             await self?.updateConfiguration { configuration in
                 configuration.process.tunnelDesired = false
@@ -144,10 +161,8 @@ final class ProcessSupervisor {
 
     func stopForQuit() {
         quitting = true
-        restartWorkItem?.cancel()
         healthTimer?.invalidate()
-        stopTunnel()
-        stopServer()
+        lifecycle.prepareForMaintenance()
         appLog.write("Supervisor quit cleanly")
     }
 
@@ -160,8 +175,30 @@ final class ProcessSupervisor {
             } catch {
                 self.fail("Configuration reload failed: \(error.localizedDescription)")
             }
+            self.lifecycle.handleWake()
             self.checkHealth()
         }
+    }
+
+    func handleNetworkAvailabilityChanged(_ available: Bool) {
+        lifecycle.handleNetworkAvailabilityChanged(available)
+    }
+
+    func prepareForMaintenance() {
+        lifecycle.prepareForMaintenance()
+    }
+
+    func retry(component: ManagedComponentID) {
+        if component == .mcpServer {
+            invalidateServerActivation()
+        } else {
+            snapshot.connectorURL = nil
+        }
+        lifecycle.retry(component: component)
+    }
+
+    func reset(component: ManagedComponentID) {
+        retry(component: component)
     }
 
     func openLogs() {
@@ -191,7 +228,12 @@ final class ProcessSupervisor {
     ) {
         guard let current = activeContract else {
             install(replacement, requiresClientRefresh: false)
-            if serverDesired { startServer() }
+            if serverDesired {
+                lifecycle.setDesiredState(.enabled, for: .mcpServer)
+            }
+            if tunnelDesired {
+                lifecycle.setDesiredState(.enabled, for: .remoteConnector)
+            }
             return
         }
 
@@ -200,74 +242,105 @@ final class ProcessSupervisor {
             replacement: replacement
         )
         if forceRestart || transition.requiresRestart {
-            restartWorkItem?.cancel()
-            stopTunnel()
-            stopServer()
+            lifecycle.prepareForMaintenance()
             install(
                 replacement,
-                requiresClientRefresh: transition.requiresClientRefresh
+                requiresClientRefresh: transition.requiresClientRefresh,
+                resetFailureHistory: true
             )
             activationSucceeded = false
             activationInFlight = false
-            serverFailures.removeAll()
-            tunnelFailures.removeAll()
-            serverRetryNotBefore = .distantPast
-            tunnelRetryNotBefore = .distantPast
-            if serverDesired { startServer() }
+            lifecycle.resumeAfterMaintenance()
             return
         }
 
         install(replacement, requiresClientRefresh: false)
         if !serverDesired {
-            stopTunnel()
-            stopServer()
+            stopTunnelProcess()
+            stopServerProcess()
         } else if serverProcess == nil {
-            startServer()
+            lifecycle.setDesiredState(.enabled, for: .mcpServer)
         }
         if !tunnelDesired {
-            stopTunnel()
-        } else if snapshot.server == .running {
-            startTunnel()
+            stopTunnelProcess()
+        } else if lifecycle.snapshot.mcpServer.isReady {
+            lifecycle.setDesiredState(.enabled, for: .remoteConnector)
         }
+        lifecycle.reconcile()
     }
 
     private func install(
         _ contract: ManagedRuntimeLaunchContract,
-        requiresClientRefresh: Bool
+        requiresClientRefresh: Bool,
+        resetFailureHistory: Bool = false
     ) {
+        invalidateServerActivation()
         activeContract = contract
         ownerID = contract.configuration.ownerID
-        serverDesired = contract.configuration.process.serverDesired
-        tunnelDesired = contract.configuration.process.tunnelDesired
+        lifecycle.synchronizeDesiredStates(
+            mcpServer: contract.configuration.process.serverDesired,
+            remoteConnector: contract.configuration.process.tunnelDesired,
+            resetFailureHistory: resetFailureHistory
+        )
         snapshot.applyRuntimeContract(
             contract,
             requiresClientRefresh: requiresClientRefresh
         )
-        snapshot.error = nil
+        applyLifecycleSnapshot(lifecycle.snapshot)
         appLog.redact(contract.redactedSecrets)
         serverLog.redact(contract.redactedSecrets)
         tunnelLog.redact(contract.redactedSecrets)
     }
 
+    private func applyLifecycleSnapshot(_ lifecycleSnapshot: LifecycleSnapshot) {
+        var projection = snapshot.projected(from: lifecycleSnapshot)
+        if lifecycleSnapshot.remoteConnector.lifecycle != .ready {
+            projection.connectorURL = nil
+        }
+        snapshot = projection
+    }
+
+    private func handleLifecycleEffect(_ effect: LifecycleEffect) {
+        switch effect {
+        case .start(.mcpServer):
+            startServer()
+        case .start(.remoteConnector):
+            startTunnel()
+        case .stop(.mcpServer):
+            stopServerProcess()
+        case .stop(.remoteConnector):
+            stopTunnelProcess()
+        case .revalidate(.remoteConnector):
+            queryTunnelURL()
+        case .revalidate(.mcpServer):
+            checkHealth()
+        }
+    }
+
     private func startServer() {
-        guard !quitting, serverDesired, serverProcess == nil,
-              Date() >= serverRetryNotBefore,
+        guard !quitting, !lifecycle.isQuiescing, serverDesired, serverProcess == nil,
               let contract = activeContract else { return }
+        beginServerLaunch()
+        lifecycle.markStarting(for: .mcpServer)
         let python = runtimeDirectory.appendingPathComponent(".venv/bin/python")
         let script = runtimeDirectory.appendingPathComponent("automac_mcp.py")
         guard FileManager.default.isExecutableFile(atPath: python.path),
               FileManager.default.fileExists(atPath: script.path) else {
-            fail("Installed Python runtime is missing. Run the terminal bootstrap again.")
+            lifecycle.markFailed(
+                for: .mcpServer,
+                reason: "Installed Python runtime is missing. Run the terminal bootstrap again."
+            )
             return
         }
-        if portIsOccupied(contract.port) {
-            fail("Port \(contract.port) is already used by another process. Mac Orchestrator did not terminate it.")
-            scheduleRestart(component: "server", status: EADDRINUSE)
+        if PortSafetyPolicy.decision(isOccupied: portIsOccupied(contract.port)) ==
+            .refuseWithoutTermination {
+            lifecycle.recordFailure(
+                for: .mcpServer,
+                reason: "Port \(contract.port) is already used by another process. Mac Orchestrator did not terminate it."
+            )
             return
         }
 
-        snapshot.server = .starting
-        snapshot.error = nil
         activationSucceeded = false
         activationInFlight = false
         let process = Process()
@@ -288,12 +361,16 @@ final class ProcessSupervisor {
                 guard let self,
                       let process = self.serverProcess,
                       ObjectIdentifier(process) == processID else { return }
+                self.invalidateServerActivation()
                 self.serverProcess = nil
                 self.persistState()
-                self.snapshot.server = self.serverDesired ? .failed : .stopped
-                self.stopTunnel()
                 if !self.quitting && self.serverDesired {
-                    self.scheduleRestart(component: "server", status: terminationStatus)
+                    self.lifecycle.recordFailure(
+                        for: .mcpServer,
+                        reason: "MCP server exited with status \(terminationStatus)."
+                    )
+                } else {
+                    self.lifecycle.markStopped(for: .mcpServer)
                 }
             }
         }
@@ -301,31 +378,43 @@ final class ProcessSupervisor {
             try process.run()
             serverProcess = process
             persistState()
+            lifecycle.markProcessRunning(for: .mcpServer)
             appLog.write("Started owned server pid=\(process.processIdentifier)")
         } catch {
             serverProcess = nil
-            fail("Could not start Python server: \(error.localizedDescription)")
-            scheduleRestart(component: "server", status: -1)
+            lifecycle.recordFailure(
+                for: .mcpServer,
+                reason: "Could not start Python server: \(error.localizedDescription)"
+            )
         }
     }
 
     private func startTunnel() {
-        guard !quitting, tunnelDesired, snapshot.server == .running, tunnelProcess == nil,
-              Date() >= tunnelRetryNotBefore,
+        guard !quitting, !lifecycle.isQuiescing, tunnelDesired,
+              lifecycle.snapshot.mcpServer.isReady, tunnelProcess == nil,
               let contract = activeContract else { return }
+        lifecycle.markStarting(for: .remoteConnector)
         guard FileManager.default.isExecutableFile(atPath: ngrokBinaryURL.path) else {
-            fail("Installed ngrok agent is missing. Run the terminal bootstrap again.")
+            lifecycle.markFailed(
+                for: .remoteConnector,
+                reason: "Installed ngrok agent is missing. Run the terminal bootstrap again."
+            )
             return
         }
         guard FileManager.default.fileExists(atPath: ngrokConfigURL.path) else {
-            fail("Installed ngrok configuration is missing. Run the terminal bootstrap again.")
+            lifecycle.markFailed(
+                for: .remoteConnector,
+                reason: "Installed ngrok configuration is missing. Run the terminal bootstrap again."
+            )
             return
         }
         guard contract.ngrokAuthtoken != nil else {
-            fail("ngrok authentication is not configured. Store an authtoken before enabling remote access.")
+            lifecycle.markFailed(
+                for: .remoteConnector,
+                reason: "ngrok authentication is not configured. Store an authtoken before enabling remote access."
+            )
             return
         }
-        snapshot.tunnel = .starting
         snapshot.connectorURL = nil
         let process = Process()
         process.executableURL = ngrokBinaryURL
@@ -354,9 +443,13 @@ final class ProcessSupervisor {
                 self.tunnelProcess = nil
                 self.persistState()
                 self.snapshot.connectorURL = nil
-                self.snapshot.tunnel = self.tunnelDesired ? .failed : .stopped
                 if !self.quitting && self.tunnelDesired && self.serverDesired {
-                    self.scheduleRestart(component: "tunnel", status: terminationStatus)
+                    self.lifecycle.recordFailure(
+                        for: .remoteConnector,
+                        reason: "Remote connector exited with status \(terminationStatus)."
+                    )
+                } else {
+                    self.lifecycle.markStopped(for: .remoteConnector)
                 }
             }
         }
@@ -365,41 +458,40 @@ final class ProcessSupervisor {
             _ = setpgid(process.processIdentifier, process.processIdentifier)
             tunnelProcess = process
             persistState()
+            lifecycle.markProcessRunning(for: .remoteConnector)
             appLog.write("Started owned tunnel pid=\(process.processIdentifier)")
         } catch {
             tunnelProcess = nil
-            fail("Could not start ngrok: \(error.localizedDescription)")
-            scheduleRestart(component: "tunnel", status: -1)
+            lifecycle.recordFailure(
+                for: .remoteConnector,
+                reason: "Could not start ngrok: \(error.localizedDescription)"
+            )
         }
     }
 
-    private func stopServer() {
-        restartWorkItem?.cancel()
-        activationSucceeded = false
-        activationInFlight = false
+    private func stopServerProcess() {
+        invalidateServerActivation()
         guard let process = serverProcess else {
-            snapshot.server = .stopped
+            lifecycle.markStopped(for: .mcpServer)
             return
         }
-        snapshot.server = .stopping
         terminateOwned(process, group: true, label: "server")
         serverProcess = nil
         persistState()
-        snapshot.server = .stopped
+        lifecycle.markStopped(for: .mcpServer)
     }
 
-    private func stopTunnel() {
+    private func stopTunnelProcess() {
         guard let process = tunnelProcess else {
-            snapshot.tunnel = .stopped
             snapshot.connectorURL = nil
+            lifecycle.markStopped(for: .remoteConnector)
             return
         }
-        snapshot.tunnel = .stopping
         snapshot.connectorURL = nil
         terminateOwned(process, group: true, label: "tunnel")
         tunnelProcess = nil
         persistState()
-        snapshot.tunnel = .stopped
+        lifecycle.markStopped(for: .remoteConnector)
     }
 
     private func terminateOwned(_ process: Process, group: Bool, label: String) {
@@ -435,28 +527,29 @@ final class ProcessSupervisor {
             if self.activationSucceeded {
                 checkLightweightHealth(
                     processID: ObjectIdentifier(process),
-                    healthURL: contract.healthURL
+                    healthURL: contract.healthURL,
+                    launchGeneration: serverLaunchGeneration
                 )
-                if snapshot.server != .running {
-                    snapshot.server = .running
-                    serverRetryNotBefore = .distantPast
-                }
-                if tunnelDesired { startTunnel() }
             } else if !activationInFlight {
                 guard let connectorToken = contract.environment["MAC_ORCHESTRATOR_CONNECTOR_TOKEN"],
                       !connectorToken.isEmpty else {
-                    fail("The managed connector token is unavailable; activation is blocked.")
+                    lifecycle.markFailed(
+                        for: .mcpServer,
+                        reason: "The managed connector token is unavailable; activation is blocked.",
+                        liveness: .running
+                    )
                     return
                 }
                 activationInFlight = true
                 runActivationProbe(
                     processID: ObjectIdentifier(process),
                     port: contract.port,
-                    capabilityToken: connectorToken
+                    capabilityToken: connectorToken,
+                    launchGeneration: serverLaunchGeneration
                 )
             }
         } else if serverDesired && !quitting {
-            startServer()
+            lifecycle.reconcile()
         }
 
         if let process = tunnelProcess, process.isRunning {
@@ -464,22 +557,33 @@ final class ProcessSupervisor {
         }
     }
 
-    private func checkLightweightHealth(processID: ObjectIdentifier, healthURL: URL) {
+    private func checkLightweightHealth(
+        processID: ObjectIdentifier,
+        healthURL: URL,
+        launchGeneration: UInt64
+    ) {
         var request = URLRequest(url: healthURL)
         request.timeoutInterval = 1
         NoRedirectURLSession.make().dataTask(with: request) { [weak self, processID] data, response, _ in
             Task { @MainActor [weak self, processID] in
                 guard let self,
                       let current = self.serverProcess,
-                      ObjectIdentifier(current) == processID else { return }
+                      current.isRunning,
+                      ObjectIdentifier(current) == processID,
+                      self.serverLaunchGeneration == launchGeneration,
+                      self.serverDesired,
+                      !self.quitting,
+                      !self.lifecycle.isQuiescing else { return }
                 let expectedBody = Data(#"{"status":"ok"}"#.utf8)
                 let isHealthy = (response as? HTTPURLResponse)?.statusCode == 200 &&
                     (response as? HTTPURLResponse)?.url == healthURL &&
                     data == expectedBody
                 guard !isHealthy else { return }
                 self.activationSucceeded = false
-                self.snapshot.server = .starting
-                self.stopTunnel()
+                self.lifecycle.markDegraded(
+                    for: .mcpServer,
+                    reason: "Server health check failed after activation."
+                )
                 self.appLog.write("Server health check failed after activation")
             }
         }.resume()
@@ -488,45 +592,89 @@ final class ProcessSupervisor {
     private func runActivationProbe(
         processID: ObjectIdentifier,
         port: Int,
-        capabilityToken: String
+        capabilityToken: String,
+        launchGeneration: UInt64
     ) {
-        Task { @MainActor [weak self, processID] in
+        Task { @MainActor [weak self, processID, launchGeneration] in
             guard let self else { return }
+            guard self.isCurrentServerActivation(
+                processID: processID,
+                launchGeneration: launchGeneration
+            ) else { return }
             do {
                 try await LocalActivationProbe().run(
                     port: port,
                     capabilityToken: capabilityToken,
                     requiresInteractiveUI: self.activeContract?.capabilitySnapshot.capabilities["mac.ui"]?.desired == true
                 )
-                guard let process = self.serverProcess,
-                      process.isRunning,
-                      ObjectIdentifier(process) == processID else {
-                    self.activationInFlight = false
-                    return
-                }
+                guard self.isCurrentServerActivation(
+                    processID: processID,
+                    launchGeneration: launchGeneration
+                ) else { return }
                 do {
+                    guard self.isCurrentServerActivation(
+                        processID: processID,
+                        launchGeneration: launchGeneration
+                    ) else { return }
                     try await self.runtimeCoordinator.markPhase2Completed()
                 } catch {
+                    guard self.isCurrentServerActivation(
+                        processID: processID,
+                        launchGeneration: launchGeneration
+                    ) else { return }
                     self.activationInFlight = false
-                    self.fail("Activation succeeded but onboarding state could not be saved: \(error.localizedDescription)")
+                    self.lifecycle.markDegraded(
+                        for: .mcpServer,
+                        reason: "Activation succeeded but onboarding state could not be saved: \(error.localizedDescription)"
+                    )
                     return
                 }
+                guard self.isCurrentServerActivation(
+                    processID: processID,
+                    launchGeneration: launchGeneration
+                ) else { return }
                 self.activationInFlight = false
                 self.activationSucceeded = true
-                self.snapshot.server = .running
-                self.snapshot.error = nil
-                self.serverRetryNotBefore = .distantPast
+                self.lifecycle.markReady(for: .mcpServer)
                 self.appLog.write("Server activation probe passed")
-                if self.tunnelDesired { self.startTunnel() }
             } catch {
+                guard self.isCurrentServerActivation(
+                    processID: processID,
+                    launchGeneration: launchGeneration
+                ) else { return }
                 self.activationInFlight = false
-                guard let process = self.serverProcess,
-                      process.isRunning,
-                      ObjectIdentifier(process) == processID else { return }
-                self.snapshot.server = .starting
+                self.lifecycle.markStarting(for: .mcpServer, liveness: .running)
                 self.appLog.write("Server activation probe pending: \(error.localizedDescription)")
             }
         }
+    }
+
+    private func isCurrentServerActivation(
+        processID: ObjectIdentifier,
+        launchGeneration: UInt64
+    ) -> Bool {
+        guard !quitting,
+              !lifecycle.isQuiescing,
+              serverDesired,
+              serverLaunchGeneration == launchGeneration,
+              let process = serverProcess,
+              process.isRunning,
+              ObjectIdentifier(process) == processID else { return false }
+        return true
+    }
+
+    @discardableResult
+    private func beginServerLaunch() -> UInt64 {
+        serverLaunchGeneration &+= 1
+        activationSucceeded = false
+        activationInFlight = false
+        return serverLaunchGeneration
+    }
+
+    private func invalidateServerActivation() {
+        serverLaunchGeneration &+= 1
+        activationSucceeded = false
+        activationInFlight = false
     }
 
     private func queryTunnelURL() {
@@ -536,8 +684,10 @@ final class ProcessSupervisor {
         guard let contract = activeContract,
               let connectorToken = contract.environment["MAC_ORCHESTRATOR_CONNECTOR_TOKEN"] else {
             snapshot.connectorURL = nil
-            snapshot.tunnel = .reconnecting
-            snapshot.error = "Remote connector identity is unavailable."
+            lifecycle.markDegraded(
+                for: .remoteConnector,
+                reason: "Remote connector identity is unavailable."
+            )
             return
         }
         let processID = ObjectIdentifier(process)
@@ -556,55 +706,19 @@ final class ProcessSupervisor {
                     // evidence. Clear it until the owned tunnel is confirmed
                     // again by the Agent API.
                     self.snapshot.connectorURL = nil
-                    self.snapshot.tunnel = .reconnecting
-                    self.snapshot.error = "Remote connector endpoint is not currently confirmed."
+                    self.lifecycle.markDegraded(
+                        for: .remoteConnector,
+                        reason: "Remote connector endpoint is not currently confirmed."
+                    )
                     return
                 }
                 self.snapshot.connectorURL = ConnectorURLBuilder.make(
                     publicURL: base.absoluteString,
                     capabilityToken: connectorToken
                 )
-                self.snapshot.tunnel = .running
-                self.snapshot.error = nil
-                self.tunnelRetryNotBefore = .distantPast
+                self.lifecycle.markReady(for: .remoteConnector)
             }
         }.resume()
-    }
-
-    private func scheduleRestart(component: String, status: Int32) {
-        let now = Date()
-        let supervisorComponent: SupervisorComponent = component == "server" ? .server : .tunnel
-        let existingFailures = supervisorComponent == .server ? serverFailures : tunnelFailures
-        let decision = SupervisorRetryPolicy.decision(failures: existingFailures, now: now)
-
-        switch (supervisorComponent, decision) {
-        case let (.server, .circuitOpen(failures)):
-            serverFailures = failures
-            serverRetryNotBefore = .distantFuture
-            fail("Server stopped repeatedly (last exit \(status)). Use Restart after checking logs.")
-            return
-        case let (.tunnel, .circuitOpen(failures)):
-            tunnelFailures = failures
-            tunnelRetryNotBefore = .distantFuture
-            fail("Tunnel stopped repeatedly (last exit \(status)). Check ngrok credentials and logs.")
-            return
-        case let (.server, .retry(failures, delay)):
-            serverFailures = failures
-            serverRetryNotBefore = now.addingTimeInterval(delay)
-        case let (.tunnel, .retry(failures, delay)):
-            tunnelFailures = failures
-            tunnelRetryNotBefore = now.addingTimeInterval(delay)
-        }
-
-        guard case let .retry(_, delay) = decision else { return }
-        appLog.write("\(component) exited status=\(status); restart in \(Int(delay))s")
-        restartWorkItem?.cancel()
-        let item = DispatchWorkItem { [weak self] in
-            guard let self, !self.quitting else { return }
-            component == "server" ? self.startServer() : self.startTunnel()
-        }
-        restartWorkItem = item
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
     }
 
     private func fail(_ message: String) {
@@ -691,12 +805,14 @@ final class ProcessSupervisor {
         component: SupervisorComponent,
         label: String
     ) {
-        guard kill(pid, 0) == 0,
-              ProcessOwnership.matches(
-                  commandLine: commandLine(for: pid),
-                  component: component,
-                  ownerID: ownerID
-              ) else { return }
+        let pidExists = kill(pid, 0) == 0
+        let observedCommandLine = pidExists ? commandLine(for: pid) : ""
+        guard ProcessOwnership.authorizesTermination(
+            pidExists: pidExists,
+            commandLine: observedCommandLine,
+            component: component,
+            ownerID: ownerID
+        ) else { return }
         appLog.write("Cleaning \(label) pid=\(pid)")
         _ = kill(-pid, SIGTERM)
         let deadline = Date().addingTimeInterval(3)

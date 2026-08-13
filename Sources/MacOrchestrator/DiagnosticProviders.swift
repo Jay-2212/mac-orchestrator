@@ -760,44 +760,32 @@ enum DiagnosticPathSafety {
 
 enum VerifiedMacOSSystemAlias {
     static func isAllowed(_ url: URL) -> Bool {
+        let path = url.standardizedFileURL.path
         let visiblePath: String
-        let resolvedPath: String
-        switch url.path {
+        let targetPath: String
+        switch path {
         case "/var", "/private/var":
             visiblePath = "/var"
-            resolvedPath = "/private/var"
+            targetPath = "/private/var"
         case "/tmp", "/private/tmp":
             visiblePath = "/tmp"
-            resolvedPath = "/private/tmp"
+            targetPath = "/private/tmp"
         default:
-            let candidates = Set([
-                url.path,
-                url.standardizedFileURL.path,
-                url.resolvingSymlinksInPath().standardizedFileURL.path
-            ])
-            if candidates.contains("/var") || candidates.contains("/private/var") {
-                visiblePath = "/var"
-                resolvedPath = "/private/var"
-            } else if candidates.contains("/tmp") || candidates.contains("/private/tmp") {
-                visiblePath = "/tmp"
-                resolvedPath = "/private/tmp"
-            } else {
-                return false
-            }
+            return false
         }
 
         var metadata = stat()
         guard lstat(url.path, &metadata) == 0 else { return false }
         let mode = UInt32(metadata.st_mode) & UInt32(S_IFMT)
         if mode == UInt32(S_IFLNK) {
-            return url.resolvingSymlinksInPath().standardizedFileURL.path == resolvedPath
+            guard let destination = try? FileManager.default.destinationOfSymbolicLink(atPath: url.path),
+                  destination == targetPath || destination == String(targetPath.dropFirst()) else {
+                return false
+            }
+            var targetMetadata = stat()
+            return lstat(targetPath, &targetMetadata) == 0
+                && UInt32(targetMetadata.st_mode) & UInt32(S_IFMT) == UInt32(S_IFDIR)
         }
-        let candidates = Set([
-            url.path,
-            url.standardizedFileURL.path,
-            url.resolvingSymlinksInPath().standardizedFileURL.path
-        ])
-        return mode == UInt32(S_IFDIR)
-            && (candidates.contains(visiblePath) || candidates.contains(resolvedPath))
+        return mode == UInt32(S_IFDIR) && (path == visiblePath || path == targetPath)
     }
 }

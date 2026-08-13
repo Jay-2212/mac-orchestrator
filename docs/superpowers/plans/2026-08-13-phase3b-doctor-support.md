@@ -37,6 +37,8 @@
   task.
 - `DoctorReport` exposes `reportSchemaVersion`, `generatedAt`, `results`, and
   `summary`; its encoded form uses sorted keys and ISO-8601 dates.
+- `DoctorReport` exposes `encodedJSON() throws -> Data`; tests may use a private
+  result lookup helper rather than requiring a presentation-layer API.
 - `RepairActionID` includes exactly the current bounded identifiers
   `retryMCPServer`, `retryRemoteConnector`, `openAccessibilitySettings`,
   `openScreenRecordingSettings`, `openAutomationSettings`,
@@ -497,6 +499,9 @@ git commit -m "feat: add bounded doctor repairs"
 **Interfaces:**
 - `SupportBundlePlan`, `SupportBundleEntryPlan`, and
   `SupportBundleRedactionSummary` are Codable/Equatable/Sendable.
+- `SupportBundlePlan.selecting(logicalIDs:)` derives a subset of the preview's
+  logical entries while preserving the plan identifier and selection metadata;
+  creation accepts only the engine-issued preview or a validated subset of it.
 - `SupportBundleSourceDescribing` provides logical metadata and approximate
   size without collecting content; `SupportBundleSourceCollecting` collects
   only a requested logical ID during creation.
@@ -511,12 +516,13 @@ git commit -m "feat: add bounded doctor repairs"
 func testPreviewDescribesEntriesWithoutCollectingOrCreatingArchive() throws {
     let source = RecordingBundleSource(entries: [.doctorReport, .logs])
     let engine = SupportBundleEngine(sources: [source], clock: FixedClock())
+    let archiveURL = temporaryArchiveURL()
 
     let plan = engine.preview()
 
     XCTAssertEqual(source.collectCalls, [])
     XCTAssertEqual(plan.entries.map(\.logicalID), ["doctor-report", "logs"])
-    XCTAssertFalse(FileManager.default.fileExists(atPath: engine.previewArchiveURL.path))
+    XCTAssertFalse(FileManager.default.fileExists(atPath: archiveURL.path))
 }
 
 func testCreationUsesExactlyTheApprovedPlan() throws {

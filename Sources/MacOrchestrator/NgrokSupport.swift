@@ -27,6 +27,10 @@ enum NgrokEndpointParser {
         (try? JSONDecoder().decode(NgrokEndpointResponse.self, from: data)) != nil
     }
 
+    static func endpoints(from data: Data) -> [NgrokEndpoint]? {
+        try? JSONDecoder().decode(NgrokEndpointResponse.self, from: data).endpoints
+    }
+
     static func hasLiveHTTPS(from data: Data) -> Bool {
         guard let response = try? JSONDecoder().decode(NgrokEndpointResponse.self, from: data) else {
             return false
@@ -44,12 +48,19 @@ enum NgrokEndpointParser {
         guard let response = try? JSONDecoder().decode(NgrokEndpointResponse.self, from: data) else {
             return .invalidAgentAPIResponse
         }
-        guard !response.endpoints.isEmpty else {
+        return reconcile(endpoints: response.endpoints, matching: target)
+    }
+
+    static func reconcile(
+        endpoints: [NgrokEndpoint],
+        matching target: String
+    ) -> RemoteEndpointReconciliation {
+        guard !endpoints.isEmpty else {
             return .missing
         }
 
         let normalizedTarget = normalizedAddress(target)
-        let matching = response.endpoints.filter { endpoint in
+        let matching = endpoints.filter { endpoint in
             normalizedAddress(endpoint.upstream.url) == normalizedTarget
         }
         guard !matching.isEmpty else {

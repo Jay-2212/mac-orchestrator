@@ -4,11 +4,11 @@ import XCTest
 
 final class SupportBundleTests: XCTestCase {
     func testPreviewDescribesEntriesWithoutCollectingOrCreatingArchive() throws {
-        let source = RecordingBundleSource(entries: [.doctorReport, .logs])
+        let source = RecordingBundleSource(entries: [RecordingBundleSource.doctorReport, RecordingBundleSource.logs])
         let writer = RecordingArchiveWriter()
         let engine = SupportBundleEngine(
             sources: [source],
-            clock: FixedSupportBundleClock(date: Date(timeIntervalSince1970: 1_700_000_000)),
+            clock: FixedSupportBundleClock(now: Date(timeIntervalSince1970: 1_700_000_000)),
             archiveWriter: writer
         )
         let archiveURL = temporaryArchiveURL()
@@ -45,10 +45,10 @@ final class SupportBundleTests: XCTestCase {
     }
 
     func testCreationUsesExactlyTheApprovedPlan() throws {
-        let source = RecordingBundleSource(entries: [.doctorReport, .logs, .config])
+        let source = RecordingBundleSource(entries: [RecordingBundleSource.doctorReport, RecordingBundleSource.logs, RecordingBundleSource.config])
         let engine = SupportBundleEngine(
             sources: [source],
-            clock: FixedSupportBundleClock(date: Date(timeIntervalSince1970: 1_700_000_000)),
+            clock: FixedSupportBundleClock(now: Date(timeIntervalSince1970: 1_700_000_000)),
             redactor: SensitiveDataRedactor(exactSecrets: [], homeDirectory: "/Users/synthetic")
         )
         let plan = engine.preview()
@@ -63,7 +63,7 @@ final class SupportBundleTests: XCTestCase {
     }
 
     func testNormalTemporaryArchiveCreationAllowsVerifiedMacOSTemporaryAlias() throws {
-        let source = RecordingBundleSource(entries: [.doctorReport])
+        let source = RecordingBundleSource(entries: [RecordingBundleSource.doctorReport])
         let engine = SupportBundleEngine(sources: [source])
         let archive = temporaryArchiveURL()
         defer { try? FileManager.default.removeItem(at: archive) }
@@ -74,7 +74,7 @@ final class SupportBundleTests: XCTestCase {
     }
 
     func testAlteredAndUnknownPlansAreRejectedBeforeCollection() throws {
-        let source = RecordingBundleSource(entries: [.doctorReport])
+        let source = RecordingBundleSource(entries: [RecordingBundleSource.doctorReport])
         let engine = SupportBundleEngine(sources: [source])
         let plan = engine.preview()
 
@@ -108,7 +108,7 @@ final class SupportBundleTests: XCTestCase {
     }
 
     func testUnknownSelectionAndRepeatedPreviewsAreRejectedOrIndependent() throws {
-        let source = RecordingBundleSource(entries: [.doctorReport])
+        let source = RecordingBundleSource(entries: [RecordingBundleSource.doctorReport])
         let engine = SupportBundleEngine(sources: [source])
 
         let first = engine.preview()
@@ -156,7 +156,7 @@ final class SupportBundleTests: XCTestCase {
     }
 
     func testSensitiveEntryIsNotCollectedEvenWhenSelectedByPublishedID() throws {
-        let source = RecordingBundleSource(entries: [.doctorReport, .credential, .telegramBotToken])
+        let source = RecordingBundleSource(entries: [RecordingBundleSource.doctorReport, RecordingBundleSource.credential, RecordingBundleSource.telegramBotToken])
         let engine = SupportBundleEngine(sources: [source])
         let plan = engine.preview()
 
@@ -274,7 +274,7 @@ final class SupportBundleTests: XCTestCase {
         try FileManager.default.createDirectory(at: destinationTarget, withIntermediateDirectories: false)
         let destinationLink = root.appendingPathComponent("destination-link", isDirectory: true)
         try FileManager.default.createSymbolicLink(at: destinationLink, withDestinationURL: destinationTarget)
-        let destinationEngine = SupportBundleEngine(sources: [RecordingBundleSource(entries: [.doctorReport])])
+        let destinationEngine = SupportBundleEngine(sources: [RecordingBundleSource(entries: [RecordingBundleSource.doctorReport])])
         XCTAssertThrowsError(try destinationEngine.create(
             plan: destinationEngine.preview(),
             to: destinationLink.appendingPathComponent("bundle.zip")
@@ -370,7 +370,7 @@ final class SupportBundleTests: XCTestCase {
     }
 
     func testPreviewDoesNotCollectSensitiveCategoriesOrCreateArchive() {
-        let source = RecordingBundleSource(entries: [.doctorReport, .credential])
+        let source = RecordingBundleSource(entries: [RecordingBundleSource.doctorReport, RecordingBundleSource.credential])
         let engine = SupportBundleEngine(sources: [source])
         let plan = engine.preview()
 

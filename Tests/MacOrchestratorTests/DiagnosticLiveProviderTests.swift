@@ -455,6 +455,82 @@ final class DiagnosticLiveProviderTests: XCTestCase {
         XCTAssertNil(facts.tunnelPID)
     }
 
+    func testLifecycleOwnershipMarkerRequiresMatchingStateOwner() throws {
+        let fixture = try makeLifecycleFixture()
+        try JSONEncoder().encode(OwnedProcessState(ownerID: "owner-2", serverPID: 42, tunnelPID: nil))
+            .write(to: fixture.paths.ownedProcessesURL)
+        try writeSupportedLaunchAgent(to: fixture.paths.launchAgentURL, helper: fixture.paths.helperExecutableURL)
+        let provider = ReadOnlyLifecycleFactsProvider(
+            paths: fixture.paths,
+            ownerID: "owner-1",
+            commandRunner: launchctlRunner(),
+            processRunner: RecordingDiagnosticProcessRunner(processes: [
+                DiagnosticProcessRecord(
+                    pid: 42,
+                    commandLine: "python automac_mcp.py --managed-owner owner-1",
+                    running: true
+                )
+            ])
+        )
+
+        let facts = try provider.inspect()
+
+        XCTAssertFalse(facts.ownershipMarkerPresent)
+    }
+
+    func testLifecycleOwnershipMarkerRequiresLiveProcessesForRecordedPIDs() throws {
+        let fixture = try makeLifecycleFixture()
+        try JSONEncoder().encode(OwnedProcessState(ownerID: "owner-1", serverPID: 42, tunnelPID: nil))
+            .write(to: fixture.paths.ownedProcessesURL)
+        try writeSupportedLaunchAgent(to: fixture.paths.launchAgentURL, helper: fixture.paths.helperExecutableURL)
+        let provider = ReadOnlyLifecycleFactsProvider(
+            paths: fixture.paths,
+            ownerID: "owner-1",
+            commandRunner: launchctlRunner(),
+            processRunner: RecordingDiagnosticProcessRunner(processes: [
+                DiagnosticProcessRecord(
+                    pid: 43,
+                    commandLine: "python automac_mcp.py --managed-owner owner-1",
+                    running: true
+                )
+            ])
+        )
+
+        let facts = try provider.inspect()
+
+        XCTAssertFalse(facts.ownershipMarkerPresent)
+    }
+
+    func testLifecycleOwnershipMarkerAcceptsCompleteUnambiguousOwnedState() throws {
+        let fixture = try makeLifecycleFixture()
+        try JSONEncoder().encode(OwnedProcessState(ownerID: "owner-1", serverPID: 42, tunnelPID: 43))
+            .write(to: fixture.paths.ownedProcessesURL)
+        try writeSupportedLaunchAgent(to: fixture.paths.launchAgentURL, helper: fixture.paths.helperExecutableURL)
+        let provider = ReadOnlyLifecycleFactsProvider(
+            paths: fixture.paths,
+            ownerID: "owner-1",
+            commandRunner: launchctlRunner(),
+            processRunner: RecordingDiagnosticProcessRunner(processes: [
+                DiagnosticProcessRecord(
+                    pid: 42,
+                    commandLine: "python automac_mcp.py --managed-owner owner-1",
+                    running: true
+                ),
+                DiagnosticProcessRecord(
+                    pid: 43,
+                    commandLine: "ngrok http --metadata mac-orchestrator-owner=owner-1",
+                    running: true
+                ),
+            ])
+        )
+
+        let facts = try provider.inspect()
+
+        XCTAssertTrue(facts.ownershipMarkerPresent)
+        XCTAssertFalse(facts.pidReuseDetected)
+        XCTAssertFalse(facts.duplicateOwnedProcesses)
+    }
+
     func testLifecycleRejectsMarkerWithoutOwnedProcessRecord() throws {
         let fixture = try makeLifecycleFixture()
         try writeSupportedLaunchAgent(to: fixture.paths.launchAgentURL, helper: fixture.paths.helperExecutableURL)
@@ -679,6 +755,40 @@ final class DiagnosticLiveProviderTests: XCTestCase {
         ).inspect()
 
         XCTAssertFalse(facts.helperPresent)
+        XCTAssertFalse(facts.runtime.runtimePresent)
+        XCTAssertFalse(facts.runtime.structurallyValid)
+    }
+
+    func testInstalledReleaseProviderRejectsZeroByteExecutableHelper() throws {
+        let fixture = try makeReleaseFixture()
+        try Data().write(to: fixture.paths.helperExecutableURL)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: fixture.paths.helperExecutableURL.path
+        )
+
+        let facts = try ReadOnlyInstalledReleaseFactsProvider(
+            paths: fixture.paths,
+            commandRunner: releaseCommandRunner(paths: fixture.paths)
+        ).inspect()
+
+        XCTAssertFalse(facts.helperPresent)
+        XCTAssertFalse(facts.runtime.structurallyValid)
+    }
+
+    func testInstalledReleaseProviderRejectsZeroByteExecutableRuntime() throws {
+        let fixture = try makeReleaseFixture()
+        try Data().write(to: fixture.paths.runtimePythonURL)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: fixture.paths.runtimePythonURL.path
+        )
+
+        let facts = try ReadOnlyInstalledReleaseFactsProvider(
+            paths: fixture.paths,
+            commandRunner: releaseCommandRunner(paths: fixture.paths)
+        ).inspect()
+
         XCTAssertFalse(facts.runtime.runtimePresent)
         XCTAssertFalse(facts.runtime.structurallyValid)
     }

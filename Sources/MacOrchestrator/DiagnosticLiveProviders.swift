@@ -511,7 +511,7 @@ struct ReadOnlyInstalledReleaseFactsProvider: InstalledReleaseFactsProviding {
     }
 
     private func isExecutableRegularFile(at url: URL) -> Bool {
-        isRegularNonSymlinkFile(at: url) && fileManager.isExecutableFile(atPath: url.path)
+        isNonEmptyRegularNonSymlinkFile(at: url) && fileManager.isExecutableFile(atPath: url.path)
     }
 
     private func architecture(from output: String) -> String? {
@@ -621,6 +621,13 @@ struct ReadOnlyLifecycleFactsProvider: LifecycleFactsProviding {
                     && matchesExactOwnershipMarker(commandLine: $0.commandLine, component: .tunnel, ownerID: ownerID)
             }
         let ownedCount = serverProcesses.count + tunnelProcesses.count
+        let ownershipMarkerPresent = state != nil
+            && stateOwnerMatches
+            && !stateHasNoPIDs
+            && serverAssignmentValid
+            && tunnelAssignmentValid
+            && !pidReuse
+            && !duplicateOwnedProcesses
         return LifecycleFacts(
             launchAgentPresent: launchAgentPresent,
             launchAgentValid: launchAgentValid,
@@ -628,7 +635,7 @@ struct ReadOnlyLifecycleFactsProvider: LifecycleFactsProviding {
             ownedProcessCount: ownedCount,
             serverPID: serverPID,
             tunnelPID: tunnelPID,
-            ownershipMarkerPresent: stateOwnerMatches && !stateHasNoPIDs,
+            ownershipMarkerPresent: ownershipMarkerPresent,
             duplicateOwnedProcesses: duplicateOwnedProcesses,
             pidReuseDetected: pidReuse
         )

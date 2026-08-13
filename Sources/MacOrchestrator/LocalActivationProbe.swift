@@ -49,6 +49,18 @@ struct LocalActivationProbe: Sendable {
         capabilityToken: String,
         requiresInteractiveUI: Bool = false
     ) async throws {
+        _ = try await runDetailed(
+            port: port,
+            capabilityToken: capabilityToken,
+            requiresInteractiveUI: requiresInteractiveUI
+        )
+    }
+
+    func runDetailed(
+        port: Int,
+        capabilityToken: String,
+        requiresInteractiveUI: Bool = false
+    ) async throws -> LocalActivationProbeDetails {
         let healthURL = URL(string: "http://127.0.0.1:\(port)/__mac_orchestrator_health")!
         var healthRequest = URLRequest(url: healthURL)
         healthRequest.httpMethod = "GET"
@@ -126,7 +138,7 @@ struct LocalActivationProbe: Sendable {
                 status: tools.status
             )
         }
-        try validateToolsList(tools.body, expectedID: 2)
+        let exposedTools = try validateToolsList(tools.body, expectedID: 2)
 
         let safeCall = try await request(
             url: mcpURL,
@@ -148,6 +160,10 @@ struct LocalActivationProbe: Sendable {
             safeCall.body,
             expectedID: 3,
             requiresInteractiveUI: requiresInteractiveUI
+        )
+        return LocalActivationProbeDetails(
+            exposedTools: exposedTools,
+            safeCallSucceeded: true
         )
     }
 
@@ -301,7 +317,7 @@ struct LocalActivationProbe: Sendable {
         }
     }
 
-    private func validateToolsList(_ data: Data, expectedID: Int) throws {
+    private func validateToolsList(_ data: Data, expectedID: Int) throws -> Set<String> {
         guard let object = Self.jsonObject(from: data) else {
             throw LocalActivationProbeError.mcpResponseInvalid(method: "tools/list")
         }
@@ -315,10 +331,21 @@ struct LocalActivationProbe: Sendable {
             throw LocalActivationProbeError.mcpError(method: "tools/list", message: message)
         }
         guard let result = object["result"] as? [String: Any],
-              let tools = result["tools"] as? [[String: Any]],
-              tools.contains(where: { $0["name"] as? String == "get_session_state" }) else {
+              let tools = result["tools"] as? [[String: Any]] else {
             throw LocalActivationProbeError.mcpResponseInvalid(method: "tools/list")
         }
+        let names: Set<String> = Set(tools.compactMap { tool -> String? in
+            guard let name = tool["name"] as? String,
+                  !name.isEmpty,
+                  name.rangeOfCharacter(from: CharacterSet.controlCharacters) == nil else {
+                return nil
+            }
+            return name
+        })
+        guard names.contains("get_session_state") else {
+            throw LocalActivationProbeError.mcpResponseInvalid(method: "tools/list")
+        }
+        return names
     }
 
     private static func jsonObject(from data: Data) -> [String: Any]? {

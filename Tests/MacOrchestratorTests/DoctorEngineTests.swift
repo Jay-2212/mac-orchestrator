@@ -540,7 +540,7 @@ final class DoctorEngineTests: XCTestCase {
 
         let remote = RemoteConnectorFacts(desired: true, binaryPresent: true, configurationPresent: false)
         XCTAssertEqual(DiagnosticChecks.remoteNgrok(remote, auth: .present, desired: true).status, .fail)
-        XCTAssertEqual(DiagnosticChecks.remoteNgrok(remote, auth: .absent, desired: true).repair?.id, .retryRemoteConnector)
+        XCTAssertEqual(DiagnosticChecks.remoteNgrok(remote, auth: .absent, desired: true).repair?.id, .replaceNgrokCredential)
         XCTAssertEqual(DiagnosticChecks.remoteEndpoint(remote, desired: true).status, .fail)
 
         let healthyRemote = RemoteConnectorFacts(
@@ -569,6 +569,268 @@ final class DoctorEngineTests: XCTestCase {
         XCTAssertEqual(DiagnosticChecks.diskFreeSpace(DiskSpaceFacts(filesystemAccessible: true, availableBytes: 99), thresholdBytes: 100).status, .warn)
         XCTAssertEqual(DiagnosticChecks.criticalPaths(DiskSpaceFacts(filesystemAccessible: true, criticalPathSymlinkCount: 0)).status, .pass)
         XCTAssertEqual(DiagnosticChecks.criticalPaths(DiskSpaceFacts(filesystemAccessible: true, criticalPathSymlinkCount: 1)).status, .fail)
+    }
+
+    func testRemoteChecksDistinguishPrerequisitesProviderStatesAndAuthenticatedReadiness() {
+        let invalidNgrok = RemoteConnectorFacts(
+            desired: true,
+            binaryPresent: false,
+            configurationPresent: true,
+            localMCPPrerequisite: .available
+        )
+        XCTAssertEqual(
+            DiagnosticChecks.remoteNgrok(invalidNgrok, auth: .present, desired: true).status,
+            .fail
+        )
+
+        let credentialAbsent = RemoteConnectorFacts(
+            desired: true,
+            binaryPresent: true,
+            configurationPresent: true,
+            ownershipMarkerPresent: true,
+            localMCPPrerequisite: .available
+        )
+        let absent = DiagnosticChecks.remoteNgrok(credentialAbsent, auth: .absent, desired: true)
+        XCTAssertEqual(absent.status, .fail)
+        XCTAssertEqual(absent.repair?.id, .replaceNgrokCredential)
+        XCTAssertTrue(absent.reason.localizedCaseInsensitiveContains("absent"))
+
+        let inaccessible = DiagnosticChecks.remoteNgrok(credentialAbsent, auth: .inaccessible, desired: true)
+        XCTAssertEqual(inaccessible.status, .warn)
+        XCTAssertEqual(inaccessible.repair?.id, .replaceNgrokCredential)
+        XCTAssertTrue(inaccessible.reason.localizedCaseInsensitiveContains("inaccessible"))
+
+        let rejectedCredential = RemoteConnectorFacts(
+            desired: true,
+            binaryPresent: true,
+            configurationPresent: true,
+            ownershipMarkerPresent: true,
+            providerCredentialState: .rejected,
+            localMCPPrerequisite: .available
+        )
+        let rejected = DiagnosticChecks.remoteNgrok(rejectedCredential, auth: .present, desired: true)
+        XCTAssertEqual(rejected.status, .fail)
+        XCTAssertEqual(rejected.repair?.id, .replaceNgrokCredential)
+        XCTAssertTrue(rejected.reason.localizedCaseInsensitiveContains("provider credential"))
+
+        for processState in [RemoteManagedProcessState.missing, .ambiguous] {
+            let processFacts = RemoteConnectorFacts(
+                desired: true,
+                binaryPresent: true,
+                configurationPresent: true,
+                ownershipMarkerPresent: processState == .owned,
+                managedProcessState: processState,
+                localMCPPrerequisite: .available
+            )
+            XCTAssertEqual(
+                DiagnosticChecks.remoteNgrok(processFacts, auth: .present, desired: true).status,
+                .fail
+            )
+        }
+
+        for agentState in [RemoteAgentAPIState.unavailable, .malformed] {
+            let agentFacts = RemoteConnectorFacts(
+                desired: true,
+                binaryPresent: true,
+                configurationPresent: true,
+                endpointState: .notObserved,
+                agentAPIState: agentState,
+                localMCPPrerequisite: .available
+            )
+            let endpoint = DiagnosticChecks.remoteEndpoint(agentFacts, desired: true)
+            XCTAssertEqual(endpoint.status, .fail)
+            XCTAssertTrue(endpoint.reason.localizedCaseInsensitiveContains(agentState == .unavailable ? "unavailable" : "malformed"))
+        }
+
+        for endpointState in [
+            RemoteEndpointState.noExpectedUpstream,
+            .foreignOnly,
+            .ambiguous
+        ] {
+            let endpointFacts = RemoteConnectorFacts(
+                desired: true,
+                binaryPresent: true,
+                configurationPresent: true,
+                endpointState: endpointState,
+                agentAPIState: .available,
+                localMCPPrerequisite: .available
+            )
+            XCTAssertEqual(DiagnosticChecks.remoteEndpoint(endpointFacts, desired: true).status, .fail)
+        }
+
+        let endpointOnly = RemoteConnectorFacts(
+            desired: true,
+            binaryPresent: true,
+            configurationPresent: true,
+            endpointAvailable: true,
+            endpointCount: 1,
+            ownershipMarkerPresent: true,
+            localMCPPrerequisite: .available
+        )
+        XCTAssertEqual(DiagnosticChecks.remoteEndpoint(endpointOnly, desired: true).status, .pass)
+        XCTAssertEqual(DiagnosticChecks.remoteAuthenticatedReadiness(endpointOnly, desired: true).status, .warn)
+
+        let authenticatedCases: [(RemoteAuthenticatedMCPFacts, DiagnosticStatus)] = [
+            (RemoteAuthenticatedMCPFacts(probeAvailable: true, probeRun: true, authenticationSucceeded: false), .fail),
+            (RemoteAuthenticatedMCPFacts(probeAvailable: true, probeRun: true, authenticationSucceeded: true), .fail),
+            (RemoteAuthenticatedMCPFacts(
+                probeAvailable: true,
+                probeRun: true,
+                authenticationSucceeded: true,
+                initializeSucceeded: true,
+                sessionEstablished: true,
+                inventoryChecked: true,
+                expectedTools: ["describe"],
+                exposedTools: ["other"]
+            ), .fail),
+            (RemoteAuthenticatedMCPFacts(
+                probeAvailable: true,
+                probeRun: true,
+                authenticationSucceeded: true,
+                initializeSucceeded: true,
+                sessionEstablished: true,
+                inventoryChecked: true,
+                expectedTools: ["describe"],
+                exposedTools: ["describe"],
+                safeCallChecked: true,
+                safeCallSucceeded: false
+            ), .fail),
+        ]
+        for (authenticated, expectedStatus) in authenticatedCases {
+            let facts = RemoteConnectorFacts(
+                desired: true,
+                binaryPresent: true,
+                configurationPresent: true,
+                endpointState: .established,
+                agentAPIState: .available,
+                authenticatedReadiness: authenticated,
+                localMCPPrerequisite: .available
+            )
+            XCTAssertEqual(DiagnosticChecks.remoteAuthenticatedReadiness(facts, desired: true).status, expectedStatus)
+        }
+
+        let mismatch = RemoteConnectorFacts(
+            desired: true,
+            endpointState: .established,
+            agentAPIState: .available,
+            authenticatedReadiness: authenticatedCases[2].0,
+            localMCPPrerequisite: .available
+        )
+        XCTAssertEqual(DiagnosticChecks.remoteInventory(mismatch, desired: true).status, .fail)
+
+        let readyChanged = RemoteConnectorFacts(
+            desired: true,
+            endpointState: .established,
+            agentAPIState: .available,
+            authenticatedReadiness: RemoteAuthenticatedMCPFacts(
+                probeAvailable: true,
+                probeRun: true,
+                authenticationSucceeded: true,
+                initializeSucceeded: true,
+                sessionEstablished: true,
+                inventoryChecked: true,
+                expectedTools: ["describe"],
+                exposedTools: ["describe"],
+                safeCallChecked: true,
+                safeCallSucceeded: true,
+                clientHandoff: .changed
+            ),
+            localMCPPrerequisite: .available
+        )
+        XCTAssertEqual(DiagnosticChecks.remoteAuthenticatedReadiness(readyChanged, desired: true).status, .pass)
+        XCTAssertEqual(DiagnosticChecks.remoteInventory(readyChanged, desired: true).status, .pass)
+        let handoff = DiagnosticChecks.remoteClientHandoff(readyChanged, desired: true)
+        XCTAssertEqual(handoff.status, .warn)
+        XCTAssertEqual(handoff.repair?.id, .reconfigureRemoteClients)
+
+        let unchanged = RemoteConnectorFacts(
+            desired: true,
+            endpointState: .established,
+            agentAPIState: .available,
+            authenticatedReadiness: RemoteAuthenticatedMCPFacts(
+                probeAvailable: true,
+                probeRun: true,
+                authenticationSucceeded: true,
+                initializeSucceeded: true,
+                sessionEstablished: true,
+                inventoryChecked: true,
+                expectedTools: ["describe"],
+                exposedTools: ["describe"],
+                safeCallChecked: true,
+                safeCallSucceeded: true,
+                clientHandoff: .unchanged
+            ),
+            localMCPPrerequisite: .available
+        )
+        XCTAssertEqual(DiagnosticChecks.remoteClientHandoff(unchanged, desired: true).status, .pass)
+
+        let noReceipt = RemoteConnectorFacts(
+            desired: true,
+            endpointState: .established,
+            agentAPIState: .available,
+            authenticatedReadiness: RemoteAuthenticatedMCPFacts(
+                probeAvailable: true,
+                probeRun: true,
+                authenticationSucceeded: true,
+                initializeSucceeded: true,
+                sessionEstablished: true,
+                inventoryChecked: true,
+                expectedTools: ["describe"],
+                exposedTools: ["describe"],
+                safeCallChecked: true,
+                safeCallSucceeded: true
+            ),
+            localMCPPrerequisite: .available
+        )
+        let noReceiptResult = DiagnosticChecks.remoteClientHandoff(noReceipt, desired: true)
+        XCTAssertEqual(noReceiptResult.status, .skip)
+        XCTAssertTrue(noReceiptResult.reason.localizedCaseInsensitiveContains("no client"))
+
+        let localUnavailable = RemoteConnectorFacts(
+            desired: true,
+            endpointState: .established,
+            agentAPIState: .available,
+            localMCPPrerequisite: .unavailable
+        )
+        for result in [
+            DiagnosticChecks.remoteNgrok(localUnavailable, auth: .absent, desired: true),
+            DiagnosticChecks.remoteEndpoint(localUnavailable, desired: true),
+            DiagnosticChecks.remoteAuthenticatedReadiness(localUnavailable, desired: true),
+            DiagnosticChecks.remoteInventory(localUnavailable, desired: true),
+            DiagnosticChecks.remoteClientHandoff(localUnavailable, desired: true),
+        ] {
+            XCTAssertEqual(result.status, .skip)
+            XCTAssertTrue(result.reason.localizedCaseInsensitiveContains("local MCP"))
+        }
+    }
+
+    func testRemoteAuthenticatedProbeIsOnlyRunAfterLocalAndEndpointPrerequisites() async {
+        let readyProvider = RecordingRemoteAuthenticatedProvider(facts: .readyFixture)
+        let readyFixture = DoctorFixture.make(
+            remoteDesired: true,
+            remoteAuthenticatedProvider: readyProvider
+        )
+        let readyReport = await DoctorEngine(dependencies: readyFixture.dependencies).run()
+
+        XCTAssertEqual(readyProvider.calls, 1)
+        XCTAssertEqual(readyReport.result(withID: "remote.endpoint")?.status, .pass)
+        XCTAssertEqual(readyReport.result(withID: "remote.authenticated-readiness")?.status, .pass)
+        XCTAssertEqual(readyReport.result(withID: "remote.inventory")?.status, .pass)
+        XCTAssertEqual(readyReport.result(withID: "capability.meridian")?.status, .skip)
+        XCTAssertEqual(readyReport.result(withID: "capability.cloudflare")?.status, .skip)
+
+        let blockedProvider = RecordingRemoteAuthenticatedProvider(facts: .readyFixture)
+        let blockedFixture = DoctorFixture.make(
+            remoteDesired: true,
+            asyncLocalMCPProvider: RecordingAsyncLocalProvider(facts: LocalMCPFacts()),
+            remoteAuthenticatedProvider: blockedProvider
+        )
+        let blockedReport = await DoctorEngine(dependencies: blockedFixture.dependencies).run()
+
+        XCTAssertEqual(blockedProvider.calls, 0)
+        for id in ["remote.ngrok", "remote.endpoint", "remote.authenticated-readiness", "remote.inventory", "remote.client-handoff"] {
+            XCTAssertEqual(blockedReport.result(withID: id)?.status, .skip, id)
+        }
     }
 
     func testDoctorGathersContextBeforeProvidersAndSkipsDisabledDependencies() async throws {
@@ -810,6 +1072,7 @@ private struct DoctorFixture {
         serverDesired: Bool = true,
         remoteDesired: Bool = false,
         asyncLocalMCPProvider: (any DoctorAsyncLocalMCPDiagnosticProviding)? = nil,
+        remoteAuthenticatedProvider: (any RemoteAuthenticatedMCPDiagnosticProviding)? = nil,
         configurationContextProvider: (any DoctorConfigurationContextProviding)? = nil
     ) -> DoctorFixture {
         var configuration = validatedConfiguration ?? AppConfiguration(
@@ -880,6 +1143,7 @@ private struct DoctorFixture {
             portProvider: FixturePortProvider(facts: PortFacts(port: configuration.localMCPPort)),
             localMCPProvider: local,
             asyncLocalMCPProvider: asyncLocalMCPProvider,
+            remoteAuthenticatedMCPProvider: remoteAuthenticatedProvider,
             lifecycleProvider: lifecycle,
             remoteConnectorProvider: remote,
             diskSpaceProvider: FixtureDiskProvider(facts: DiskSpaceFacts(filesystemAccessible: true, availableBytes: 10_000)),
@@ -1014,6 +1278,35 @@ private final class RecordingRemoteProvider: RemoteConnectorFactsProviding, @unc
 
     init(facts: RemoteConnectorFacts) { self.facts = facts }
     func inspect() throws -> RemoteConnectorFacts { calls.append(()); return facts }
+}
+
+private final class RecordingRemoteAuthenticatedProvider: RemoteAuthenticatedMCPDiagnosticProviding, @unchecked Sendable {
+    let facts: RemoteAuthenticatedMCPFacts
+    var calls = 0
+
+    init(facts: RemoteAuthenticatedMCPFacts) {
+        self.facts = facts
+    }
+
+    func inspect() async throws -> RemoteAuthenticatedMCPFacts {
+        calls += 1
+        return facts
+    }
+}
+
+private extension RemoteAuthenticatedMCPFacts {
+    static let readyFixture = RemoteAuthenticatedMCPFacts(
+        probeAvailable: true,
+        probeRun: true,
+        authenticationSucceeded: true,
+        initializeSucceeded: true,
+        sessionEstablished: true,
+        inventoryChecked: true,
+        expectedTools: ["describe"],
+        exposedTools: ["describe"],
+        safeCallChecked: true,
+        safeCallSucceeded: true
+    )
 }
 
 private final class RecordingLifecycleProvider: LifecycleFactsProviding, @unchecked Sendable {

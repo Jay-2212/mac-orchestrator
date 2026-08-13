@@ -134,6 +134,26 @@ The connector URL is a password-like capability. Possession grants the enabled
 tool surface without a second approval prompt per action. Logs, diagnostics,
 client configuration, support requests, and screenshots must redact it.
 
+## Phase 4C remote Doctor boundary
+
+Doctor keeps remote evidence in separate layers:
+
+1. local MCP prerequisite readiness;
+2. ngrok binary/configuration, provider-credential, managed-process, and Agent
+   API observations;
+3. expected-upstream endpoint classification;
+4. an injectable authenticated remote MCP probe covering authentication,
+   initialize/session, inventory, and a safe application call; and
+5. a receipt-backed client-handoff comparison.
+
+An Agent API endpoint match can pass its own endpoint check but can never stand
+in for authenticated remote MCP readiness. A changed connector identity with a
+healthy current probe is a manual client-reconfiguration warning. Without a
+known handoff receipt, Doctor does not inspect arbitrary clients or assert that
+any particular client is stale. Phase 4C defines the read-only seam and
+deterministic classifications; Phase 4D may bind a live authenticated probe,
+but this stream does not wire one into `ProcessSupervisor`.
+
 ## Dependency boundary
 
 The default runtime contains the core MCP/UI/OCR stack. The explicit `indexer`
@@ -178,8 +198,9 @@ non-required job.
 ## Deferred boundaries
 
 Phase 2 does not add Developer ID/notarization, DMG packaging, Intel support,
-Meridian or provider changes, a new retry state machine, a doctor, a full
-updater/rollback product, or mature remote recovery. Those remain Phase 3/4 or
-later work. The current architecture also remains single-user and local-first;
+Meridian or provider changes, a new retry state machine, live
+`RemoteActivationProbe` binding, or a full updater/rollback product. Those
+remain Phase 3/4 or later work. The current architecture also remains
+single-user and local-first;
 OAuth, accounts, roles, hosted deployment, and enterprise management are not
 implicit roadmap guarantees.

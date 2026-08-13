@@ -17,12 +17,35 @@ enum RepairActionID: String, Codable, Sendable {
     case reassignLocalPort
     case repairLaunchAgent
     case rerunVerifiedBootstrap
+    case replaceNgrokCredential
+    case rotateConnectorCredential
+    case reconfigureRemoteClients
 }
 
 struct RepairActionDescriptor: Codable, Equatable, Sendable {
     let id: RepairActionID
     let title: String
     let guidance: String
+}
+
+private enum DiagnosticSerializationRedactor {
+    static let shared = SensitiveDataRedactor(exactSecrets: [], homeDirectory: nil)
+}
+
+extension RepairActionDescriptor {
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case title
+        case guidance
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        let redactor = DiagnosticSerializationRedactor.shared
+        try container.encode(id, forKey: .id)
+        try container.encode(redactor.redact(title), forKey: .title)
+        try container.encode(redactor.redact(guidance), forKey: .guidance)
+    }
 }
 
 struct DiagnosticResult: Codable, Equatable, Sendable {
@@ -56,10 +79,11 @@ struct DiagnosticResult: Codable, Equatable, Sendable {
 
     func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
-        try container.encode(id, forKey: .id)
-        try container.encode(title, forKey: .title)
+        let redactor = DiagnosticSerializationRedactor.shared
+        try container.encode(redactor.redact(id), forKey: .id)
+        try container.encode(redactor.redact(title), forKey: .title)
         try container.encode(status, forKey: .status)
-        try container.encode(reason, forKey: .reason)
+        try container.encode(redactor.redact(reason), forKey: .reason)
         if let repair {
             try container.encode(repair, forKey: .repair)
         } else {

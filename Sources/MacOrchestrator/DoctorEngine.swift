@@ -172,6 +172,7 @@ struct DoctorDependencies {
     let asyncLocalMCPProvider: (any DoctorAsyncLocalMCPDiagnosticProviding)?
     let lifecycleProvider: any LifecycleFactsProviding
     let remoteConnectorProvider: any RemoteConnectorFactsProviding
+    let remoteAuthenticatedMCPProvider: (any RemoteAuthenticatedMCPDiagnosticProviding)?
     let diskSpaceProvider: any DiskSpaceProviding
     let logDirectoryProvider: any LogDirectoryPermissionsProviding
     let updateProvider: any UpdateAvailabilityProviding
@@ -188,6 +189,7 @@ struct DoctorDependencies {
         asyncLocalMCPProvider: (any DoctorAsyncLocalMCPDiagnosticProviding)? = nil,
         lifecycleProvider: any LifecycleFactsProviding = UnavailableLifecycleProvider(),
         remoteConnectorProvider: any RemoteConnectorFactsProviding = UnavailableRemoteProvider(),
+        remoteAuthenticatedMCPProvider: (any RemoteAuthenticatedMCPDiagnosticProviding)? = nil,
         diskSpaceProvider: any DiskSpaceProviding = UnavailableDiskProvider(),
         logDirectoryProvider: any LogDirectoryPermissionsProviding = ReadOnlyLogDirectoryPermissionsProvider(
             directoryURL: FileManager.default.homeDirectoryForCurrentUser
@@ -208,6 +210,7 @@ struct DoctorDependencies {
         self.asyncLocalMCPProvider = asyncLocalMCPProvider
         self.lifecycleProvider = lifecycleProvider
         self.remoteConnectorProvider = remoteConnectorProvider
+        self.remoteAuthenticatedMCPProvider = remoteAuthenticatedMCPProvider
         self.diskSpaceProvider = diskSpaceProvider
         self.logDirectoryProvider = logDirectoryProvider
         self.updateProvider = updateProvider
@@ -259,8 +262,20 @@ struct DoctorEngine {
             hasValidatedConfiguration: hasValidatedConfiguration
         )
         let keychainFacts = keychainInspection.value
-        let remoteInspection = remoteDesired ? inspectRemote() : DoctorInspection<RemoteConnectorFacts>()
-        let remoteFacts = remoteInspection.value
+        let remotePrerequisite = remoteLocalPrerequisite(
+            localMCPFacts,
+            serverDesired: serverDesired,
+            remoteDesired: remoteDesired
+        )
+        let remoteInspection = remoteDesired && remotePrerequisite == .available
+            ? inspectRemote()
+            : DoctorInspection<RemoteConnectorFacts>()
+        var remoteFacts = (remoteInspection.value ?? (remoteDesired ? RemoteConnectorFacts(desired: true) : nil))?
+            .with(localMCPPrerequisite: remotePrerequisite)
+        let remoteAuthenticatedInspection = await inspectRemoteAuthenticated(remoteFacts)
+        if let authenticatedFacts = remoteAuthenticatedInspection.value {
+            remoteFacts = remoteFacts?.with(authenticatedReadiness: authenticatedFacts)
+        }
         let diskInspection = inspectDisk()
         let diskFacts = diskInspection.value
         let logDirectoryInspection = inspectLogDirectory()
@@ -304,6 +319,9 @@ struct DoctorEngine {
             DiagnosticChecks.remoteNgrokArchitecture(remoteFacts, desired: remoteDesired),
             DiagnosticChecks.remoteNgrokSigning(remoteFacts, desired: remoteDesired),
             DiagnosticChecks.remoteEndpoint(remoteFacts, desired: remoteDesired),
+            DiagnosticChecks.remoteAuthenticatedReadiness(remoteFacts, desired: remoteDesired),
+            DiagnosticChecks.remoteInventory(remoteFacts, desired: remoteDesired),
+            DiagnosticChecks.remoteClientHandoff(remoteFacts, desired: remoteDesired),
             DiagnosticChecks.updateAvailability(updateFacts),
             DiagnosticChecks.diskFreeSpace(diskFacts, thresholdBytes: dependencies.thresholds.lowDiskBytes),
             DiagnosticChecks.criticalPaths(diskFacts),
@@ -345,7 +363,18 @@ struct DoctorEngine {
             to: ["lifecycle.launch-agent", "lifecycle.process-ownership"],
             in: &results
         )
-        applyFailure(remoteInspection.failureReason, to: ["remote.ngrok"], in: &results)
+        if remotePrerequisite != .unavailable {
+            applyFailure(
+                remoteInspection.failureReason,
+                to: ["remote.ngrok", "remote.endpoint"],
+                in: &results
+            )
+        }
+        applyFailure(
+            remoteAuthenticatedInspection.failureReason,
+            to: ["remote.authenticated-readiness"],
+            in: &results
+        )
         applyFailure(diskInspection.failureReason, to: ["disk.free-space"], in: &results)
         applyFailure(
             logDirectoryInspection.failureReason,
@@ -439,6 +468,43 @@ struct DoctorEngine {
         } catch {
             return DoctorInspection(failureReason: providerFailureReason(error, subject: "remote connector"))
         }
+    }
+
+    private func inspectRemoteAuthenticated(
+        _ facts: RemoteConnectorFacts?
+    ) async -> DoctorInspection<RemoteAuthenticatedMCPFacts> {
+        guard let facts,
+              facts.localMCPPrerequisite == .available,
+              facts.endpointState == .established || facts.endpointAvailable else {
+            return DoctorInspection()
+        }
+        guard let provider = dependencies.remoteAuthenticatedMCPProvider else {
+            return DoctorInspection(value: .notRun)
+        }
+        do {
+            return DoctorInspection(value: try await provider.inspect())
+        } catch {
+            return DoctorInspection(failureReason: providerFailureReason(error, subject: "remote authenticated MCP readiness"))
+        }
+    }
+
+    private func remoteLocalPrerequisite(
+        _ facts: LocalMCPFacts?,
+        serverDesired: Bool,
+        remoteDesired: Bool
+    ) -> RemoteLocalMCPPrerequisiteState {
+        guard remoteDesired else { return .notObserved }
+        guard serverDesired,
+              let facts,
+              facts.livenessVerified,
+              facts.readinessVerified,
+              facts.sessionEstablished,
+              facts.safeCallSucceeded,
+              facts.expectedTools == facts.exposedTools,
+              facts.expectedCapabilityGroups == facts.exposedCapabilityGroups else {
+            return .unavailable
+        }
+        return .available
     }
 
     private func inspectDisk() -> DoctorInspection<DiskSpaceFacts> {

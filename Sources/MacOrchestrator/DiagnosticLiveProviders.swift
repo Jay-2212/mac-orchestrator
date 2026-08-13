@@ -60,7 +60,10 @@ struct CurrentCoreMCPExpectationProvider: Sendable {
         add("mac.files.read", tools: Self.fileReadTools, to: &tools, groups: &groups, configuration: configuration)
         add("mac.files.write", tools: Self.fileWriteTools, to: &tools, groups: &groups, configuration: configuration)
         add("mac.shell", tools: Self.shellTools, to: &tools, groups: &groups, configuration: configuration)
-        add("mac.clipboard.write", tools: Self.clipboardTools, to: &tools, groups: &groups, configuration: configuration)
+        tools.formUnion(Self.clipboardTools)
+        if configuration.desiredCapabilities["mac.clipboard.write"] == true {
+            groups.insert("mac.clipboard.write")
+        }
         add("telegram.send", tools: Self.telegramTools, to: &tools, groups: &groups, configuration: configuration)
 
         let currentOptionalGroups = [
@@ -193,6 +196,7 @@ struct LocalActivationProbeAdapter {
 
 struct DiagnosticPathSet: Sendable {
     let supportDirectory: URL
+    let homeDirectory: URL
     let appURL: URL
     let helperExecutableURL: URL
     let runtimeDirectory: URL
@@ -208,6 +212,7 @@ struct DiagnosticPathSet: Sendable {
 
     init(supportDirectory: URL, homeDirectory: URL) {
         self.supportDirectory = supportDirectory
+        self.homeDirectory = homeDirectory
         self.appURL = supportDirectory.appendingPathComponent("app/Mac Orchestrator.app", isDirectory: true)
         self.helperExecutableURL = appURL.appendingPathComponent("Contents/MacOS/MacOrchestrator")
         self.runtimeDirectory = supportDirectory.appendingPathComponent("runtime", isDirectory: true)
@@ -321,6 +326,29 @@ struct SystemDiagnosticProcessRunner: DiagnosticProcessRunning {
     }
 }
 
+private enum DiagnosticOwnershipComponent {
+    case server
+    case tunnel
+}
+
+private func matchesExactOwnershipMarker(
+    commandLine: String,
+    component: DiagnosticOwnershipComponent,
+    ownerID: String
+) -> Bool {
+    let tokens = commandLine.split { character in
+        character == " " || character == "\t" || character == "\r" || character == "\n"
+    }.map(String.init)
+    switch component {
+    case .server:
+        guard let markerIndex = tokens.firstIndex(of: "--managed-owner") else { return false }
+        let ownerIndex = tokens.index(after: markerIndex)
+        return ownerIndex < tokens.endIndex && tokens[ownerIndex] == ownerID
+    case .tunnel:
+        return tokens.contains("mac-orchestrator-owner=\(ownerID)")
+    }
+}
+
 struct DiagnosticHTTPResponse: Sendable {
     let status: Int
     let url: URL
@@ -382,13 +410,20 @@ struct ReadOnlyInstalledReleaseFactsProvider: InstalledReleaseFactsProviding {
     }
 
     func inspect() throws -> InstalledReleaseFacts {
-        let helperPresent = fileManager.fileExists(atPath: paths.appURL.path)
-        let markerPresent = fileManager.fileExists(atPath: paths.runtimeMarkerURL.path)
-        let runtimePresent = fileManager.fileExists(atPath: paths.runtimePythonURL.path)
-        let payloadPresent = fileManager.fileExists(atPath: paths.runtimeScriptURL.path)
+        let infoURL = paths.appURL.appendingPathComponent("Contents/Info.plist")
+        let info = infoDictionary(at: infoURL)
+        let bundleIdentifier = (info?["CFBundleIdentifier"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let bundleVersion = (info?["CFBundleShortVersionString"] as? String ?? info?["CFBundleVersion"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let usableBundleMetadata = isRegularNonSymlinkFile(at: infoURL)
+            && bundleIdentifier?.isEmpty == false
+            && bundleVersion?.isEmpty == false
+        let helperPresent = isExecutableRegularFile(at: paths.helperExecutableURL) && usableBundleMetadata
+        let markerPresent = isRegularNonSymlinkFile(at: paths.runtimeMarkerURL)
+        let runtimePresent = isExecutableRegularFile(at: paths.runtimePythonURL)
+        let payloadPresent = isRegularNonSymlinkFile(at: paths.runtimeScriptURL)
         let releaseVersion = markerPresent ? try? String(contentsOf: paths.runtimeMarkerURL, encoding: .utf8)
             .trimmingCharacters(in: .whitespacesAndNewlines) : nil
-        let info = infoDictionary(at: paths.appURL.appendingPathComponent("Contents/Info.plist"))
         let file = commandRunner.run(DiagnosticCommandRequest(
             executable: "/usr/bin/file",
             arguments: ["-b", paths.helperExecutableURL.path]
@@ -409,11 +444,14 @@ struct ReadOnlyInstalledReleaseFactsProvider: InstalledReleaseFactsProviding {
             executable: paths.runtimePythonURL.path,
             arguments: ["--version"]
         ))
+        let helperArchitecture = architecture(from: file.stdout)
+        let runtimeArchitecture = architecture(from: runtimeFile.stdout)
+        let parsedRuntimeVersion = pythonVersion(from: runtimeVersion.stdout + runtimeVersion.stderr)
         let details = signature.stderr + signature.stdout
         let helper = CodeSignFacts(
             bundleIdentifier: info?["CFBundleIdentifier"] as? String,
             version: info?["CFBundleShortVersionString"] as? String ?? info?["CFBundleVersion"] as? String,
-            architecture: architecture(from: file.stdout),
+            architecture: helperArchitecture,
             isSigned: verify.status == 0,
             isAdHoc: details.localizedCaseInsensitiveContains("adhoc") || details.localizedCaseInsensitiveContains("ad hoc"),
             developerIDTrusted: details.contains("Developer ID Application"),
@@ -422,11 +460,20 @@ struct ReadOnlyInstalledReleaseFactsProvider: InstalledReleaseFactsProviding {
         )
         let runtime = RuntimeFacts(
             runtimePresent: runtimePresent,
-            architecture: architecture(from: runtimeFile.stdout),
-            version: pythonVersion(from: runtimeVersion.stdout + runtimeVersion.stderr) ?? releaseVersion,
+            architecture: runtimeArchitecture,
+            version: parsedRuntimeVersion ?? releaseVersion,
             markerPresent: markerPresent,
             payloadPresent: payloadPresent,
-            structurallyValid: runtimePresent && markerPresent && payloadPresent
+            structurallyValid: helperPresent
+                && runtimePresent
+                && markerPresent
+                && payloadPresent
+                && file.status == 0
+                && helperArchitecture != nil
+                && runtimeFile.status == 0
+                && runtimeVersion.status == 0
+                && runtimeArchitecture != nil
+                && parsedRuntimeVersion != nil
         )
         return InstalledReleaseFacts(
             releaseVersion: releaseVersion,
@@ -442,6 +489,17 @@ struct ReadOnlyInstalledReleaseFactsProvider: InstalledReleaseFactsProviding {
               let object = try? PropertyListSerialization.propertyList(from: data, format: nil),
               let dictionary = object as? [String: Any] else { return nil }
         return dictionary
+    }
+
+    private func isRegularNonSymlinkFile(at url: URL) -> Bool {
+        var metadata = stat()
+        guard lstat(url.path, &metadata) == 0 else { return false }
+        let mode = UInt32(metadata.st_mode)
+        return mode & UInt32(S_IFMT) == UInt32(S_IFREG)
+    }
+
+    private func isExecutableRegularFile(at url: URL) -> Bool {
+        isRegularNonSymlinkFile(at: url) && fileManager.isExecutableFile(atPath: url.path)
     }
 
     private func architecture(from output: String) -> String? {
@@ -519,12 +577,10 @@ struct ReadOnlyLifecycleFactsProvider: LifecycleFactsProviding {
         let processes = processRunner.snapshot()
         let runningProcesses = processes.filter(\.running)
         let serverProcesses = runningProcesses.filter {
-            ProcessOwnership.matches(commandLine: $0.commandLine, component: .server, ownerID: ownerID)
-                && !ProcessOwnership.matches(commandLine: $0.commandLine, component: .tunnel, ownerID: ownerID)
+            matchesExactOwnershipMarker(commandLine: $0.commandLine, component: .server, ownerID: ownerID)
         }
         let tunnelProcesses = runningProcesses.filter {
-            ProcessOwnership.matches(commandLine: $0.commandLine, component: .tunnel, ownerID: ownerID)
-                && !ProcessOwnership.matches(commandLine: $0.commandLine, component: .server, ownerID: ownerID)
+            matchesExactOwnershipMarker(commandLine: $0.commandLine, component: .tunnel, ownerID: ownerID)
         }
         let serverPID = state?.serverPID
         let tunnelPID = state?.tunnelPID
@@ -540,12 +596,15 @@ struct ReadOnlyLifecycleFactsProvider: LifecycleFactsProviding {
             || (state != nil && !stateOwnerMatches)
             || !serverAssignmentValid
             || !tunnelAssignmentValid
+            || (state == nil && (!serverProcesses.isEmpty || !tunnelProcesses.isEmpty))
+            || (!serverProcesses.isEmpty && state?.serverPID == nil)
+            || (!tunnelProcesses.isEmpty && state?.tunnelPID == nil)
         let duplicateOwnedProcesses = duplicateAssignment
             || serverProcesses.count > 1
             || tunnelProcesses.count > 1
             || runningProcesses.contains {
-                ProcessOwnership.matches(commandLine: $0.commandLine, component: .server, ownerID: ownerID)
-                    && ProcessOwnership.matches(commandLine: $0.commandLine, component: .tunnel, ownerID: ownerID)
+                matchesExactOwnershipMarker(commandLine: $0.commandLine, component: .server, ownerID: ownerID)
+                    && matchesExactOwnershipMarker(commandLine: $0.commandLine, component: .tunnel, ownerID: ownerID)
             }
         let ownedCount = serverProcesses.count + tunnelProcesses.count
         return LifecycleFacts(
@@ -562,42 +621,52 @@ struct ReadOnlyLifecycleFactsProvider: LifecycleFactsProviding {
     }
 
     private func launchAgentIsValid() -> Bool {
-        var metadata = stat()
-        let isSymlink = lstat(paths.launchAgentURL.path, &metadata) == 0
-            && UInt32(metadata.st_mode) & UInt32(S_IFMT) == UInt32(S_IFLNK)
-        guard !isSymlink,
+        guard !isSymlink(at: paths.launchAgentURL.deletingLastPathComponent()),
+              !isSymlink(at: paths.launchAgentURL),
               label == Self.expectedLabel,
               let data = try? Data(contentsOf: paths.launchAgentURL),
               let object = try? PropertyListSerialization.propertyList(from: data, format: nil),
               let plist = object as? [String: Any] else { return false }
 
-        let allowedKeys: Set<String> = [
+        let baseKeys: Set<String> = [
             "Label", "ProgramArguments", "RunAtLoad", "KeepAlive", "LimitLoadToSessionType",
-            "ThrottleInterval", "ProcessType", "StandardOutPath", "StandardErrorPath"
         ]
-        guard Set(plist.keys).isSubset(of: allowedKeys),
+        let distributionKeys = baseKeys.union([
+            "ThrottleInterval", "ProcessType", "StandardOutPath", "StandardErrorPath"
+        ])
+        guard let arguments = plist["ProgramArguments"] as? [String],
+              arguments.count == 1,
               plist["Label"] as? String == label,
-              plist["ProgramArguments"] as? [String] == [paths.helperExecutableURL.path],
               plist["RunAtLoad"] as? Bool == true,
               plist["LimitLoadToSessionType"] as? String == "Aqua",
               let keepAlive = plist["KeepAlive"] as? [String: Any],
               keepAlive.count == 1,
               keepAlive["SuccessfulExit"] as? Bool == false else { return false }
 
-        if let throttle = plist["ThrottleInterval"] as? Int, throttle != 5 { return false }
-        if plist["ThrottleInterval"] != nil && plist["ThrottleInterval"] as? Int == nil { return false }
-        if let processType = plist["ProcessType"] as? String, processType != "Interactive" { return false }
-        if plist["ProcessType"] != nil && plist["ProcessType"] as? String == nil { return false }
-        guard (plist["ThrottleInterval"] == nil) == (plist["ProcessType"] == nil) else { return false }
-        guard (plist["StandardOutPath"] == nil) == (plist["StandardErrorPath"] == nil) else { return false }
-        for key in ["StandardOutPath", "StandardErrorPath"] {
-            if let path = plist[key] as? String,
-               !path.hasSuffix("/Library/Logs/Mac Orchestrator/launcher.log") {
-                return false
-            }
-            if plist[key] != nil && plist[key] as? String == nil { return false }
+        let isBootstrapContract = arguments == [paths.helperExecutableURL.path]
+        let distributionExecutable = "/Applications/Mac Orchestrator.app/Contents/MacOS/MacOrchestrator"
+        let isDistributionContract = arguments == [distributionExecutable]
+        guard isBootstrapContract || isDistributionContract else { return false }
+        if isBootstrapContract {
+            return Set(plist.keys) == baseKeys
         }
+
+        guard Set(plist.keys) == distributionKeys,
+              plist["ThrottleInterval"] as? Int == 5,
+              plist["ProcessType"] as? String == "Interactive",
+              plist["StandardOutPath"] as? String == launcherLogPath,
+              plist["StandardErrorPath"] as? String == launcherLogPath else { return false }
         return true
+    }
+
+    private var launcherLogPath: String {
+        paths.homeDirectory.appendingPathComponent("Library/Logs/Mac Orchestrator/launcher.log").path
+    }
+
+    private func isSymlink(at url: URL) -> Bool {
+        var metadata = stat()
+        guard lstat(url.path, &metadata) == 0 else { return false }
+        return UInt32(metadata.st_mode) & UInt32(S_IFMT) == UInt32(S_IFLNK)
     }
 
     private func readOwnedState() -> (state: OwnedProcessState?, malformed: Bool) {
@@ -646,7 +715,7 @@ struct ReadOnlyPortFactsProvider: PortFactsProviding {
         let process = processRunner.snapshot().first(where: { $0.pid == pid })
         let owned = ownerID.map { owner in
             process.map {
-                $0.running && ProcessOwnership.matches(commandLine: $0.commandLine, component: .server, ownerID: owner)
+                $0.running && matchesExactOwnershipMarker(commandLine: $0.commandLine, component: .server, ownerID: owner)
             } ?? false
         } ?? false
         let pidReuse = ownerID != nil && process != nil && !owned

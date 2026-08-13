@@ -152,6 +152,17 @@ final class DiagnosticLiveProviderTests: XCTestCase {
         XCTAssertFalse(expectations.expectedTools.contains("vector_search"))
     }
 
+    func testCurrentCoreExpectationsAlwaysIncludeShippedClipboardToolWhenGroupDisabled() {
+        var configuration = AppConfiguration(ownerID: "owner-1")
+        configuration.desiredCapabilities["mac.clipboard.write"] = false
+
+        let expectations = CurrentCoreMCPExpectationProvider().expectations(for: configuration)
+
+        XCTAssertTrue(expectations.expectedTools.contains("clipboard"))
+        XCTAssertFalse(expectations.expectedCapabilityGroups.contains("mac.clipboard.write"))
+        XCTAssertTrue(expectations.skippedCapabilityGroups.contains("mac.clipboard.write"))
+    }
+
     func testActivationAdapterReportsShippedClipboardGroupWhenClipboardToolIsExposed() async {
         var configuration = AppConfiguration(ownerID: "owner-1")
         configuration.desiredCapabilities["mac.clipboard.write"] = true
@@ -174,6 +185,30 @@ final class DiagnosticLiveProviderTests: XCTestCase {
         XCTAssertTrue(facts.expectedTools.contains("clipboard"))
         XCTAssertTrue(facts.expectedCapabilityGroups.contains("mac.clipboard.write"))
         XCTAssertTrue(facts.exposedCapabilityGroups.contains("mac.clipboard.write"))
+    }
+
+    func testActivationAdapterDoesNotExposeClipboardGroupWhenDisabled() async {
+        var configuration = AppConfiguration(ownerID: "owner-1")
+        configuration.desiredCapabilities["mac.clipboard.write"] = false
+        let probe = RecordingActivationProbe(outcome: .init(
+            phase: .safeCall,
+            details: LocalActivationProbeDetails(
+                exposedTools: ["describe", "get_capabilities", "get_session_state", "clipboard"],
+                safeCallSucceeded: true
+            )
+        ))
+        let adapter = LocalActivationProbeAdapter(
+            probe: probe,
+            keychain: KeychainStore(client: RecordingDiagnosticKeychainClient(value: "connector-secret")),
+            configuration: configuration,
+            port: 8007
+        )
+
+        let facts = await adapter.inspect()
+
+        XCTAssertTrue(facts.expectedTools.contains("clipboard"))
+        XCTAssertFalse(facts.expectedCapabilityGroups.contains("mac.clipboard.write"))
+        XCTAssertFalse(facts.exposedCapabilityGroups.contains("mac.clipboard.write"))
     }
 
     func testPortProviderUsesInjectedReadOnlyCommandAndDoesNotTreatPIDAsReadiness() throws {
@@ -374,6 +409,110 @@ final class DiagnosticLiveProviderTests: XCTestCase {
         XCTAssertEqual(facts.ownedProcessCount, 2)
     }
 
+    func testLifecycleUsesExactOwnershipTokensAndRejectsOwnerSubstringReuse() throws {
+        let fixture = try makeLifecycleFixture()
+        try JSONEncoder().encode(OwnedProcessState(ownerID: "owner-1", serverPID: 42, tunnelPID: nil))
+            .write(to: fixture.paths.ownedProcessesURL)
+        try writeSupportedLaunchAgent(to: fixture.paths.launchAgentURL, helper: fixture.paths.helperExecutableURL)
+        let provider = ReadOnlyLifecycleFactsProvider(
+            paths: fixture.paths,
+            ownerID: "owner-1",
+            commandRunner: launchctlRunner(),
+            processRunner: RecordingDiagnosticProcessRunner(processes: [
+                DiagnosticProcessRecord(
+                    pid: 42,
+                    commandLine: "python automac_mcp.py --managed-owner owner-10",
+                    running: true
+                )
+            ])
+        )
+
+        let facts = try provider.inspect()
+
+        XCTAssertEqual(facts.ownedProcessCount, 0)
+        XCTAssertFalse(facts.ownershipMarkerPresent)
+        XCTAssertTrue(facts.pidReuseDetected)
+    }
+
+    func testLifecycleRejectsMarkerWithoutOwnedProcessRecord() throws {
+        let fixture = try makeLifecycleFixture()
+        try writeSupportedLaunchAgent(to: fixture.paths.launchAgentURL, helper: fixture.paths.helperExecutableURL)
+        let provider = ReadOnlyLifecycleFactsProvider(
+            paths: fixture.paths,
+            ownerID: "owner-1",
+            commandRunner: launchctlRunner(),
+            processRunner: RecordingDiagnosticProcessRunner(processes: [
+                DiagnosticProcessRecord(
+                    pid: 42,
+                    commandLine: "python automac_mcp.py --managed-owner owner-1",
+                    running: true
+                )
+            ])
+        )
+
+        let facts = try provider.inspect()
+
+        XCTAssertTrue(facts.pidReuseDetected || facts.duplicateOwnedProcesses)
+        XCTAssertFalse(facts.ownershipMarkerPresent)
+    }
+
+    func testLifecycleRejectsMarkerWhenItsComponentPIDIsMissing() throws {
+        let fixture = try makeLifecycleFixture()
+        try JSONEncoder().encode(OwnedProcessState(ownerID: "owner-1", serverPID: nil, tunnelPID: 43))
+            .write(to: fixture.paths.ownedProcessesURL)
+        try writeSupportedLaunchAgent(to: fixture.paths.launchAgentURL, helper: fixture.paths.helperExecutableURL)
+        let provider = ReadOnlyLifecycleFactsProvider(
+            paths: fixture.paths,
+            ownerID: "owner-1",
+            commandRunner: launchctlRunner(),
+            processRunner: RecordingDiagnosticProcessRunner(processes: [
+                DiagnosticProcessRecord(
+                    pid: 42,
+                    commandLine: "python automac_mcp.py --managed-owner owner-1",
+                    running: true
+                ),
+                DiagnosticProcessRecord(
+                    pid: 43,
+                    commandLine: "ngrok http --metadata mac-orchestrator-owner=owner-1",
+                    running: true
+                ),
+            ])
+        )
+
+        let facts = try provider.inspect()
+
+        XCTAssertTrue(facts.pidReuseDetected || facts.duplicateOwnedProcesses)
+    }
+
+    func testLifecycleRejectsCrossComponentMarkerAssignment() throws {
+        let fixture = try makeLifecycleFixture()
+        try JSONEncoder().encode(OwnedProcessState(ownerID: "owner-1", serverPID: 42, tunnelPID: 43))
+            .write(to: fixture.paths.ownedProcessesURL)
+        try writeSupportedLaunchAgent(to: fixture.paths.launchAgentURL, helper: fixture.paths.helperExecutableURL)
+        let provider = ReadOnlyLifecycleFactsProvider(
+            paths: fixture.paths,
+            ownerID: "owner-1",
+            commandRunner: launchctlRunner(),
+            processRunner: RecordingDiagnosticProcessRunner(processes: [
+                DiagnosticProcessRecord(
+                    pid: 42,
+                    commandLine: "python automac_mcp.py --managed-owner owner-1 --metadata mac-orchestrator-owner=owner-1",
+                    running: true
+                ),
+                DiagnosticProcessRecord(
+                    pid: 43,
+                    commandLine: "ngrok http --metadata mac-orchestrator-owner=owner-1",
+                    running: true
+                ),
+            ])
+        )
+
+        let facts = try provider.inspect()
+
+        XCTAssertTrue(facts.duplicateOwnedProcesses)
+        XCTAssertTrue(facts.pidReuseDetected)
+    }
+
     func testLifecycleRejectsUnknownLaunchAgentKeysAndWrongContractValues() throws {
         let fixture = try makeLifecycleFixture()
         let plist: [String: Any] = [
@@ -396,23 +535,131 @@ final class DiagnosticLiveProviderTests: XCTestCase {
         XCTAssertFalse(facts.launchAgentValid)
     }
 
+    func testLifecycleRejectsMissingLaunchAgentContractKey() throws {
+        let fixture = try makeLifecycleFixture()
+        let plist: [String: Any] = [
+            "Label": "com.jay.mac-orchestrator",
+            "ProgramArguments": [fixture.paths.helperExecutableURL.path],
+            "RunAtLoad": true,
+            "KeepAlive": ["SuccessfulExit": false],
+        ]
+        let data = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+        try data.write(to: fixture.paths.launchAgentURL)
+
+        let facts = try ReadOnlyLifecycleFactsProvider(
+            paths: fixture.paths,
+            ownerID: "owner-1",
+            commandRunner: launchctlRunner(),
+            processRunner: RecordingDiagnosticProcessRunner(processes: [])
+        ).inspect()
+
+        XCTAssertFalse(facts.launchAgentValid)
+    }
+
+    func testLifecycleAcceptsDistributionLaunchAgentContract() throws {
+        let fixture = try makeLifecycleFixture()
+        try writeSupportedLaunchAgent(
+            to: fixture.paths.launchAgentURL,
+            helper: fixture.paths.helperExecutableURL,
+            distribution: true
+        )
+
+        let facts = try ReadOnlyLifecycleFactsProvider(
+            paths: fixture.paths,
+            ownerID: "owner-1",
+            commandRunner: launchctlRunner(),
+            processRunner: RecordingDiagnosticProcessRunner(processes: [])
+        ).inspect()
+
+        XCTAssertTrue(facts.launchAgentValid)
+    }
+
+    func testLifecycleRejectsArbitraryLaunchAgentExecutablePath() throws {
+        let fixture = try makeLifecycleFixture()
+        try writeSupportedLaunchAgent(
+            to: fixture.paths.launchAgentURL,
+            helper: URL(fileURLWithPath: "/tmp/MacOrchestrator")
+        )
+
+        let facts = try ReadOnlyLifecycleFactsProvider(
+            paths: fixture.paths,
+            ownerID: "owner-1",
+            commandRunner: launchctlRunner(),
+            processRunner: RecordingDiagnosticProcessRunner(processes: [])
+        ).inspect()
+
+        XCTAssertFalse(facts.launchAgentValid)
+    }
+
+    func testLifecycleRejectsLaunchAgentFileAndParentSymlinks() throws {
+        let fixture = try makeLifecycleFixture()
+        let fileTarget = fixture.root.appendingPathComponent("valid.plist")
+        try writeSupportedLaunchAgent(to: fileTarget, helper: fixture.paths.helperExecutableURL)
+        try FileManager.default.createSymbolicLink(at: fixture.paths.launchAgentURL, withDestinationURL: fileTarget)
+
+        let fileLinkFacts = try ReadOnlyLifecycleFactsProvider(
+            paths: fixture.paths,
+            ownerID: "owner-1",
+            commandRunner: launchctlRunner(),
+            processRunner: RecordingDiagnosticProcessRunner(processes: [])
+        ).inspect()
+        XCTAssertFalse(fileLinkFacts.launchAgentValid)
+
+        try FileManager.default.removeItem(at: fixture.paths.launchAgentURL)
+        let parent = fixture.paths.launchAgentURL.deletingLastPathComponent()
+        let parentTarget = fixture.root.appendingPathComponent("target-launch-agents", isDirectory: true)
+        try FileManager.default.createDirectory(at: parentTarget, withIntermediateDirectories: true)
+        try writeSupportedLaunchAgent(
+            to: parentTarget.appendingPathComponent(fixture.paths.launchAgentURL.lastPathComponent),
+            helper: fixture.paths.helperExecutableURL
+        )
+        try FileManager.default.removeItem(at: parent)
+        try FileManager.default.createSymbolicLink(at: parent, withDestinationURL: parentTarget)
+
+        let parentLinkFacts = try ReadOnlyLifecycleFactsProvider(
+            paths: fixture.paths,
+            ownerID: "owner-1",
+            commandRunner: launchctlRunner(),
+            processRunner: RecordingDiagnosticProcessRunner(processes: [])
+        ).inspect()
+        XCTAssertFalse(parentLinkFacts.launchAgentValid)
+    }
+
     func testInstalledReleaseProviderReportsCompleteFixtureWithoutSecrets() throws {
         let fixture = try makeReleaseFixture()
-        let runner = RecordingDiagnosticCommandRunner(outputs: [
-            DiagnosticCommandRequest(executable: "/usr/bin/file", arguments: ["-b", fixture.paths.helperExecutableURL.path]): .init(status: 0, stdout: "Mach-O 64-bit executable arm64", stderr: ""),
-            DiagnosticCommandRequest(executable: "/usr/bin/codesign", arguments: ["-dv", "--verbose=4", fixture.paths.appURL.path]): .init(status: 0, stdout: "", stderr: "Authority=Developer ID Application"),
-            DiagnosticCommandRequest(executable: "/usr/bin/codesign", arguments: ["--verify", "--deep", "--strict", fixture.paths.appURL.path]): .init(status: 0, stdout: "", stderr: ""),
-            DiagnosticCommandRequest(executable: "/usr/bin/file", arguments: ["-b", fixture.paths.runtimePythonURL.path]): .init(status: 0, stdout: "Mach-O 64-bit executable arm64", stderr: ""),
-            DiagnosticCommandRequest(executable: fixture.paths.runtimePythonURL.path, arguments: ["--version"]): .init(status: 0, stdout: "Python 3.13.14\n", stderr: ""),
-        ])
+        let runner = releaseCommandRunner(paths: fixture.paths)
 
         let facts = try ReadOnlyInstalledReleaseFactsProvider(paths: fixture.paths, commandRunner: runner).inspect()
 
         XCTAssertTrue(facts.helperPresent)
         XCTAssertTrue(facts.ownershipMarkerPresent)
+        XCTAssertTrue(facts.runtime.runtimePresent)
+        XCTAssertTrue(facts.runtime.markerPresent)
+        XCTAssertTrue(facts.runtime.payloadPresent)
         XCTAssertTrue(facts.runtime.structurallyValid)
         XCTAssertEqual(facts.helper.architecture, "arm64")
         XCTAssertFalse(String(describing: facts).contains("connector"))
+    }
+
+    func testInstalledReleaseProviderRejectsNonExecutableHelperAndRuntimeFixtures() throws {
+        let fixture = try makeReleaseFixture()
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o644],
+            ofItemAtPath: fixture.paths.helperExecutableURL.path
+        )
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o644],
+            ofItemAtPath: fixture.paths.runtimePythonURL.path
+        )
+
+        let facts = try ReadOnlyInstalledReleaseFactsProvider(
+            paths: fixture.paths,
+            commandRunner: releaseCommandRunner(paths: fixture.paths)
+        ).inspect()
+
+        XCTAssertFalse(facts.helperPresent)
+        XCTAssertFalse(facts.runtime.runtimePresent)
+        XCTAssertFalse(facts.runtime.structurallyValid)
     }
 
     func testDiskProviderReportsCriticalSymlinkWithoutFollowingIt() throws {
@@ -449,16 +696,31 @@ final class DiagnosticLiveProviderTests: XCTestCase {
         home.appendingPathComponent("Library/LaunchAgents", isDirectory: true)
     }
 
-    private func writeSupportedLaunchAgent(to url: URL, helper: URL) throws {
-        let plist: [String: Any] = [
+    private func writeSupportedLaunchAgent(to url: URL, helper: URL, distribution: Bool = false) throws {
+        var plist: [String: Any] = [
             "Label": "com.jay.mac-orchestrator",
             "ProgramArguments": [helper.path],
             "RunAtLoad": true,
             "KeepAlive": ["SuccessfulExit": false],
             "LimitLoadToSessionType": "Aqua",
         ]
+        if distribution {
+            plist["ProgramArguments"] = ["/Applications/Mac Orchestrator.app/Contents/MacOS/MacOrchestrator"]
+            let logPath = fixtureHome(from: url).appendingPathComponent("Library/Logs/Mac Orchestrator/launcher.log").path
+            plist["ThrottleInterval"] = 5
+            plist["ProcessType"] = "Interactive"
+            plist["StandardOutPath"] = logPath
+            plist["StandardErrorPath"] = logPath
+        }
         let data = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
         try data.write(to: url)
+    }
+
+    private func fixtureHome(from launchAgentURL: URL) -> URL {
+        launchAgentURL
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
     }
 
     private func launchctlRunner() -> RecordingDiagnosticCommandRunner {
@@ -477,11 +739,29 @@ final class DiagnosticLiveProviderTests: XCTestCase {
         try FileManager.default.createDirectory(at: paths.helperExecutableURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: paths.runtimePythonURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         try Data("1.2.3".utf8).write(to: paths.runtimeMarkerURL)
-        try Data().write(to: paths.helperExecutableURL)
-        try Data().write(to: paths.runtimePythonURL)
-        try Data().write(to: paths.runtimeScriptURL)
+        try Data("#!/bin/sh\nexit 0\n".utf8).write(to: paths.helperExecutableURL)
+        try Data("#!/bin/sh\necho Python 3.13.14\n".utf8).write(to: paths.runtimePythonURL)
+        try Data("print('fixture')\n".utf8).write(to: paths.runtimeScriptURL)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: paths.helperExecutableURL.path)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: paths.runtimePythonURL.path)
+        let info: [String: Any] = [
+            "CFBundleIdentifier": "com.jay.mac-orchestrator",
+            "CFBundleShortVersionString": "1.2.3",
+        ]
+        let infoData = try PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0)
+        try infoData.write(to: paths.appURL.appendingPathComponent("Contents/Info.plist"))
         addTeardownBlock { try? FileManager.default.removeItem(at: root) }
         return (paths, root)
+    }
+
+    private func releaseCommandRunner(paths: DiagnosticPathSet) -> RecordingDiagnosticCommandRunner {
+        RecordingDiagnosticCommandRunner(outputs: [
+            DiagnosticCommandRequest(executable: "/usr/bin/file", arguments: ["-b", paths.helperExecutableURL.path]): .init(status: 0, stdout: "Mach-O 64-bit executable arm64", stderr: ""),
+            DiagnosticCommandRequest(executable: "/usr/bin/codesign", arguments: ["-dv", "--verbose=4", paths.appURL.path]): .init(status: 0, stdout: "", stderr: "Authority=Developer ID Application"),
+            DiagnosticCommandRequest(executable: "/usr/bin/codesign", arguments: ["--verify", "--deep", "--strict", paths.appURL.path]): .init(status: 0, stdout: "", stderr: ""),
+            DiagnosticCommandRequest(executable: "/usr/bin/file", arguments: ["-b", paths.runtimePythonURL.path]): .init(status: 0, stdout: "Mach-O 64-bit executable arm64", stderr: ""),
+            DiagnosticCommandRequest(executable: paths.runtimePythonURL.path, arguments: ["--version"]): .init(status: 0, stdout: "Python 3.13.14\n", stderr: ""),
+        ])
     }
 }
 

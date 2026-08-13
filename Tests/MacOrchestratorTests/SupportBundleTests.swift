@@ -441,10 +441,29 @@ final class SupportBundleTests: XCTestCase {
             let values = try url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
             XCTAssertNotEqual(values.isSymbolicLink, true, "archive contains a symlink: \(url.path)")
             guard values.isDirectory != true else { continue }
-            let relative = String(url.path.dropFirst(directory.path.count + 1))
+            let relative = try relativePath(of: url, under: directory)
             result.append((relative, try Data(contentsOf: url)))
         }
         return result.sorted { $0.name < $1.name }
+    }
+
+    private func relativePath(of file: URL, under directory: URL) throws -> String {
+        let rootPaths = [
+            directory.path,
+            directory.standardizedFileURL.path,
+            directory.resolvingSymlinksInPath().standardizedFileURL.path
+        ]
+        let filePaths = [
+            file.path,
+            file.standardizedFileURL.path,
+            file.resolvingSymlinksInPath().standardizedFileURL.path
+        ]
+        for root in rootPaths {
+            for path in filePaths where path.hasPrefix(root + "/") {
+                return String(path.dropFirst(root.count + 1))
+            }
+        }
+        throw NSError(domain: "SupportBundleTests", code: 1)
     }
 }
 

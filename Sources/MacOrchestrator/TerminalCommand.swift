@@ -584,7 +584,7 @@ enum TerminalCommand {
         let support = ConfigurationStore.defaultDirectoryURL()
         let paths = DiagnosticPathSet.defaultPaths(fileManager: fileManager)
         let configuration = try? ReadOnlyDoctorConfigurationContextProvider(directoryURL: support).inspect().validatedConfiguration
-        var portRepair: (any LocalPortReassigning)?
+        let portRepair: (any LocalPortReassigning)?
         if let configuration,
            let candidate = try? LocalPortAllocator.select(
                preferred: configuration.localMCPPort,
@@ -599,6 +599,8 @@ enum TerminalCommand {
                 occupancy: TerminalPortOccupancy(ownerID: configuration.ownerID),
                 configuration: ConfigurationStorePortUpdater(store: ConfigurationStore())
             )
+        } else {
+            portRepair = nil
         }
         let contract = ManagedLaunchAgentContract(
             homeDirectory: paths.homeDirectory,

@@ -312,8 +312,8 @@ struct DittoSupportBundleArchiveWriter: SupportBundleArchiveWriting {
             guard type == S_IFREG else {
                 throw SupportBundleError.archiveWriteFailed
             }
-            let stagingPath = stagingDirectory.resolvingSymlinksInPath().standardizedFileURL.path
-            let itemPath = url.resolvingSymlinksInPath().standardizedFileURL.path
+            let stagingPath = stagingDirectory.standardizedFileURL.path
+            let itemPath = url.standardizedFileURL.path
             guard itemPath.hasPrefix(stagingPath + "/") else {
                 throw SupportBundleError.archiveWriteFailed
             }

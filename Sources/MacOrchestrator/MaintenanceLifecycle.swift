@@ -196,6 +196,7 @@ struct LaunchAgentMaintenanceController: MaintenanceServiceController {
 
     func verifyOwnership(ownerID: String) throws -> Bool {
         guard ownerID == String(getuid()),
+              launchAgentLabel == "gui/\(getuid())/\(ManagedLaunchAgentContract.label)",
               launchAgentURL == launchAgentContract.launchAgentURL,
               Self.matchesCanonicalContract(launchAgentURL, contract: launchAgentContract) else {
             return false

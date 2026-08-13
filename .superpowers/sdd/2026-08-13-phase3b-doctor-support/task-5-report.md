@@ -74,3 +74,28 @@ current Mac Orchestrator core.
 - Message: `feat: add read-only doctor engine`
 - The final commit SHA and clean-worktree verification are recorded in the
   completion handoff.
+
+## Fix-round evidence
+
+- Fix commit: `58c94f23bbe0a240ae9e25d1c10083c96d3ada0a` (`fix: close Task 5 doctor review findings`).
+- Configuration checks now share one usable-file predicate requiring existence,
+  readability, validity, valid observation state, current schema, and no symlink;
+  restore repair is offered only for a validated non-symlink backup.
+- Doctor now gathers an owned configuration snapshot first, derives all desired
+  state from its validated configuration, selectively probes Keychain items, and
+  skips local MCP, remote, lifecycle, port, permission, and Keychain dependents
+  when configuration context is unavailable or disabled.
+- `DoctorEngineTests` now has deterministic missing/malformed/invalid/unsupported
+  configuration, backup, recovery, generation, integrity/version, requester
+  permission/session, MCP, lifecycle/PID reuse, remote/auth/endpoint, disk,
+  update/future, disabled-provider, and real mutation-free negative-control
+  coverage. The vacuous `allSatisfy { _ in true }` assertion is removed.
+- `swift build`: passed with exit code 0; existing Command Line Tools linker
+  search-path warnings remain.
+- `swiftc -parse` passed for `DiagnosticChecks.swift`, `DoctorEngine.swift`,
+  and `DoctorEngineTests.swift`; a temporary out-of-repo XCTest shim also
+  typechecked the test file against the rebuilt testable production module.
+- `swift test --filter DoctorEngineTests`: remains blocked before XCTest
+  execution by the installed Command Line Tools (`CapabilityReadinessCoordinatorTests.swift:2:8 unable to resolve module dependency: 'XCTest'`).
+- `git diff --check` and the no-repair/no-mutation/scope scans passed; tracked
+  worktree was clean after commit.

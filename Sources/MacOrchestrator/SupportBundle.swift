@@ -243,17 +243,12 @@ struct DittoSupportBundleArchiveWriter: SupportBundleArchiveWriting {
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
-        let topLevelSources = Array(Set(entries.compactMap { entry in
-            entry.archivePath.split(separator: "/", maxSplits: 1, omittingEmptySubsequences: true).first.map(String.init)
-        })).sorted().map { stagingDirectory.appendingPathComponent($0).path }
-        guard !topLevelSources.isEmpty else {
-            throw SupportBundleError.archiveWriteFailed
-        }
+        process.currentDirectoryURL = stagingDirectory
         process.arguments = [
             "-c",
             "-k",
             "--norsrc",
-        ] + topLevelSources + [
+            ".",
             destination.path
         ]
         process.standardOutput = FileHandle.nullDevice

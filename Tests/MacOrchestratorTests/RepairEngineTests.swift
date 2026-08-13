@@ -104,7 +104,8 @@ final class RepairEngineTests: XCTestCase {
         for (pane, url, action) in expected {
             let result = await adapter.open(pane)
             XCTAssertEqual(result.status, .requiresUserAction)
-            XCTAssertEqual(await opener.openedURLs.last, url)
+            let lastOpenedURL = await opener.openedURLs.last
+            XCTAssertEqual(lastOpenedURL, url)
 
             let outcome = await RepairEngine(dependencies: RepairDependencies(
                 permissionSettingsOpening: adapter
@@ -118,7 +119,8 @@ final class RepairEngineTests: XCTestCase {
         let result = await SystemSettingsPermissionOpener(urlOpening: opener).open(.automation)
 
         XCTAssertEqual(result.status, .failed)
-        XCTAssertEqual(await opener.openedURLs, [SystemSettingsPaneURLs.automation])
+        let openedURLs = await opener.openedURLs
+        XCTAssertEqual(openedURLs, [SystemSettingsPaneURLs.automation])
     }
 
     func testDefaultDependenciesWireOnlyBoundedSettingsAdapter() {
@@ -322,9 +324,12 @@ final class RepairEngineTests: XCTestCase {
 
         XCTAssertEqual(outcome.status, .repaired)
         XCTAssertTrue(outcome.reason.contains("configured clients"))
-        XCTAssertEqual(await occupancy.ports, [8000, 8123, 8123])
-        XCTAssertEqual(await updater.updatedPorts, [8123])
-        XCTAssertEqual(await updater.terminatedListeners, 0)
+        let observedPorts = await occupancy.ports
+        let updatedPorts = await updater.updatedPorts
+        let terminatedListeners = await updater.terminatedListeners
+        XCTAssertEqual(observedPorts, [8000, 8123, 8123])
+        XCTAssertEqual(updatedPorts, [8123])
+        XCTAssertEqual(terminatedListeners, 0)
     }
 
     func testPortReassignmentAllowsExplicitUnrelatedCurrentListenerWithoutTermination() async {
@@ -344,13 +349,13 @@ final class RepairEngineTests: XCTestCase {
             configuration: updater
         )
 
-        XCTAssertEqual(
-            await RepairEngine(dependencies: RepairDependencies(localPortReassigning: reassigner))
-                .execute(.reassignLocalPort).status,
-            .repaired
-        )
-        XCTAssertEqual(await updater.updatedPorts, [8123])
-        XCTAssertEqual(await updater.terminatedListeners, 0)
+        let outcome = await RepairEngine(dependencies: RepairDependencies(localPortReassigning: reassigner))
+            .execute(.reassignLocalPort)
+        let updatedPorts = await updater.updatedPorts
+        let terminatedListeners = await updater.terminatedListeners
+        XCTAssertEqual(outcome.status, .repaired)
+        XCTAssertEqual(updatedPorts, [8123])
+        XCTAssertEqual(terminatedListeners, 0)
     }
 
     func testPortReassignmentRefusesOccupiedCandidateAndOwnershipMismatch() async {
@@ -378,16 +383,12 @@ final class RepairEngineTests: XCTestCase {
             configuration: RecordingPortUpdater()
         )
 
-        XCTAssertEqual(
-            await RepairEngine(dependencies: RepairDependencies(localPortReassigning: occupied))
-                .execute(.reassignLocalPort).status,
-            .refused
-        )
-        XCTAssertEqual(
-            await RepairEngine(dependencies: RepairDependencies(localPortReassigning: mismatch))
-                .execute(.reassignLocalPort).status,
-            .refused
-        )
+        let occupiedOutcome = await RepairEngine(dependencies: RepairDependencies(localPortReassigning: occupied))
+            .execute(.reassignLocalPort)
+        let mismatchOutcome = await RepairEngine(dependencies: RepairDependencies(localPortReassigning: mismatch))
+            .execute(.reassignLocalPort)
+        XCTAssertEqual(occupiedOutcome.status, .refused)
+        XCTAssertEqual(mismatchOutcome.status, .refused)
     }
 
     func testPortReassignmentRefusesCandidateRaceAndUnknownOccupancy() async {
@@ -414,16 +415,13 @@ final class RepairEngineTests: XCTestCase {
             configuration: RecordingPortUpdater()
         )
 
-        XCTAssertEqual(
-            await RepairEngine(dependencies: RepairDependencies(localPortReassigning: raced))
-                .execute(.reassignLocalPort).status,
-            .refused
-        )
-        XCTAssertEqual(
-            await RepairEngine(dependencies: RepairDependencies(localPortReassigning: unknownCurrent))
-                .execute(.reassignLocalPort).status,
-            .refused
-        )
+        let racedOutcome = await RepairEngine(dependencies: RepairDependencies(localPortReassigning: raced))
+            .execute(.reassignLocalPort)
+        let unknownCurrentOutcome = await RepairEngine(
+            dependencies: RepairDependencies(localPortReassigning: unknownCurrent)
+        ).execute(.reassignLocalPort)
+        XCTAssertEqual(racedOutcome.status, .refused)
+        XCTAssertEqual(unknownCurrentOutcome.status, .refused)
     }
 
     func testConcretePortUpdaterRefusesMissingConfigurationWithoutCreatingSupportState() async throws {
@@ -486,7 +484,8 @@ final class RepairEngineTests: XCTestCase {
         )).execute(.repairLaunchAgent)
 
         XCTAssertEqual(outcome.status, .refused)
-        XCTAssertEqual(await writer.writeCount, 0)
+        let writeCount = await writer.writeCount
+        XCTAssertEqual(writeCount, 0)
     }
 
     func testExactLaunchAgentContractInspectorAndWriterRejectGuardsAndAcceptExactTarget() async throws {
@@ -501,8 +500,10 @@ final class RepairEngineTests: XCTestCase {
         let writer = FileSystemManagedLaunchAgentWriter(reloader: reloader)
 
         XCTAssertFalse(inspector.inspect(contract).ownedByMacOrchestrator)
-        XCTAssertEqual(await writer.writeExactManagedContract(contract), .repaired)
-        XCTAssertEqual(await reloader.reloadedContracts, [contract])
+        let writeOutcome = await writer.writeExactManagedContract(contract)
+        let reloadedContracts = await reloader.reloadedContracts
+        XCTAssertEqual(writeOutcome, .repaired)
+        XCTAssertEqual(reloadedContracts, [contract])
         let owned = inspector.inspect(contract)
         XCTAssertTrue(owned.exactLabel)
         XCTAssertTrue(owned.exactPath)
@@ -537,7 +538,8 @@ final class RepairEngineTests: XCTestCase {
             at: contract.launchAgentURL,
             withDestinationURL: unrelated
         )
-        XCTAssertEqual(await writer.writeExactManagedContract(contract), .refused)
+        let writeOutcome = await writer.writeExactManagedContract(contract)
+        XCTAssertEqual(writeOutcome, .refused)
         XCTAssertFalse(inspector.inspect(contract).exactPath)
     }
 
@@ -565,8 +567,10 @@ final class RepairEngineTests: XCTestCase {
 
         let reloader = RecordingLaunchAgentReloader(result: .repaired)
         let writer = FileSystemManagedLaunchAgentWriter(reloader: reloader)
-        XCTAssertEqual(await writer.writeExactManagedContract(contract), .refused)
-        XCTAssertEqual(await reloader.reloadedContracts, [])
+        let writeOutcome = await writer.writeExactManagedContract(contract)
+        let reloadedContracts = await reloader.reloadedContracts
+        XCTAssertEqual(writeOutcome, .refused)
+        XCTAssertEqual(reloadedContracts, [])
         XCTAssertEqual(try Data(contentsOf: foreignLaunchAgent), foreignData)
     }
 
@@ -580,16 +584,20 @@ final class RepairEngineTests: XCTestCase {
 
         let failedReloader = RecordingLaunchAgentReloader(result: .failed)
         let failedWriter = FileSystemManagedLaunchAgentWriter(reloader: failedReloader)
-        XCTAssertEqual(await failedWriter.writeExactManagedContract(contract), .failed)
-        XCTAssertEqual(await failedReloader.reloadedContracts, [contract])
+        let failedWriteOutcome = await failedWriter.writeExactManagedContract(contract)
+        let failedReloadedContracts = await failedReloader.reloadedContracts
+        XCTAssertEqual(failedWriteOutcome, .failed)
+        XCTAssertEqual(failedReloadedContracts, [contract])
 
         let userActionReloader = RecordingLaunchAgentReloader(result: .requiresUserAction)
         let userActionWriter = FileSystemManagedLaunchAgentWriter(reloader: userActionReloader)
-        XCTAssertEqual(await userActionWriter.writeExactManagedContract(contract), .requiresUserAction)
+        let userActionOutcome = await userActionWriter.writeExactManagedContract(contract)
+        XCTAssertEqual(userActionOutcome, .requiresUserAction)
 
         let notNeededReloader = RecordingLaunchAgentReloader(result: .notNeeded)
         let notNeededWriter = FileSystemManagedLaunchAgentWriter(reloader: notNeededReloader)
-        XCTAssertEqual(await notNeededWriter.writeExactManagedContract(contract), .notNeeded)
+        let notNeededOutcome = await notNeededWriter.writeExactManagedContract(contract)
+        XCTAssertEqual(notNeededOutcome, .notNeeded)
     }
 
     func testLaunchAgentRepairPassesExactContractOnlyAfterOwnershipGuard() async {
@@ -606,8 +614,10 @@ final class RepairEngineTests: XCTestCase {
             writer: writer
         )
 
-        XCTAssertEqual(await repairer.repairManagedLaunchAgent(), .repaired)
-        XCTAssertEqual(await writer.writtenContracts, [contract])
+        let repairOutcome = await repairer.repairManagedLaunchAgent()
+        let writtenContracts = await writer.writtenContracts
+        XCTAssertEqual(repairOutcome, .repaired)
+        XCTAssertEqual(writtenContracts, [contract])
     }
 
     func testLaunchAgentRepairAllowsMissingSafeTargetAndMalformedOwnedContract() async {
@@ -634,8 +644,10 @@ final class RepairEngineTests: XCTestCase {
                 ownership: StaticLaunchAgentOwnershipFacts(facts: facts),
                 writer: writer
             )
-            XCTAssertEqual(await repairer.repairManagedLaunchAgent(), .repaired)
-            XCTAssertEqual(await writer.writeCount, 1)
+            let repairOutcome = await repairer.repairManagedLaunchAgent()
+            let writeCount = await writer.writeCount
+            XCTAssertEqual(repairOutcome, .repaired)
+            XCTAssertEqual(writeCount, 1)
         }
 
         let foreignWriter = RecordingLaunchAgentWriter()
@@ -650,8 +662,10 @@ final class RepairEngineTests: XCTestCase {
             )),
             writer: foreignWriter
         )
-        XCTAssertEqual(await foreignRepairer.repairManagedLaunchAgent(), .refused)
-        XCTAssertEqual(await foreignWriter.writeCount, 0)
+        let foreignOutcome = await foreignRepairer.repairManagedLaunchAgent()
+        let foreignWriteCount = await foreignWriter.writeCount
+        XCTAssertEqual(foreignOutcome, .refused)
+        XCTAssertEqual(foreignWriteCount, 0)
     }
 
     func testOwnershipFactsDefaultToFalse() {
@@ -667,9 +681,12 @@ final class RepairEngineTests: XCTestCase {
             ownership: LifecycleOwnershipFacts(mcpServerOwned: true, remoteConnectorOwned: true)
         )
 
-        XCTAssertEqual(await refused.retry(.mcpServer).status, .refused)
-        XCTAssertEqual(await refused.retry(.remoteConnector).status, .requiresUserAction)
-        XCTAssertEqual(await allowed.retry(.mcpServer).status, .requiresUserAction)
+        let refusedServer = await refused.retry(.mcpServer)
+        let refusedRemote = await refused.retry(.remoteConnector)
+        let allowedServer = await allowed.retry(.mcpServer)
+        XCTAssertEqual(refusedServer.status, .refused)
+        XCTAssertEqual(refusedRemote.status, .requiresUserAction)
+        XCTAssertEqual(allowedServer.status, .requiresUserAction)
     }
 
     func testVerifiedBootstrapOnlyHandsOffPinnedVerifiedContext() async {
@@ -680,11 +697,10 @@ final class RepairEngineTests: XCTestCase {
             context: VerifiedBootstrapContext(releasePinned: true, artifactVerified: true, helperOwned: true)
         )
 
-        XCTAssertEqual(
-            await RepairEngine(dependencies: RepairDependencies(verifiedBootstrapHandingOff: unverified))
-                .execute(.rerunVerifiedBootstrap).status,
-            .refused
-        )
+        let unverifiedOutcome = await RepairEngine(
+            dependencies: RepairDependencies(verifiedBootstrapHandingOff: unverified)
+        ).execute(.rerunVerifiedBootstrap)
+        XCTAssertEqual(unverifiedOutcome.status, .refused)
         let outcome = await RepairEngine(dependencies: RepairDependencies(
             verifiedBootstrapHandingOff: verified
         )).execute(.rerunVerifiedBootstrap)

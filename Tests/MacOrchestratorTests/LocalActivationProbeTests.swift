@@ -606,7 +606,12 @@ private final class ActivationProbeURLProtocol: URLProtocol {
         Self.requests.append(request)
         do {
             let response = try XCTUnwrap(Self.handler?(request))
-            let responseURL = response.responseURL ?? (try XCTUnwrap(request.url))
+            let responseURL: URL
+            if let explicitResponseURL = response.responseURL {
+                responseURL = explicitResponseURL
+            } else {
+                responseURL = try XCTUnwrap(request.url)
+            }
             let httpResponse = try XCTUnwrap(
                 HTTPURLResponse(
                     url: responseURL,

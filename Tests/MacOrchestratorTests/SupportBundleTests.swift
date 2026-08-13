@@ -124,7 +124,7 @@ final class SupportBundleTests: XCTestCase {
     func testPreviewMetadataIsRedactedAndSensitiveCategoriesAreExcluded() throws {
         let connectorToken = "connector-secret-preview-123"
         let ngrokToken = "ngrok_preview_token_1234567890"
-        let home = "/Users/synthetic/Documents/private"
+        let home = ["/Users", "synthetic", "Documents", "private"].joined(separator: "/")
         let connectorURL = "https://connector.example.test/\(connectorToken)/mcp"
         let source = RecordingBundleSource(entries: [
             sourceEntry(
@@ -332,10 +332,11 @@ final class SupportBundleTests: XCTestCase {
         let connectorToken = "capability-token-synthetic-123"
         let ngrokToken = "2f7b8e3c9a1d4e6f8a0b2c4d6e8f0a1b"
         let connectorURL = "https://connector.example.test/\(connectorToken)/mcp?token=\(connectorToken)"
+        let privatePath = ["/Users", "synthetic", "Documents", "private.txt"].joined(separator: "/")
         let payload = """
-        {"authorization":"Bearer \(connectorToken)","connectorURL":"\(connectorURL)","token":"\(connectorToken)","path":"/Users/synthetic/Documents/private.txt","nested":{"secret":"\(ngrokToken)"}}
+        {"authorization":"Bearer \(connectorToken)","connectorURL":"\(connectorURL)","token":"\(connectorToken)","path":"\(privatePath)","nested":{"secret":"\(ngrokToken)"}}
         """
-        let log = "remote=\(connectorURL) ngrok_authtoken=\(ngrokToken) path=/Users/synthetic/Documents/private.txt"
+        let log = "remote=\(connectorURL) ngrok_authtoken=\(ngrokToken) path=\(privatePath)"
         let source = RecordingBundleSource(entries: [
             sourceEntry(logicalID: "doctor-report", archivePath: "doctor-report.json", data: Data(payload.utf8)),
             sourceEntry(logicalID: "logs", archivePath: "logs/current.log", data: Data(log.utf8)),

@@ -160,6 +160,85 @@ final class DoctorEngineTests: XCTestCase {
         XCTAssertEqual(DiagnosticChecks.configurationMigration(cleanupPending).status, .warn)
     }
 
+    func testUnsafeConfigurationAncestorBlocksContextUsabilityAndDesiredState() {
+        let primary = DoctorFixture.file(state: .valid, valid: true, schemaVersion: 1, generation: 1)
+        let facts = ConfigurationDiagnosticFacts(
+            directoryExists: true,
+            directoryMode: 0o700,
+            directoryPathSafe: false,
+            primary: primary
+        )
+
+        XCTAssertFalse(DiagnosticChecks.isUsableConfigurationContext(facts))
+        XCTAssertEqual(DiagnosticChecks.configurationRead(facts).status, .fail)
+        XCTAssertEqual(DiagnosticChecks.configurationRecovery(facts).status, .fail)
+    }
+
+    func testReadOnlyConfigurationProviderMarksSymlinkedSupportAncestorUnsafe() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let foreign = root.appendingPathComponent("foreign", isDirectory: true)
+        let support = root.appendingPathComponent("support", isDirectory: true)
+        try FileManager.default.createDirectory(at: foreign, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: support, withDestinationURL: foreign)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let facts = try ReadOnlyConfigurationDiagnosticProvider(directoryURL: support).inspect()
+
+        XCTAssertTrue(facts.directoryIsSymlink)
+        XCTAssertFalse(facts.directoryPathSafe)
+        XCTAssertFalse(DiagnosticChecks.isUsableConfigurationContext(facts))
+    }
+
+    func testManagedPermissionAdapterMapsRequesterProbeWithoutTCCClaims() throws {
+        let provider = SystemManagedRuntimePermissionFactsProvider(
+            runtimeDirectory: URL(fileURLWithPath: "/private/tmp/runtime"),
+            checker: FixtureManagedPermissionChecker(facts: ManagedPermissionProbeFacts(
+                accessibility: true,
+                screenRecording: false,
+                automation: true,
+                activeConsole: true,
+                unlocked: false
+            ))
+        )
+
+        let facts = try provider.inspect()
+
+        XCTAssertTrue(facts.requesterIsManagedRuntime)
+        XCTAssertTrue(facts.accessibility)
+        XCTAssertFalse(facts.screenRecording)
+        XCTAssertTrue(facts.activeConsole)
+        XCTAssertTrue(facts.sessionLocked)
+    }
+
+    func testLogDirectoryPermissionBoundariesAndUpdateInspectionFailureAreStable() {
+        XCTAssertEqual(
+            DiagnosticChecks.logDirectoryPermissions(LogDirectoryFacts()).status,
+            .skip
+        )
+        XCTAssertEqual(
+            DiagnosticChecks.logDirectoryPermissions(LogDirectoryFacts(
+                inspectionAvailable: true,
+                exists: true,
+                isDirectory: true,
+                mode: 0o755
+            )).status,
+            .fail
+        )
+        XCTAssertEqual(
+            DiagnosticChecks.logDirectoryPermissions(LogDirectoryFacts(
+                inspectionAvailable: true,
+                exists: true,
+                isDirectory: true,
+                mode: 0o700
+            )).status,
+            .pass
+        )
+        XCTAssertEqual(
+            DiagnosticChecks.updateAvailability(UpdateAvailabilityFacts(inspectionFailed: true)).status,
+            .warn
+        )
+    }
+
     func testInstallationVersionMismatchAndUnavailableIntegrityEvidenceAreConservative() {
         let healthy = InstalledReleaseFacts(
             releaseVersion: "1.0.0",
@@ -868,6 +947,12 @@ private struct FixtureInstalledProvider: InstalledReleaseFactsProviding {
 private struct FixturePermissionProvider: PermissionFactsProviding {
     let facts: PermissionFacts
     func inspect() throws -> PermissionFacts { facts }
+}
+
+private struct FixtureManagedPermissionChecker: ManagedPermissionChecking {
+    let facts: ManagedPermissionProbeFacts?
+
+    func probe(runtimeDirectory: URL) -> ManagedPermissionProbeFacts? { facts }
 }
 
 private final class RecordingPermissionProvider: PermissionFactsProviding, @unchecked Sendable {

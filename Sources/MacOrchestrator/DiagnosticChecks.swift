@@ -15,10 +15,12 @@ enum DiagnosticChecks {
         static let adHocTrust = "Ad-hoc signing is supported for this development install, but distribution trust is not established."
         static let permissionRequired = "The managed runtime lacks a required interactive permission."
         static let sessionUnavailable = "An active unlocked console session is required for interactive operations."
+        static let requesterProbeVerified = "The managed runtime permission probe reported the requested facts."
         static let keychainAbsent = "The optional Keychain item is not present."
         static let keychainUnavailable = "Keychain presence could not be determined."
         static let malformedPort = "The selected local port is invalid."
         static let portOccupied = "The selected local port is occupied by an unrelated listener."
+        static let portInspectionUnavailable = "The selected local port could not be inspected safely."
         static let mcpUnavailable = "The local MCP server could not be verified."
         static let mcpNotReady = "The local MCP server is live but canonical readiness was not verified."
         static let inventoryMismatch = "The local MCP tool inventory does not match the expected current-core inventory."
@@ -30,14 +32,16 @@ enum DiagnosticChecks {
         static let diskUnavailable = "The filesystem free-space observation is unavailable."
         static let diskLow = "Free disk space is below the configured noncritical threshold."
         static let unsafePath = "A critical path is symlinked and cannot be trusted."
+        static let logDirectoryUnavailable = "Log-directory permissions could not be determined."
     }
 
     static func configurationRead(_ facts: ConfigurationDiagnosticFacts?) -> DiagnosticResult {
         guard let facts else {
             return result("configuration.read", "Configuration read", .fail, Text.providerUnavailable)
         }
-        guard isUsableConfigurationFile(facts.primary) else {
-            let repair = isUsableConfigurationFile(facts.backup) ? RepairActionID.restoreConfigurationBackup : nil
+        guard isUsableConfigurationContext(facts) else {
+            let repair = isUsableConfigurationDirectory(facts) && isUsableConfigurationFile(facts.backup)
+                ? RepairActionID.restoreConfigurationBackup : nil
             return result(
                 "configuration.read",
                 "Configuration read",
@@ -53,7 +57,7 @@ enum DiagnosticChecks {
         guard let facts else {
             return result("configuration.permissions", "Configuration permissions", .fail, Text.providerUnavailable)
         }
-        guard facts.directoryExists, !facts.directoryIsSymlink,
+        guard isUsableConfigurationDirectory(facts),
               let directoryMode = facts.directoryMode, privateMode(directoryMode) else {
             return result("configuration.permissions", "Configuration permissions", .fail, "Configuration support permissions are unsafe.")
         }
@@ -75,7 +79,7 @@ enum DiagnosticChecks {
         if facts.primary.state == .unsupported || schemaVersion != AppConfiguration.currentSchemaVersion {
             return result("configuration.schema", "Configuration schema", .fail, "The configuration schema is unsupported.")
         }
-        guard isUsableConfigurationFile(facts.primary) else {
+        guard isUsableConfigurationContext(facts) else {
             return result("configuration.schema", "Configuration schema", .fail, Text.invalidConfiguration)
         }
         return result("configuration.schema", "Configuration schema", .pass, Text.verified)
@@ -84,6 +88,9 @@ enum DiagnosticChecks {
     static func configurationBackup(_ facts: ConfigurationDiagnosticFacts?) -> DiagnosticResult {
         guard let facts else {
             return result("configuration.backup", "Configuration backup", .skip, Text.providerUnavailable)
+        }
+        guard isUsableConfigurationDirectory(facts) else {
+            return result("configuration.backup", "Configuration backup", .warn, Text.unsafePath)
         }
         let backup = facts.backup
         guard backup.exists else {
@@ -99,8 +106,11 @@ enum DiagnosticChecks {
         guard let facts else {
             return result("configuration.recovery", "Configuration recovery", .skip, Text.providerUnavailable)
         }
-        let primaryUsable = isUsableConfigurationFile(facts.primary)
-        let backupUsable = isUsableConfigurationFile(facts.backup)
+        let primaryUsable = isUsableConfigurationContext(facts)
+        let backupUsable = isUsableConfigurationDirectory(facts) && isUsableConfigurationFile(facts.backup)
+        guard isUsableConfigurationDirectory(facts) else {
+            return result("configuration.recovery", "Configuration recovery", .fail, Text.unsafePath)
+        }
         if !primaryUsable && backupUsable {
             return result(
                 "configuration.recovery",
@@ -123,7 +133,7 @@ enum DiagnosticChecks {
         guard let facts else {
             return result("configuration.generation", "Configuration generation", .skip, Text.providerUnavailable)
         }
-        guard isUsableConfigurationFile(facts.primary), let generation = facts.primary.generation, generation >= 1 else {
+        guard isUsableConfigurationContext(facts), let generation = facts.primary.generation, generation >= 1 else {
             return result("configuration.generation", "Configuration generation", .fail, Text.invalidConfiguration)
         }
         if isUsableConfigurationFile(facts.backup), let backupGeneration = facts.backup.generation, backupGeneration > generation {
@@ -287,7 +297,7 @@ enum DiagnosticChecks {
         if capabilities["mac.ui"] == true && !facts.automation {
             return result("permissions.requester", "Requester permissions", .fail, Text.permissionRequired, repair: .openAutomationSettings)
         }
-        return result("permissions.requester", "Requester permissions", .pass, Text.verified)
+        return result("permissions.requester", "Requester permissions", .pass, Text.requesterProbeVerified)
     }
 
     static func keychainConnector(_ facts: KeychainPresenceFacts?) -> DiagnosticResult {
@@ -331,6 +341,9 @@ enum DiagnosticChecks {
         }
         guard (1...65535).contains(configuredPort) else {
             return result("port.selected", "Selected local port", .fail, Text.malformedPort, repair: .reassignLocalPort)
+        }
+        guard facts.inspectionAvailable else {
+            return result("port.selected", "Selected local port", .warn, Text.portInspectionUnavailable, repair: .reassignLocalPort)
         }
         if facts.pidReuseDetected || (facts.listenerPresent && !facts.listenerOwned) {
             return result("port.selected", "Selected local port", .fail, Text.portOccupied, repair: .reassignLocalPort)
@@ -467,6 +480,9 @@ enum DiagnosticChecks {
         guard let facts else {
             return result("update.availability", "Update availability", .skip, Text.updateUnavailable)
         }
+        if facts.inspectionFailed {
+            return result("update.availability", "Update availability", .warn, "Update discovery failed safely; trust was not established.")
+        }
         switch facts.status {
         case .unavailable:
             return result("update.availability", "Update availability", .skip, Text.updateUnavailable)
@@ -498,6 +514,22 @@ enum DiagnosticChecks {
             return result("filesystem.critical-paths", "Critical filesystem paths", .fail, Text.unsafePath)
         }
         return result("filesystem.critical-paths", "Critical filesystem paths", .pass, Text.verified)
+    }
+
+    static func logDirectoryPermissions(_ facts: LogDirectoryFacts?) -> DiagnosticResult {
+        guard let facts, facts.inspectionAvailable else {
+            return result("filesystem.log-directory-permissions", "Log-directory permissions", .skip, Text.logDirectoryUnavailable)
+        }
+        guard facts.pathSafe else {
+            return result("filesystem.log-directory-permissions", "Log-directory permissions", .fail, Text.unsafePath)
+        }
+        guard facts.exists else {
+            return result("filesystem.log-directory-permissions", "Log-directory permissions", .skip, "The log directory is not present.")
+        }
+        guard facts.isDirectory, let mode = facts.mode, privateMode(mode) else {
+            return result("filesystem.log-directory-permissions", "Log-directory permissions", .fail, "Log-directory permissions are unsafe.")
+        }
+        return result("filesystem.log-directory-permissions", "Log-directory permissions", .pass, Text.verified)
     }
 
     static func futureCapability(_ id: String, title: String) -> DiagnosticResult {
@@ -554,6 +586,17 @@ enum DiagnosticChecks {
             && file.state == .valid
             && !file.isSymlink
             && file.schemaVersion == AppConfiguration.currentSchemaVersion
+    }
+
+    static func isUsableConfigurationContext(_ facts: ConfigurationDiagnosticFacts) -> Bool {
+        isUsableConfigurationDirectory(facts)
+            && isUsableConfigurationFile(facts.primary)
+    }
+
+    static func isUsableConfigurationDirectory(_ facts: ConfigurationDiagnosticFacts) -> Bool {
+        (facts.directoryExists || (facts.directoryMode == nil && facts.primary.exists))
+            && !facts.directoryIsSymlink
+            && facts.directoryPathSafe
     }
 
     static func consumesProtectedBehavior(_ configuration: AppConfiguration?) -> Bool {

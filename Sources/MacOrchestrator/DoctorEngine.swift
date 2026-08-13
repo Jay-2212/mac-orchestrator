@@ -64,7 +64,7 @@ struct ReadOnlyDoctorConfigurationContextProvider: DoctorConfigurationContextPro
     }
 
     private func decodeValidatedConfiguration(facts: ConfigurationDiagnosticFacts) -> AppConfiguration? {
-        guard DiagnosticChecks.isUsableConfigurationFile(facts.primary),
+        guard DiagnosticChecks.isUsableConfigurationContext(facts),
               let data = try? Data(contentsOf: primaryConfigurationURL),
               let configuration = try? decoder.decode(AppConfiguration.self, from: data) else {
             return nil
@@ -109,6 +109,33 @@ struct SystemDoctorKeychainPresenceProvider: DoctorKeychainPresenceProviding {
     }
 }
 
+struct SystemManagedRuntimePermissionFactsProvider: PermissionFactsProviding {
+    let runtimeDirectory: URL
+    let checker: any ManagedPermissionChecking
+
+    init(
+        runtimeDirectory: URL,
+        checker: any ManagedPermissionChecking = SystemManagedPermissionChecker()
+    ) {
+        self.runtimeDirectory = runtimeDirectory
+        self.checker = checker
+    }
+
+    func inspect() throws -> PermissionFacts {
+        guard let probe = checker.probe(runtimeDirectory: runtimeDirectory) else {
+            throw DiagnosticProviderError.unavailable
+        }
+        return PermissionFacts(
+            accessibility: probe.accessibility,
+            screenRecording: probe.screenRecording,
+            automation: probe.automation,
+            activeConsole: probe.activeConsole,
+            sessionLocked: !probe.unlocked,
+            requesterIsManagedRuntime: true
+        )
+    }
+}
+
 protocol DoctorAsyncLocalMCPDiagnosticProviding {
     func inspect() async throws -> LocalMCPFacts
 }
@@ -136,6 +163,7 @@ struct DoctorDependencies {
     let lifecycleProvider: any LifecycleFactsProviding
     let remoteConnectorProvider: any RemoteConnectorFactsProviding
     let diskSpaceProvider: any DiskSpaceProviding
+    let logDirectoryProvider: any LogDirectoryPermissionsProviding
     let updateProvider: any UpdateAvailabilityProviding
     let thresholds: DoctorThresholds
     let clock: @Sendable () -> Date
@@ -143,7 +171,7 @@ struct DoctorDependencies {
     init(
         configurationContextProvider: any DoctorConfigurationContextProviding = UnavailableConfigurationContextProvider(),
         installedReleaseProvider: any InstalledReleaseFactsProviding = UnavailableInstalledReleaseProvider(),
-        permissionProvider: any PermissionFactsProviding = UnavailablePermissionProvider(),
+        permissionProvider: (any PermissionFactsProviding)? = nil,
         keychainPresenceProvider: any DoctorKeychainPresenceProviding = SystemDoctorKeychainPresenceProvider(),
         portProvider: any PortFactsProviding = UnavailablePortProvider(),
         localMCPProvider: any LocalMCPDiagnosticProviding = UnavailableLocalMCPProvider(),
@@ -151,13 +179,19 @@ struct DoctorDependencies {
         lifecycleProvider: any LifecycleFactsProviding = UnavailableLifecycleProvider(),
         remoteConnectorProvider: any RemoteConnectorFactsProviding = UnavailableRemoteProvider(),
         diskSpaceProvider: any DiskSpaceProviding = UnavailableDiskProvider(),
+        logDirectoryProvider: any LogDirectoryPermissionsProviding = ReadOnlyLogDirectoryPermissionsProvider(
+            directoryURL: FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Library/Logs/Mac Orchestrator", isDirectory: true)
+        ),
         updateProvider: any UpdateAvailabilityProviding = UnavailableUpdateProvider(),
         thresholds: DoctorThresholds = DoctorThresholds(),
         clock: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.configurationContextProvider = configurationContextProvider
         self.installedReleaseProvider = installedReleaseProvider
-        self.permissionProvider = permissionProvider
+        self.permissionProvider = permissionProvider ?? SystemManagedRuntimePermissionFactsProvider(
+            runtimeDirectory: DiagnosticPathSet.defaultPaths().runtimeDirectory
+        )
         self.keychainPresenceProvider = keychainPresenceProvider
         self.portProvider = portProvider
         self.localMCPProvider = localMCPProvider
@@ -165,6 +199,7 @@ struct DoctorDependencies {
         self.lifecycleProvider = lifecycleProvider
         self.remoteConnectorProvider = remoteConnectorProvider
         self.diskSpaceProvider = diskSpaceProvider
+        self.logDirectoryProvider = logDirectoryProvider
         self.updateProvider = updateProvider
         self.thresholds = thresholds
         self.clock = clock
@@ -184,7 +219,7 @@ struct DoctorEngine {
         let snapshot = inspectConfigurationContext()
         let configurationFacts = snapshot?.facts
         let configuration = snapshot.flatMap {
-            DiagnosticChecks.isUsableConfigurationFile($0.facts.primary) ? $0.validatedConfiguration : nil
+            DiagnosticChecks.isUsableConfigurationContext($0.facts) ? $0.validatedConfiguration : nil
         }
         let hasValidatedConfiguration = configuration != nil
         let serverDesired = configuration?.process.serverDesired == true
@@ -207,6 +242,7 @@ struct DoctorEngine {
         )
         let remoteFacts = remoteDesired ? inspectRemote() : nil
         let diskFacts = inspectDisk()
+        let logDirectoryFacts = inspectLogDirectory()
         let updateFacts = inspectUpdate()
 
         var results = [
@@ -245,6 +281,7 @@ struct DoctorEngine {
             DiagnosticChecks.updateAvailability(updateFacts),
             DiagnosticChecks.diskFreeSpace(diskFacts, thresholdBytes: dependencies.thresholds.lowDiskBytes),
             DiagnosticChecks.criticalPaths(diskFacts),
+            DiagnosticChecks.logDirectoryPermissions(logDirectoryFacts),
             DiagnosticChecks.futureCapability("capability.meridian", title: "Meridian capability"),
             DiagnosticChecks.futureCapability("capability.cloudflare", title: "Cloudflare capability"),
             DiagnosticChecks.futureCapability("capability.telegram-assistant", title: "Telegram Assistant capability"),
@@ -306,8 +343,18 @@ struct DoctorEngine {
         try? dependencies.diskSpaceProvider.inspect()
     }
 
+    private func inspectLogDirectory() -> LogDirectoryFacts? {
+        try? dependencies.logDirectoryProvider.inspect()
+    }
+
     private func inspectUpdate() -> UpdateAvailabilityFacts? {
-        try? dependencies.updateProvider.inspect()
+        do {
+            return try dependencies.updateProvider.inspect()
+        } catch DiagnosticProviderError.unavailable {
+            return UpdateAvailabilityFacts(status: .unavailable)
+        } catch {
+            return UpdateAvailabilityFacts(inspectionFailed: true)
+        }
     }
 }
 
@@ -323,10 +370,6 @@ private struct UnavailableConfigurationContextProvider: DoctorConfigurationConte
 
 private struct UnavailableInstalledReleaseProvider: InstalledReleaseFactsProviding {
     func inspect() throws -> InstalledReleaseFacts { throw DiagnosticProviderError.unavailable }
-}
-
-private struct UnavailablePermissionProvider: PermissionFactsProviding {
-    func inspect() throws -> PermissionFacts { throw DiagnosticProviderError.unavailable }
 }
 
 private struct UnavailablePortProvider: PortFactsProviding {
@@ -347,6 +390,10 @@ private struct UnavailableRemoteProvider: RemoteConnectorFactsProviding {
 
 private struct UnavailableDiskProvider: DiskSpaceProviding {
     func inspect() throws -> DiskSpaceFacts { throw DiagnosticProviderError.unavailable }
+}
+
+private struct UnavailableLogDirectoryProvider: LogDirectoryPermissionsProviding {
+    func inspect() throws -> LogDirectoryFacts { throw DiagnosticProviderError.unavailable }
 }
 
 private struct UnavailableUpdateProvider: UpdateAvailabilityProviding {

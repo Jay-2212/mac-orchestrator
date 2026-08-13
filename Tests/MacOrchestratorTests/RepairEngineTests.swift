@@ -304,6 +304,32 @@ final class RepairEngineTests: XCTestCase {
         XCTAssertEqual(await updater.terminatedListeners, 0)
     }
 
+    func testPortReassignmentAllowsExplicitUnrelatedCurrentListenerWithoutTermination() async {
+        let occupancy = SequencedPortOccupancy(results: [
+            .occupiedUnrelated,
+            .free,
+            .free,
+        ])
+        let updater = RecordingPortUpdater()
+        let reassigner = SafeLocalPortReassigner(
+            request: LocalPortReassignmentRequest(
+                currentPort: 8000,
+                candidatePort: 8123,
+                expectedOwnerID: "owner-1"
+            ),
+            occupancy: occupancy,
+            configuration: updater
+        )
+
+        XCTAssertEqual(
+            await RepairEngine(dependencies: RepairDependencies(localPortReassigning: reassigner))
+                .execute(.reassignLocalPort).status,
+            .repaired
+        )
+        XCTAssertEqual(await updater.updatedPorts, [8123])
+        XCTAssertEqual(await updater.terminatedListeners, 0)
+    }
+
     func testPortReassignmentRefusesOccupiedCandidateAndOwnershipMismatch() async {
         let occupied = SafeLocalPortReassigner(
             request: LocalPortReassignmentRequest(
@@ -517,6 +543,50 @@ final class RepairEngineTests: XCTestCase {
 
         XCTAssertEqual(await repairer.repairManagedLaunchAgent(), .repaired)
         XCTAssertEqual(await writer.writtenContracts, [contract])
+    }
+
+    func testLaunchAgentRepairAllowsMissingSafeTargetAndMalformedOwnedContract() async {
+        let contract = ManagedLaunchAgentContract(homeDirectory: makeTemporaryHome())
+        for facts in [
+            LaunchAgentOwnershipFacts(
+                exactLabel: false,
+                exactPath: false,
+                exactContract: false,
+                targetSafe: true,
+                targetExists: false
+            ),
+            LaunchAgentOwnershipFacts(
+                exactLabel: true,
+                exactPath: true,
+                exactContract: false,
+                targetSafe: true,
+                targetExists: true
+            ),
+        ] {
+            let writer = RecordingLaunchAgentWriter()
+            let repairer = ManagedLaunchAgentRepairer(
+                contract: contract,
+                ownership: StaticLaunchAgentOwnershipFacts(facts: facts),
+                writer: writer
+            )
+            XCTAssertEqual(await repairer.repairManagedLaunchAgent(), .repaired)
+            XCTAssertEqual(await writer.writeCount, 1)
+        }
+
+        let foreignWriter = RecordingLaunchAgentWriter()
+        let foreignRepairer = ManagedLaunchAgentRepairer(
+            contract: contract,
+            ownership: StaticLaunchAgentOwnershipFacts(facts: LaunchAgentOwnershipFacts(
+                exactLabel: false,
+                exactPath: true,
+                exactContract: false,
+                targetSafe: true,
+                targetExists: true
+            )),
+            writer: foreignWriter
+        )
+        XCTAssertEqual(await foreignRepairer.repairManagedLaunchAgent(), .refused)
+        XCTAssertEqual(await foreignWriter.writeCount, 0)
     }
 
     func testOwnershipFactsDefaultToFalse() {
@@ -756,14 +826,22 @@ private struct StaticLaunchAgentOwnershipFacts: LaunchAgentOwnershipInspecting {
         exactLabel: Bool,
         exactPath: Bool,
         exactContract: Bool,
-        ownedByMacOrchestrator: Bool = false
+        ownedByMacOrchestrator: Bool = false,
+        targetSafe: Bool = false,
+        targetExists: Bool = false
     ) {
         self.facts = LaunchAgentOwnershipFacts(
             exactLabel: exactLabel,
             exactPath: exactPath,
             exactContract: exactContract,
-            ownedByMacOrchestrator: ownedByMacOrchestrator
+            ownedByMacOrchestrator: ownedByMacOrchestrator,
+            targetSafe: targetSafe,
+            targetExists: targetExists
         )
+    }
+
+    init(facts: LaunchAgentOwnershipFacts) {
+        self.facts = facts
     }
 
     func inspect(_ contract: ManagedLaunchAgentContract) -> LaunchAgentOwnershipFacts { facts }

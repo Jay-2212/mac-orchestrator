@@ -511,8 +511,12 @@ struct SafeLocalPortReassigner: LocalPortReassigning {
         guard request.currentPort != request.candidatePort else {
             return .refused
         }
-        guard case let .occupiedOwned(ownerID) = await occupancy.inspect(port: request.currentPort),
-              ownerID == request.expectedOwnerID else {
+        switch await occupancy.inspect(port: request.currentPort) {
+        case let .occupiedOwned(ownerID) where ownerID == request.expectedOwnerID:
+            break
+        case .occupiedUnrelated:
+            break
+        default:
             return .refused
         }
         guard case .free = await occupancy.inspect(port: request.candidatePort) else {
@@ -545,12 +549,16 @@ struct LaunchAgentOwnershipFacts: Equatable, Sendable {
     let exactPath: Bool
     let exactContract: Bool
     let ownedByMacOrchestrator: Bool
+    let targetSafe: Bool
+    let targetExists: Bool
 
     init(
         exactLabel: Bool,
         exactPath: Bool,
         exactContract: Bool,
-        ownedByMacOrchestrator: Bool = false
+        ownedByMacOrchestrator: Bool = false,
+        targetSafe: Bool = false,
+        targetExists: Bool = false
     ) {
         self.exactLabel = exactLabel
         self.exactPath = exactPath
@@ -559,6 +567,12 @@ struct LaunchAgentOwnershipFacts: Equatable, Sendable {
             && exactLabel
             && exactPath
             && exactContract
+        self.targetSafe = targetSafe
+        self.targetExists = targetExists
+    }
+
+    var repairableTarget: Bool {
+        ownedByMacOrchestrator || (targetSafe && (!targetExists || (exactLabel && exactPath)))
     }
 }
 
@@ -650,7 +664,7 @@ struct ManagedLaunchAgentRepairer: LaunchAgentRepairing {
 
     func repairManagedLaunchAgent() async -> RepairAdapterResult {
         let facts = ownership.inspect(contract)
-        guard facts.ownedByMacOrchestrator else {
+        guard facts.repairableTarget else {
             return .refused
         }
         return await writer.writeExactManagedContract(contract)
@@ -665,23 +679,31 @@ struct FileSystemLaunchAgentOwnershipInspector: @unchecked Sendable, LaunchAgent
     }
 
     func inspect(_ contract: ManagedLaunchAgentContract) -> LaunchAgentOwnershipFacts {
-        let safeTargetPath = areContractPathsSafe(contract)
-            && fileManager.fileExists(atPath: contract.launchAgentURL.path)
-        guard safeTargetPath,
+        let targetSafe = areContractPathsSafe(contract)
+        let targetExists = targetSafe && fileManager.fileExists(atPath: contract.launchAgentURL.path)
+        guard targetSafe, targetExists,
               let data = try? Data(contentsOf: contract.launchAgentURL),
               let object = try? PropertyListSerialization.propertyList(from: data, format: nil) else {
-            return LaunchAgentOwnershipFacts(exactLabel: false, exactPath: false, exactContract: false)
+            return LaunchAgentOwnershipFacts(
+                exactLabel: false,
+                exactPath: false,
+                exactContract: false,
+                targetSafe: targetSafe,
+                targetExists: targetExists
+            )
         }
         let plist = object as? [String: Any]
         let exactLabel = plist?["Label"] as? String == ManagedLaunchAgentContract.label
-        let exactPath = safeTargetPath
+        let exactPath = targetSafe
             && plist?["ProgramArguments"] as? [String] == [contract.executableURL.path]
         let exactContract = contract.matches(object)
         return LaunchAgentOwnershipFacts(
             exactLabel: exactLabel,
             exactPath: exactPath,
             exactContract: exactContract,
-            ownedByMacOrchestrator: exactLabel && exactPath && exactContract
+            ownedByMacOrchestrator: exactLabel && exactPath && exactContract,
+            targetSafe: targetSafe,
+            targetExists: targetExists
         )
     }
 

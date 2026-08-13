@@ -255,6 +255,29 @@ final class DiagnosticLiveProviderTests: XCTestCase {
         XCTAssertNil(facts.listenerPID)
     }
 
+    func testPortProviderMarksCommandFailureAndMalformedOutputUnavailable() throws {
+        let request = DiagnosticCommandRequest(executable: "/usr/sbin/lsof", arguments: [
+            "-nP", "-iTCP:8007", "-sTCP:LISTEN", "-t"
+        ])
+        for result in [
+            DiagnosticCommandResult(status: 1, stdout: "", stderr: "permission denied"),
+            DiagnosticCommandResult(status: 0, stdout: "not-a-pid\n", stderr: ""),
+        ] {
+            let provider = ReadOnlyPortFactsProvider(
+                port: 8007,
+                commandRunner: RecordingDiagnosticCommandRunner(outputs: [request: result]),
+                processRunner: RecordingDiagnosticProcessRunner(processes: [])
+            )
+            let facts = try provider.inspect()
+            XCTAssertFalse(facts.inspectionAvailable)
+            XCTAssertFalse(facts.listenerPresent)
+        }
+        XCTAssertEqual(
+            DiagnosticChecks.portSelected(PortFacts(port: 8007, inspectionAvailable: false), configuredPort: 8007).status,
+            .warn
+        )
+    }
+
     func testNgrokProviderParsesEndpointCountWithoutReturningURLOrBody() throws {
         let apiURL = URL(string: "http://127.0.0.1:4040/api/endpoints")!
         let http = RecordingDiagnosticHTTPRunner(response: DiagnosticHTTPResponse(
@@ -330,6 +353,75 @@ final class DiagnosticLiveProviderTests: XCTestCase {
 
         XCTAssertEqual(facts.binaryArchitecture, "arm64")
         XCTAssertEqual(facts.originalVendorSigning, true)
+    }
+
+    func testNgrokProviderRequiresOneExactOwnedProcessBeforeUsingAgentAPI() throws {
+        let apiURL = URL(string: "http://127.0.0.1:4040/api/endpoints")!
+        let http = RecordingDiagnosticHTTPRunner(response: DiagnosticHTTPResponse(
+            status: 200,
+            url: apiURL,
+            body: Data(#"{"endpoints":[{"url":"https://public.example","upstream":{"url":"http://127.0.0.1:8007"}}]}"#.utf8)
+        ))
+        let process = RecordingDiagnosticProcessRunner(processes: [
+            DiagnosticProcessRecord(
+                pid: 42,
+                commandLine: "/opt/ngrok http --config /tmp/ngrok.yml mac-orchestrator-owner=owner-1",
+                running: true
+            )
+        ])
+        let provider = ReadOnlyRemoteConnectorFactsProvider(
+            desired: true,
+            binaryPresent: true,
+            configurationPresent: true,
+            target: "http://127.0.0.1:8007",
+            httpRunner: http,
+            ownerID: "owner-1",
+            processRunner: process,
+            expectedBinaryPath: "/opt/ngrok"
+        )
+
+        let facts = try provider.inspect()
+
+        XCTAssertTrue(facts.ownershipMarkerPresent)
+        XCTAssertTrue(facts.endpointAvailable)
+        XCTAssertEqual(http.requests, [apiURL])
+
+        let foreign = ReadOnlyRemoteConnectorFactsProvider(
+            desired: true,
+            binaryPresent: true,
+            configurationPresent: true,
+            target: "http://127.0.0.1:8007",
+            httpRunner: http,
+            ownerID: "other-owner",
+            processRunner: process,
+            expectedBinaryPath: "/opt/ngrok"
+        )
+        XCTAssertFalse(try foreign.inspect().ownershipMarkerPresent)
+        XCTAssertEqual(http.requests, [apiURL])
+    }
+
+    func testInstalledReleaseProviderDoesNotInferTrustOrIntegrityFromFilenames() throws {
+        let fixture = try makeReleaseFixture()
+        let paths = fixture.paths
+        try FileManager.default.createDirectory(
+            at: paths.appURL.appendingPathComponent("Contents/_MASReceipt", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        try Data("receipt".utf8).write(to: paths.appURL.appendingPathComponent("Contents/_MASReceipt/receipt"))
+        try FileManager.default.createDirectory(
+            at: paths.appURL.appendingPathComponent("Contents/_CodeSignature", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        try Data("resources".utf8).write(to: paths.appURL.appendingPathComponent("Contents/_CodeSignature/CodeResources"))
+
+        let facts = try ReadOnlyInstalledReleaseFactsProvider(
+            paths: paths,
+            commandRunner: releaseCommandRunner(paths: paths)
+        ).inspect()
+
+        XCTAssertNil(facts.helper.developerIDTrusted)
+        XCTAssertFalse(facts.helper.receiptAvailable)
+        XCTAssertFalse(facts.helper.integrityAvailable)
     }
 
     func testNgrokPathProviderUsesFixedReadOnlyArchitectureAndSigningProbes() throws {

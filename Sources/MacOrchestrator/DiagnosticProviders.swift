@@ -81,6 +81,7 @@ struct ConfigurationDiagnosticFacts: Codable, Equatable, Sendable {
     let directoryExists: Bool
     let directoryMode: UInt16?
     let directoryIsSymlink: Bool
+    let directoryPathSafe: Bool
     let primary: ConfigurationFileFacts
     let backup: ConfigurationFileFacts
     let corruptEvidenceCount: Int
@@ -89,6 +90,7 @@ struct ConfigurationDiagnosticFacts: Codable, Equatable, Sendable {
         directoryExists: Bool = false,
         directoryMode: UInt16? = nil,
         directoryIsSymlink: Bool = false,
+        directoryPathSafe: Bool = true,
         primary: ConfigurationFileFacts = ConfigurationFileFacts(),
         backup: ConfigurationFileFacts = ConfigurationFileFacts(),
         corruptEvidenceCount: Int = 0
@@ -96,6 +98,7 @@ struct ConfigurationDiagnosticFacts: Codable, Equatable, Sendable {
         self.directoryExists = directoryExists
         self.directoryMode = directoryMode
         self.directoryIsSymlink = directoryIsSymlink
+        self.directoryPathSafe = directoryPathSafe
         self.primary = primary
         self.backup = backup
         self.corruptEvidenceCount = corruptEvidenceCount
@@ -146,6 +149,7 @@ struct ReadOnlyConfigurationDiagnosticProvider: ConfigurationDiagnosticProviding
             directoryExists: directoryMetadata.exists,
             directoryMode: directoryMetadata.mode,
             directoryIsSymlink: directoryMetadata.isSymlink,
+            directoryPathSafe: DiagnosticPathSafety.isSafe(directoryURL),
             primary: inspectFile(primaryURL),
             backup: inspectFile(backupURL),
             corruptEvidenceCount: corruptEvidenceCount
@@ -475,6 +479,7 @@ protocol PermissionFactsProviding {
 
 struct PortFacts: Codable, Equatable, Sendable {
     let port: Int
+    let inspectionAvailable: Bool
     let listenerPresent: Bool
     let listenerOwned: Bool
     let listenerPID: Int32?
@@ -482,12 +487,14 @@ struct PortFacts: Codable, Equatable, Sendable {
 
     init(
         port: Int = 0,
+        inspectionAvailable: Bool = true,
         listenerPresent: Bool = false,
         listenerOwned: Bool = false,
         listenerPID: Int32? = nil,
         pidReuseDetected: Bool = false
     ) {
         self.port = port
+        self.inspectionAvailable = inspectionAvailable
         self.listenerPresent = listenerPresent
         self.listenerOwned = listenerOwned
         self.listenerPID = listenerPID
@@ -603,6 +610,61 @@ struct RemoteConnectorFacts: Codable, Equatable, Sendable {
     }
 }
 
+struct LogDirectoryFacts: Codable, Equatable, Sendable {
+    let inspectionAvailable: Bool
+    let exists: Bool
+    let isDirectory: Bool
+    let pathSafe: Bool
+    let mode: UInt16?
+
+    init(
+        inspectionAvailable: Bool = false,
+        exists: Bool = false,
+        isDirectory: Bool = false,
+        pathSafe: Bool = true,
+        mode: UInt16? = nil
+    ) {
+        self.inspectionAvailable = inspectionAvailable
+        self.exists = exists
+        self.isDirectory = isDirectory
+        self.pathSafe = pathSafe
+        self.mode = mode
+    }
+}
+
+protocol LogDirectoryPermissionsProviding {
+    func inspect() throws -> LogDirectoryFacts
+}
+
+struct ReadOnlyLogDirectoryPermissionsProvider: LogDirectoryPermissionsProviding {
+    let directoryURL: URL
+
+    init(directoryURL: URL) {
+        self.directoryURL = directoryURL
+    }
+
+    func inspect() throws -> LogDirectoryFacts {
+        guard DiagnosticPathSafety.isSafe(directoryURL) else {
+            return LogDirectoryFacts(inspectionAvailable: true, exists: true, pathSafe: false)
+        }
+        var metadata = stat()
+        guard lstat(directoryURL.path, &metadata) == 0 else {
+            if errno == ENOENT {
+                return LogDirectoryFacts(inspectionAvailable: true)
+            }
+            return LogDirectoryFacts()
+        }
+        let rawMode = UInt32(metadata.st_mode)
+        return LogDirectoryFacts(
+            inspectionAvailable: true,
+            exists: true,
+            isDirectory: rawMode & UInt32(S_IFMT) == UInt32(S_IFDIR),
+            pathSafe: rawMode & UInt32(S_IFMT) != UInt32(S_IFLNK),
+            mode: UInt16(rawMode & 0o7777)
+        )
+    }
+}
+
 protocol RemoteConnectorFactsProviding {
     func inspect() throws -> RemoteConnectorFacts
 }
@@ -640,18 +702,58 @@ struct UpdateAvailabilityFacts: Codable, Equatable, Sendable {
     let status: UpdateAvailability
     let currentVersion: String?
     let availableVersion: String?
+    let inspectionFailed: Bool
 
     init(
         status: UpdateAvailability = .unavailable,
         currentVersion: String? = nil,
-        availableVersion: String? = nil
+        availableVersion: String? = nil,
+        inspectionFailed: Bool = false
     ) {
         self.status = status
         self.currentVersion = currentVersion
         self.availableVersion = availableVersion
+        self.inspectionFailed = inspectionFailed
     }
 }
 
 protocol UpdateAvailabilityProviding {
     func inspect() throws -> UpdateAvailabilityFacts
+}
+
+enum DiagnosticPathSafety {
+    static func isSafe(_ url: URL) -> Bool {
+        let path = url.standardizedFileURL.path
+        guard path.hasPrefix("/") else { return false }
+        let components = path.split(separator: "/", omittingEmptySubsequences: true)
+        var current = URL(fileURLWithPath: "/", isDirectory: true)
+        for (index, component) in components.enumerated() {
+            current.appendPathComponent(String(component), isDirectory: index < components.count - 1)
+            var metadata = stat()
+            if lstat(current.path, &metadata) == 0 {
+                let mode = UInt32(metadata.st_mode)
+                if mode & UInt32(S_IFMT) == UInt32(S_IFLNK) {
+                    guard isAllowedSystemAlias(current) else { return false }
+                    continue
+                }
+                if index < components.count - 1, mode & UInt32(S_IFMT) != UInt32(S_IFDIR) {
+                    return false
+                }
+            } else if errno != ENOENT {
+                return false
+            }
+        }
+        return true
+    }
+
+    private static func isAllowedSystemAlias(_ url: URL) -> Bool {
+        let path = url.standardizedFileURL.path
+        let expected: String
+        switch path {
+        case "/var": expected = "/private/var"
+        case "/tmp": expected = "/private/tmp"
+        default: return false
+        }
+        return url.resolvingSymlinksInPath().standardizedFileURL.path == expected
+    }
 }

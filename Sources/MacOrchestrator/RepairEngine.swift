@@ -398,23 +398,6 @@ private enum NonFollowingPathGuard {
     }
 }
 
-private enum VerifiedMacOSSystemAlias {
-    static func isAllowed(_ url: URL) -> Bool {
-        let path = url.standardizedFileURL.path
-        let expectedTarget: String
-        switch path {
-        case "/var":
-            expectedTarget = "/private/var"
-        case "/tmp":
-            expectedTarget = "/private/tmp"
-        default:
-            return false
-        }
-
-        return url.resolvingSymlinksInPath().standardizedFileURL.path == expectedTarget
-    }
-}
-
 struct ConfigurationStoreBackupRestorer: @unchecked Sendable, ConfigurationBackupRestoring {
     let store: ConfigurationStore
     let expectedOwnerID: String

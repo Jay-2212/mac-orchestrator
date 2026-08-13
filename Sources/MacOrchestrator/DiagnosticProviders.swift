@@ -744,7 +744,7 @@ enum DiagnosticPathSafety {
             if lstat(current.path, &metadata) == 0 {
                 let mode = UInt32(metadata.st_mode)
                 if mode & UInt32(S_IFMT) == UInt32(S_IFLNK) {
-                    guard isAllowedSystemAlias(current) else { return false }
+                    guard VerifiedMacOSSystemAlias.isAllowed(current) else { return false }
                     continue
                 }
                 if index < components.count - 1, mode & UInt32(S_IFMT) != UInt32(S_IFDIR) {
@@ -756,15 +756,22 @@ enum DiagnosticPathSafety {
         }
         return true
     }
+}
 
-    private static func isAllowedSystemAlias(_ url: URL) -> Bool {
-        let path = url.standardizedFileURL.path
-        let expected: String
-        switch path {
-        case "/var": expected = "/private/var"
-        case "/tmp": expected = "/private/tmp"
-        default: return false
+enum VerifiedMacOSSystemAlias {
+    static func isAllowed(_ url: URL) -> Bool {
+        guard url.standardizedFileURL.path == "/var" else { return false }
+
+        var linkMetadata = stat()
+        guard lstat(url.path, &linkMetadata) == 0,
+              UInt32(linkMetadata.st_mode) & UInt32(S_IFMT) == UInt32(S_IFLNK),
+              let destination = try? FileManager.default.destinationOfSymbolicLink(atPath: url.path),
+              destination == "private/var" || destination == "/private/var" else {
+            return false
         }
-        return url.resolvingSymlinksInPath().standardizedFileURL.path == expected
+
+        var targetMetadata = stat()
+        return lstat("/private/var", &targetMetadata) == 0
+            && UInt32(targetMetadata.st_mode) & UInt32(S_IFMT) == UInt32(S_IFDIR)
     }
 }

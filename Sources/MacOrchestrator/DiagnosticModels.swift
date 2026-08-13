@@ -32,6 +32,14 @@ struct DiagnosticResult: Codable, Equatable, Sendable {
     let reason: String
     let repair: RepairActionDescriptor?
 
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case title
+        case status
+        case reason
+        case repair
+    }
+
     init(
         id: String,
         title: String,
@@ -44,6 +52,19 @@ struct DiagnosticResult: Codable, Equatable, Sendable {
         self.status = status
         self.reason = reason
         self.repair = repair
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(title, forKey: .title)
+        try container.encode(status, forKey: .status)
+        try container.encode(reason, forKey: .reason)
+        if let repair {
+            try container.encode(repair, forKey: .repair)
+        } else {
+            try container.encodeNil(forKey: .repair)
+        }
     }
 }
 

@@ -287,6 +287,41 @@ struct AppConfiguration: Codable, Equatable, Sendable {
         case policy
     }
 
+    private struct DynamicCodingKey: CodingKey {
+        let stringValue: String
+        let intValue: Int? = nil
+
+        init?(stringValue: String) {
+            self.stringValue = stringValue
+        }
+
+        init?(intValue: Int) {
+            nil
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(schemaVersion, forKey: .schemaVersion)
+        try container.encode(generation, forKey: .generation)
+        try container.encode(controlProfile, forKey: .controlProfile)
+        try container.encode(localMCPPort, forKey: .localMCPPort)
+        try container.encode(process, forKey: .process)
+        var capabilities = container.nestedContainer(keyedBy: DynamicCodingKey.self, forKey: .desiredCapabilities)
+        for key in desiredCapabilities.keys.sorted() {
+            guard let codingKey = DynamicCodingKey(stringValue: key),
+                  let value = desiredCapabilities[key] else { continue }
+            try capabilities.encode(value, forKey: codingKey)
+        }
+        try container.encode(approvedFileRoots, forKey: .approvedFileRoots)
+        try container.encode(excludePatterns, forKey: .excludePatterns)
+        try container.encode(scheduling, forKey: .scheduling)
+        try container.encode(integration, forKey: .integration)
+        try container.encode(onboarding, forKey: .onboarding)
+        try container.encode(ownerID, forKey: .ownerID)
+        try container.encode(policy, forKey: .policy)
+    }
+
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         self.init(

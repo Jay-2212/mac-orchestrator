@@ -885,7 +885,7 @@ final class DiagnosticLiveProviderTests: XCTestCase {
         }
     }
 
-    func testLifecycleRejectsMatchingPartialOwnedStateAsPIDReuse() throws {
+    func testLifecycleAcceptsMatchingLocalOnlyServerState() throws {
         let fixture = try makeLifecycleFixture()
         try JSONEncoder().encode(OwnedProcessState(ownerID: "owner-1", serverPID: 42, tunnelPID: nil))
             .write(to: fixture.paths.ownedProcessesURL)
@@ -905,10 +905,35 @@ final class DiagnosticLiveProviderTests: XCTestCase {
 
         let facts = try provider.inspect()
 
+        XCTAssertTrue(facts.ownershipMarkerPresent)
+        XCTAssertFalse(facts.pidReuseDetected)
+        XCTAssertEqual(facts.serverPID, 42)
+        XCTAssertNil(facts.tunnelPID)
+    }
+
+    func testLifecycleRejectsStaleLocalOnlyServerState() throws {
+        let fixture = try makeLifecycleFixture()
+        try JSONEncoder().encode(OwnedProcessState(ownerID: "owner-1", serverPID: 42, tunnelPID: nil))
+            .write(to: fixture.paths.ownedProcessesURL)
+        try writeSupportedLaunchAgent(to: fixture.paths.launchAgentURL, helper: fixture.paths.helperExecutableURL)
+        let provider = ReadOnlyLifecycleFactsProvider(
+            paths: fixture.paths,
+            ownerID: "owner-1",
+            commandRunner: launchctlRunner(),
+            processRunner: RecordingDiagnosticProcessRunner(processes: [
+                DiagnosticProcessRecord(
+                    pid: 43,
+                    commandLine: "python automac_mcp.py --managed-owner owner-1",
+                    running: true
+                ),
+            ])
+        )
+
+        let facts = try provider.inspect()
+
         XCTAssertFalse(facts.ownershipMarkerPresent)
         XCTAssertTrue(facts.pidReuseDetected)
         XCTAssertEqual(facts.serverPID, 42)
-        XCTAssertNil(facts.tunnelPID)
     }
 
     func testLifecycleRejectsMarkerWithoutOwnedProcessRecord() throws {

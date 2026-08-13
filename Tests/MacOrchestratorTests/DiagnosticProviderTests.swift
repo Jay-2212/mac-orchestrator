@@ -3,6 +3,19 @@ import XCTest
 @testable import MacOrchestrator
 
 final class DiagnosticProviderTests: XCTestCase {
+    func testDiagnosticPathSafetyAcceptsOnlyVerifiedVarAliasAndRejectsUserSymlinks() throws {
+        XCTAssertTrue(DiagnosticPathSafety.isSafe(FileManager.default.temporaryDirectory))
+        XCTAssertFalse(DiagnosticPathSafety.isSafe(URL(fileURLWithPath: "/tmp")))
+
+        let root = try makeTemporaryDirectory()
+        let target = root.appendingPathComponent("target", isDirectory: true)
+        let link = root.appendingPathComponent("link", isDirectory: true)
+        try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: target)
+
+        XCTAssertFalse(DiagnosticPathSafety.isSafe(link.appendingPathComponent("child")))
+    }
+
     func testConfigurationProviderDoesNotCreateMissingConfigurationOrDirectory() throws {
         let root = try makeTemporaryDirectory()
         let support = root.appendingPathComponent("Mac Orchestrator", isDirectory: true)

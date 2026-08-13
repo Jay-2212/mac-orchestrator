@@ -40,14 +40,11 @@ enum DiagnosticChecks {
             return result("configuration.read", "Configuration read", .fail, Text.providerUnavailable)
         }
         guard isUsableConfigurationContext(facts) else {
-            let repair = isUsableConfigurationDirectory(facts) && isUsableConfigurationFile(facts.backup)
-                ? RepairActionID.restoreConfigurationBackup : nil
             return result(
                 "configuration.read",
                 "Configuration read",
                 .fail,
-                Text.invalidConfiguration,
-                repair: repair
+                Text.invalidConfiguration
             )
         }
         return result("configuration.read", "Configuration read", .pass, Text.verified)
@@ -597,7 +594,7 @@ enum DiagnosticChecks {
     }
 
     static func isUsableConfigurationDirectory(_ facts: ConfigurationDiagnosticFacts) -> Bool {
-        (facts.directoryExists || (facts.directoryMode == nil && facts.primary.exists))
+        (facts.directoryExists || (facts.directoryMode == nil && (facts.primary.exists || facts.backup.exists)))
             && !facts.directoryIsSymlink
             && facts.directoryPathSafe
     }

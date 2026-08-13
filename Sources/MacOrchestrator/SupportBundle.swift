@@ -407,23 +407,6 @@ struct DittoSupportBundleArchiveWriter: SupportBundleArchiveWriting {
     }
 }
 
-private enum VerifiedMacOSSystemAlias {
-    static func isAllowed(_ url: URL) -> Bool {
-        let path = url.standardizedFileURL.path
-        let expectedTarget: String
-        switch path {
-        case "/var":
-            expectedTarget = "/private/var"
-        case "/tmp":
-            expectedTarget = "/private/tmp"
-        default:
-            return false
-        }
-
-        return url.resolvingSymlinksInPath().standardizedFileURL.path == expectedTarget
-    }
-}
-
 final class SupportBundleEngine: @unchecked Sendable {
     private struct IssuedEntry: Sendable {
         let original: SupportBundleEntryPlan

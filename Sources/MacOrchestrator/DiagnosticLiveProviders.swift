@@ -659,8 +659,7 @@ struct ReadOnlyLifecycleFactsProvider: LifecycleFactsProviding {
         let serverPID = state?.serverPID
         let tunnelPID = state?.tunnelPID
         let stateOwnerMatches = state?.ownerID == ownerID
-        let stateHasCompletePIDs = serverPID != nil && tunnelPID != nil
-        let stateHasPartialPIDs = state != nil && !stateHasCompletePIDs
+        let stateHasAnyPID = serverPID != nil || tunnelPID != nil
         let duplicateAssignment = serverPID != nil && serverPID == tunnelPID
         let serverAssignmentValid = serverPID.map { pid in
             serverProcesses.count == 1 && serverProcesses[0].pid == pid
@@ -669,7 +668,7 @@ struct ReadOnlyLifecycleFactsProvider: LifecycleFactsProviding {
             tunnelProcesses.count == 1 && tunnelProcesses[0].pid == pid
         } ?? true
         let pidReuse = stateResult.malformed
-            || stateHasPartialPIDs
+            || (state != nil && !stateHasAnyPID)
             || (state != nil && !stateOwnerMatches)
             || !serverAssignmentValid
             || !tunnelAssignmentValid
@@ -687,7 +686,7 @@ struct ReadOnlyLifecycleFactsProvider: LifecycleFactsProviding {
         let ownedCount = serverProcesses.count + tunnelProcesses.count
         let ownershipMarkerPresent = state != nil
             && stateOwnerMatches
-            && stateHasCompletePIDs
+            && stateHasAnyPID
             && serverAssignmentValid
             && tunnelAssignmentValid
             && !pidReuse

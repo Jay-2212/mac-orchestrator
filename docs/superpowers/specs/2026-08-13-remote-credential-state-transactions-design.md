@@ -26,7 +26,7 @@ Add security-sensitive, independently testable primitives for connector capabili
 
 The model has no URL, token, credential, request-body, or arbitrary dictionary fields. `RemotePublicOrigin` rejects user-info, path, query, fragment, whitespace, and non-HTTPS URL forms. Decoding rejects unknown keys and unsupported schema versions.
 
-`RemoteConnectorStateStore` writes `remote-connector-state-v1.json` below `ConfigurationStore.defaultDirectoryURL()`. Before every read/write it validates every existing path component with `lstat`, rejects unsafe symlinks and non-directory ancestors, verifies the current user owns the store directory/file, and requires `0700`/`0600` permissions. It creates an exclusive private temporary file in the same directory, writes and synchronizes it, atomically renames it, synchronizes the directory, and removes temporary state files on normal completion. Temporary state data is nonsecret; no credential is ever written to a file.
+`RemoteConnectorStateStore` writes `remote-connector-state-v1.json` below `ConfigurationStore.defaultDirectoryURL()`. Before every read/write it validates every existing path component with `lstat`, rejects unsafe symlinks and non-directory ancestors, verifies the current user owns the store directory/file, and requires `0700`/`0600` permissions. It creates an exclusive private temporary file in the same directory, writes and synchronizes it, atomically renames it, synchronizes the directory, and removes temporary state files on normal completion. The transaction engine consumes the small injectable `RemoteConnectorStatePersisting` protocol so final-state failures are deterministic in unit tests. Temporary state data is nonsecret; no credential is ever written to a file.
 
 The store serializes access with a lock and rejects provider changes or generation regressions. A pending generation is persisted before connector Keychain cutover. If the process stops after cutover, the pending/degraded state is interpreted as not-ready and requires forward recovery; the old token is never restored.
 
@@ -37,7 +37,7 @@ The store serializes access with a lock and rejects provider changes or generati
 - an injected `SecureRandomByteGenerating` seam for deterministic tests;
 - `generateConnectorToken()` that returns a 32-byte lowercase hexadecimal token without persistence;
 - `replaceConnectorToken(expectedCurrent:with:)` that compare-checks and updates the single canonical Keychain item, never creating a second accepted connector token;
-- `replaceNgrokAuthtoken(expectedCurrent:with:)` for explicit candidate commit, plus local deletion through the existing Keychain client for compromised-old fail-closed handling.
+- `replaceNgrokAuthtoken(expectedCurrent:with:)` for explicit candidate commit, plus compare-and-delete of the expected local ngrok item for compromised-old fail-closed handling.
 
 All new Keychain and transaction errors contain only fixed safe categories/statuses. Secret values are not embedded in `Error`, `LocalizedError`, result, state, or log text.
 

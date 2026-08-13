@@ -146,6 +146,37 @@ final class RepairEngineTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: store.configurationURL), Data("{not-json".utf8))
     }
 
+    func testSymlinkBackupIsRefusedWithoutPromotionOrPrimaryMutation() async throws {
+        let root = try makeTemporaryDirectory()
+        let store = ConfigurationStore(directoryURL: root, ownerIDProvider: { "owner-test" })
+        _ = try store.loadOrCreate()
+
+        let malformedPrimary = Data("{malformed-primary".utf8)
+        try malformedPrimary.write(to: store.configurationURL)
+
+        var validBackup = AppConfiguration.fresh(ownerID: "owner-test")
+        validBackup.localMCPPort = 8123
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let validBackupURL = root.appendingPathComponent("valid-backup.json")
+        try encoder.encode(validBackup).write(to: validBackupURL)
+        try FileManager.default.removeItem(at: store.backupURL)
+        try FileManager.default.createSymbolicLink(
+            at: store.backupURL,
+            withDestinationURL: validBackupURL
+        )
+
+        let restorer = ConfigurationStoreBackupRestorer(store: store, expectedOwnerID: "owner-test")
+        let outcome = await RepairEngine(dependencies: RepairDependencies(
+            configurationBackupRestoring: restorer
+        )).execute(.restoreConfigurationBackup)
+
+        XCTAssertEqual(outcome.status, .refused)
+        XCTAssertEqual(try Data(contentsOf: store.configurationURL), malformedPrimary)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: validBackupURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: store.configurationURL.path + ".corrupt"))
+    }
+
     func testValidBackupRestoresAndPreservesBadPrimary() async throws {
         let root = try makeTemporaryDirectory()
         let store = ConfigurationStore(directoryURL: root, ownerIDProvider: { "owner-test" })
@@ -320,10 +351,12 @@ final class RepairEngineTests: XCTestCase {
             withIntermediateDirectories: true
         )
         let inspector = FileSystemLaunchAgentOwnershipInspector()
-        let writer = FileSystemManagedLaunchAgentWriter()
+        let reloader = RecordingLaunchAgentReloader(result: .repaired)
+        let writer = FileSystemManagedLaunchAgentWriter(reloader: reloader)
 
         XCTAssertFalse(inspector.inspect(contract).ownedByMacOrchestrator)
         XCTAssertEqual(await writer.writeExactManagedContract(contract), .repaired)
+        XCTAssertEqual(await reloader.reloadedContracts, [contract])
         let owned = inspector.inspect(contract)
         XCTAssertTrue(owned.exactLabel)
         XCTAssertTrue(owned.exactPath)
@@ -360,6 +393,24 @@ final class RepairEngineTests: XCTestCase {
         )
         XCTAssertEqual(await writer.writeExactManagedContract(contract), .refused)
         XCTAssertFalse(inspector.inspect(contract).exactPath)
+    }
+
+    func testLaunchAgentWriterRequiresSuccessfulReload() async throws {
+        let home = makeTemporaryHome()
+        let contract = ManagedLaunchAgentContract(homeDirectory: home)
+        try FileManager.default.createDirectory(
+            at: contract.launchAgentURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+
+        let failedReloader = RecordingLaunchAgentReloader(result: .failed)
+        let failedWriter = FileSystemManagedLaunchAgentWriter(reloader: failedReloader)
+        XCTAssertEqual(await failedWriter.writeExactManagedContract(contract), .failed)
+        XCTAssertEqual(await failedReloader.reloadedContracts, [contract])
+
+        let userActionReloader = RecordingLaunchAgentReloader(result: .requiresUserAction)
+        let userActionWriter = FileSystemManagedLaunchAgentWriter(reloader: userActionReloader)
+        XCTAssertEqual(await userActionWriter.writeExactManagedContract(contract), .requiresUserAction)
     }
 
     func testLaunchAgentRepairPassesExactContractOnlyAfterOwnershipGuard() async {
@@ -593,6 +644,20 @@ private actor RecordingLaunchAgentWriter: ExactLaunchAgentContractWriting {
         writeCount += 1
         writtenContracts.append(contract)
         return .repaired
+    }
+}
+
+private actor RecordingLaunchAgentReloader: ManagedLaunchAgentReloading {
+    let result: RepairAdapterResult
+    private(set) var reloadedContracts: [ManagedLaunchAgentContract] = []
+
+    init(result: RepairAdapterResult) {
+        self.result = result
+    }
+
+    func reloadManagedLaunchAgent(_ contract: ManagedLaunchAgentContract) async -> RepairAdapterResult {
+        reloadedContracts.append(contract)
+        return result
     }
 }
 

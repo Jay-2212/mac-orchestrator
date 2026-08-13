@@ -399,6 +399,7 @@ struct ConfigurationStoreBackupRestorer: @unchecked Sendable, ConfigurationBacku
     }
 
     private func readValidatedConfiguration(at url: URL) -> AppConfiguration? {
+        guard !isSymlink(at: url) else { return nil }
         guard let data = try? Data(contentsOf: url) else { return nil }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
@@ -406,6 +407,12 @@ struct ConfigurationStoreBackupRestorer: @unchecked Sendable, ConfigurationBacku
             return nil
         }
         return try? decoded.validated()
+    }
+
+    private func isSymlink(at url: URL) -> Bool {
+        var metadata = stat()
+        guard lstat(url.path, &metadata) == 0 else { return false }
+        return UInt32(metadata.st_mode) & UInt32(S_IFMT) == UInt32(S_IFLNK)
     }
 }
 
@@ -570,6 +577,10 @@ protocol ExactLaunchAgentContractWriting: Sendable {
     func writeExactManagedContract(_ contract: ManagedLaunchAgentContract) async -> RepairAdapterResult
 }
 
+protocol ManagedLaunchAgentReloading: Sendable {
+    func reloadManagedLaunchAgent(_ contract: ManagedLaunchAgentContract) async -> RepairAdapterResult
+}
+
 struct ManagedLaunchAgentRepairer: LaunchAgentRepairing {
     let contract: ManagedLaunchAgentContract
     let ownership: any LaunchAgentOwnershipInspecting
@@ -633,9 +644,14 @@ struct FileSystemLaunchAgentOwnershipInspector: @unchecked Sendable, LaunchAgent
 
 struct FileSystemManagedLaunchAgentWriter: @unchecked Sendable, ExactLaunchAgentContractWriting {
     let fileManager: FileManager
+    let reloader: any ManagedLaunchAgentReloading
 
-    init(fileManager: FileManager = .default) {
+    init(
+        fileManager: FileManager = .default,
+        reloader: any ManagedLaunchAgentReloading
+    ) {
         self.fileManager = fileManager
+        self.reloader = reloader
     }
 
     func writeExactManagedContract(_ contract: ManagedLaunchAgentContract) async -> RepairAdapterResult {
@@ -649,7 +665,13 @@ struct FileSystemManagedLaunchAgentWriter: @unchecked Sendable, ExactLaunchAgent
             let data = try contract.propertyListData()
             try data.write(to: contract.launchAgentURL, options: [.atomic])
             try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: contract.launchAgentURL.path)
-            return .repaired
+            let reloadResult = await reloader.reloadManagedLaunchAgent(contract)
+            switch reloadResult.status {
+            case .repaired, .notNeeded:
+                return .repaired
+            case .refused, .failed, .requiresUserAction:
+                return reloadResult
+            }
         } catch {
             return .failed
         }

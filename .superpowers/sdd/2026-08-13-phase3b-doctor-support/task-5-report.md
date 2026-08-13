@@ -8,8 +8,12 @@ current Mac Orchestrator core.
 ## Baseline and scope
 
 - Branch: `phase3/doctor-support`
-- Required starting HEAD: `37e9f884440074d89a21780231fefbf14c2747a8`
-- The exact-base guard passed before tests or edits.
+- Repository exact required base: `3cf8e7d43f17524b705b9fe612eebe75a0450571`.
+- Task 5 implementation parent: `37e9f884440074d89a21780231fefbf14c2747a8`.
+  The Task 5 implementation parent is distinct from the repository required
+  base above.
+- Fix-round starting HEAD: `1e28cf69556cc41f43a25c01352f428ee7a7a563` on
+  `phase3/doctor-support`.
 - Changed implementation paths are exactly:
   - `Sources/MacOrchestrator/DiagnosticChecks.swift`
   - `Sources/MacOrchestrator/DoctorEngine.swift`
@@ -76,6 +80,35 @@ current Mac Orchestrator core.
   completion handoff.
 
 ## Fix-round evidence
+
+- This fix round preserves the provenance distinction above: `3cf8e7d...` is
+  the repository required base, while `37e9f884...` is the Task 5
+  implementation parent.
+- Permission facts are now gated by a validated, server-enabled local
+  protected-behavior consumer (`mac.ui` or `mac.screenOcr`); disabled and
+  remote-only configurations skip the permission result and do not contact
+  the permission provider.
+- MCP inventory now requires liveness, readiness, session establishment, and
+  safe-call success before comparing the canonical inventory.
+- Process ownership now requires a running service and at least one owned
+  process in addition to the ownership marker and PID safety facts; the
+  LaunchAgent structural check remains separate.
+- Deterministic coverage was restored for migration markers, unsafe
+  configuration permissions, owned and malformed ports, critical-path
+  symlinks, complete MCP readiness, successful async-provider selection,
+  installation/trust, Keychain, remote/update, disk, future, and lifecycle
+  branches.
+- The mutation-negative test now uses `ReadOnlyDoctorConfigurationContextProvider`
+  against its temporary `config.json`, with ISO-8601 decoding, and snapshots
+  bytes, generation, directory entries, dependent-provider calls, Keychain
+  mutation/value calls, archive absence, and repair absence.
+- `swift build`: passed after the fix round.
+- `swiftc -parse` passed for all three owned source/test files.
+- An out-of-repository XCTest shim typechecked `DoctorEngineTests.swift`.
+- `swift test --filter DoctorEngineTests`: remains blocked before XCTest
+  execution by the installed Command Line Tools (`CapabilityReadinessCoordinatorTests.swift:2:8 unable to resolve module dependency: XCTest`).
+- Fix-round code/test commit: `ae0c1da34d9b7e6c98764a2b1dc0e84f56a58fdb`
+  (`fix: close Task 5 doctor review findings`).
 
 - Fix commit: `58c94f23bbe0a240ae9e25d1c10083c96d3ada0a` (`fix: close Task 5 doctor review findings`).
 - Configuration checks now share one usable-file predicate requiring existence,

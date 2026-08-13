@@ -38,6 +38,8 @@ NGROK_SHA256=""
 NGROK_AUTHORITY=""
 NGROK_TEAM=""
 MANIFEST_URL=""
+MANIFEST_SIGNING_KEY_PATH=""
+MANIFEST_SIGNING_KEY_ID="production-v1"
 WORK_DIR=""
 
 die() {
@@ -46,7 +48,7 @@ die() {
 }
 
 usage() {
-  echo "Usage: build_release_artifacts.sh --product-version VERSION --bootstrap-version VERSION --bootstrap-url URL --bootstrap-sha256 DIGEST --manifest-url URL --helper-url URL --helper-sha256 DIGEST --uv PATH --uv-url URL --uv-sha256 DIGEST --core-payload PATH --core-url URL --core-sha256 DIGEST --lock PATH --lock-sha256 DIGEST --ngrok-archive PATH --ngrok-version VERSION --ngrok-url URL --ngrok-sha256 DIGEST --ngrok-authority AUTHORITY --ngrok-team TEAM [--helper-app PATH|--helper-archive PATH] [--output-dir DIR]" >&2
+  echo "Usage: build_release_artifacts.sh --product-version VERSION --bootstrap-version VERSION --bootstrap-url URL --bootstrap-sha256 DIGEST --manifest-url URL --helper-url URL --helper-sha256 DIGEST --uv PATH --uv-url URL --uv-sha256 DIGEST --core-payload PATH --core-url URL --core-sha256 DIGEST --lock PATH --lock-sha256 DIGEST --ngrok-archive PATH --ngrok-version VERSION --ngrok-url URL --ngrok-sha256 DIGEST --ngrok-authority AUTHORITY --ngrok-team TEAM [--manifest-signing-key PATH --manifest-key-id ID] [--helper-app PATH|--helper-archive PATH] [--output-dir DIR]" >&2
 }
 
 finish() {
@@ -87,6 +89,8 @@ while [ "$#" -gt 0 ]; do
     --ngrok-sha256) [ "$#" -ge 2 ] || { usage; exit 2; }; NGROK_SHA256="$2"; shift 2 ;;
     --ngrok-authority) [ "$#" -ge 2 ] || { usage; exit 2; }; NGROK_AUTHORITY="$2"; shift 2 ;;
     --ngrok-team) [ "$#" -ge 2 ] || { usage; exit 2; }; NGROK_TEAM="$2"; shift 2 ;;
+    --manifest-signing-key) [ "$#" -ge 2 ] || { usage; exit 2; }; MANIFEST_SIGNING_KEY_PATH="$2"; shift 2 ;;
+    --manifest-key-id) [ "$#" -ge 2 ] || { usage; exit 2; }; MANIFEST_SIGNING_KEY_ID="$2"; shift 2 ;;
     --output-dir) [ "$#" -ge 2 ] || { usage; exit 2; }; OUTPUT_DIR="$2"; shift 2 ;;
     --help|-h) usage; exit 0 ;;
     *) usage; exit 2 ;;
@@ -399,12 +403,30 @@ write_checksums() {
   checksums_path="$OUTPUT_DIR/SHA256SUMS"
   (
     cd "$OUTPUT_DIR"
-    for asset in bootstrap.sh manifest.json Mac-Orchestrator-arm64.zip uv-arm64 core-payload.tar.gz install-command.sh; do
+    assets=(bootstrap.sh manifest.json Mac-Orchestrator-arm64.zip uv-arm64 core-payload.tar.gz install-command.sh)
+    if [ -f manifest.sig ]; then
+      assets+=(manifest.sig)
+    fi
+    for asset in "${assets[@]}"; do
       [ -f "$asset" ] || die "release asset is missing before checksum generation: $asset"
       "$SHASUM_BIN" -a 256 "$asset"
     done
   ) > "$checksums_path"
   /bin/chmod 644 "$checksums_path"
+}
+
+write_manifest_signature() {
+  if [ -n "$MANIFEST_SIGNING_KEY_PATH" ]; then
+    require_file "--manifest-signing-key" "$MANIFEST_SIGNING_KEY_PATH"
+    [ "$MANIFEST_SIGNING_KEY_PATH" != "$PROJECT_DIR" ] || die "manifest signing key must be outside the repository"
+    bash "$PROJECT_DIR/script/sign_release_manifest.sh" \
+      --manifest "$OUTPUT_DIR/manifest.json" \
+      --private-key "$MANIFEST_SIGNING_KEY_PATH" \
+      --key-id "$MANIFEST_SIGNING_KEY_ID" \
+      --output "$OUTPUT_DIR/manifest.sig" >/dev/null
+  elif [ -e "$OUTPUT_DIR/manifest.sig" ]; then
+    die "manifest.sig exists but no external signing key was provided"
+  fi
 }
 
 validate_inputs() {
@@ -438,6 +460,9 @@ validate_inputs() {
   require_sha256 "--ngrok-sha256" "$NGROK_SHA256"
   require_input "--ngrok-authority" "$NGROK_AUTHORITY"
   require_input "--ngrok-team" "$NGROK_TEAM"
+  if [ -n "$MANIFEST_SIGNING_KEY_PATH" ]; then
+    require_input "--manifest-key-id" "$MANIFEST_SIGNING_KEY_ID"
+  fi
   [ "${#NGROK_TEAM}" -eq 10 ] || die "--ngrok-team must be ten uppercase characters"
   case "$NGROK_TEAM" in
     *[!0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ]*) die "--ngrok-team must be ten uppercase characters" ;;
@@ -455,6 +480,7 @@ main() {
   /bin/cp "$BOOTSTRAP_PATH" "$OUTPUT_DIR/bootstrap.sh"
   /bin/chmod 755 "$OUTPUT_DIR/bootstrap.sh"
   write_manifest
+  write_manifest_signature
   manifest_sha256="$(sha256_file "$OUTPUT_DIR/manifest.json")" || die "could not hash generated manifest"
   bash "$PROJECT_DIR/script/generate_install_command.sh" \
     --product-version "$PRODUCT_VERSION" \

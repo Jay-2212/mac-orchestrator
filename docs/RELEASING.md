@@ -11,11 +11,14 @@ account test is a hosted public release.
 The release contract is represented by:
 
 - `release/manifest.schema.json` — schema version 1 for the release manifest;
+- `release/manifest.signature.schema.json` — strict v1 detached Ed25519 envelope schema;
 - `release/manifest.template.json` — an intentionally incomplete maintainer
   template, never a distributable concrete manifest;
 - `script/bootstrap.sh` — the Bash 3.2-compatible public installer;
 - `script/build_release_artifacts.sh` — maintainer-only helper/manifest
   assembly;
+- `script/sign_release_manifest.sh` — external-key-only raw-byte manifest
+  signing;
 - `script/generate_install_command.sh` — exact release-pinned install handoff; and
 - `script/test_bootstrap.sh` — deterministic fixture coverage for validation,
   staging, recovery, and artifact boundaries.
@@ -25,9 +28,19 @@ bootstrap SHA-256, manifest URL, and manifest SHA-256. It rejects mutable
 branch URLs, empty, all-zero, or sentinel digests,
 unsupported arm64/macOS combinations, bad helper/uv/runtime/ngrok hashes, lock
 identity mismatches, editable metadata, missing imports, and failed local smoke
-activation. The release manifest is an integrity chain, not a project-owned
-signature against a compromised release account. Developer ID signing and
-notarization are deferred.
+activation. Update discovery treats GitHub Releases as untrusted metadata:
+`UpdateEngine` fetches the exact raw `manifest.json` and `manifest.sig`,
+verifies the detached Ed25519 signature against the embedded public key, and
+only then decodes and validates immutable version/platform/schema/compatibility
+metadata. The signature covers the exact raw manifest bytes; no ad-hoc JSON
+canonicalization is used.
+
+Production signing private keys are supplied to the release job as an external
+secret and are rejected by the signing script when located in the repository.
+The repository contains only the embedded public verification key. The
+externally pinned bootstrap + manifest SHA path remains available for Phase 2
+fresh install and recovery, but a GitHub tag, release title, or discovered
+version alone never authorizes an update.
 
 The bootstrap keeps filesystem recovery armed only through verified staging,
 payload promotion, promoted-install validation, and LaunchAgent installation.
@@ -41,6 +54,26 @@ The helper is ad-hoc signed, arm64, installed below the user's Application
 Support directory, and does not contain ngrok. The bootstrap obtains ngrok from
 the vendor, verifies its original Developer ID authority/team, and never
 re-signs it. Config and Keychain state remain outside runtime promotion.
+
+## Phase 3C update and uninstall contract
+
+The native maintenance layer persists `InstallationReceiptV1` at the install
+root and records update transactions through durable states from discovery to
+postflight. Candidate helper handoff is digest-checked and re-verified before
+maintenance quiescing. Candidate-owned migrations run on a copy and are
+validated before active configuration mutation; the current schema remains 1
+until a real candidate requires a compatible migration.
+
+Pre-commit failures restore the transaction backup. A post-commit TCC or human
+onboarding failure is reported as postflight and does not roll back structurally
+valid installed files. Uninstall is plan-driven, defaults to preserving
+configuration and all Keychain identity/credentials, and models explicit
+helper/app, owned-process, managed-runtime, local-remote, cache, log/support,
+LaunchAgent, configuration, and credential choices. Credential deletion is
+available only through an explicit option. Every filesystem removal is
+restricted to known project-owned roots with ownership, type, and symlink
+checks; process removal fails closed without an integration-owned ownership
+proof. No provider/ngrok account cleanup is attempted.
 
 ## Toolchain contract
 
@@ -147,8 +180,9 @@ Do not create a tag first and rely on a later push workflow to find a failure.
    the core payload, downloads the exact vendor ngrok ZIP for temporary
    validation, checks its digest and original signature, and asks
    `script/build_release_artifacts.sh` to emit `bootstrap.sh`, `manifest.json`,
-   `install-command.sh`, the pinned `release-body.md` snippet, `SHA256SUMS`,
-   and the release payloads. The ngrok ZIP itself is not copied into or
+   the raw-byte detached `manifest.sig`, `install-command.sh`, the pinned
+   `release-body.md` snippet, `SHA256SUMS`, and the release payloads. The
+   external signing key is never checked into the checkout. The ngrok ZIP itself is not copied into or
    uploaded as a project release asset.
 6. Publication depends on validation, required CI, and asset assembly. It
    rechecks the SHA, current remote `main`, and tag absence before uploading the
@@ -191,9 +225,8 @@ manual command with a branch URL or an unpinned manifest.
 They are not public onboarding instructions and do not replace the immutable
 bootstrap contract.
 
-Developer ID/notarization, DMG packaging, Intel, Meridian/provider changes, a
-new retry state machine, a doctor, a full updater/rollback product, and mature
-remote recovery are deferred to Phase 3/4 or later. Workflow code also cannot
+Developer ID/notarization, DMG packaging, Intel, Meridian/provider changes, and
+mature remote recovery remain outside this phase. Workflow code also cannot
 prevent a repository administrator from bypassing Actions or manually creating
 a tag; repository rulesets and branch/tag protections must be configured and
 verified outside this change.

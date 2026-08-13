@@ -143,6 +143,10 @@ enum TerminalCommand {
                 }
                 try waitForRemoteConnector()
                 return 0
+            case "update":
+                return try runUpdate(arguments: Array(arguments.dropFirst()))
+            case "uninstall":
+                return try runUninstall(arguments: Array(arguments.dropFirst()))
             default:
                 if command.hasPrefix("-") {
                     throw TerminalCommandError.invalidArguments("Unknown Mac Orchestrator command: \(command)")
@@ -169,8 +173,129 @@ enum TerminalCommand {
               --wait-for-local-activation Wait for the authenticated local MCP activation oracle.
               --print-local-connector-url Confirm activation and print the local MCP URL.
               --wait-for-remote-connector Wait for and print a confirmed live HTTPS connector URL.
+              update [--check|--apply] Check or apply an authenticated release update.
+              update --pinned --manifest URL --manifest-sha256 SHA --version VERSION
+              uninstall --plan [removal options] Preview an explicit uninstall plan.
+              uninstall --apply --confirm-uninstall [removal options] Apply that plan.
+              Removal options: --remove-app --remove-owned-processes --remove-runtime --remove-remote --remove-caches --remove-logs --remove-launch-agent --remove-config --delete-credentials.
             """
         )
+    }
+
+    private static func runUpdate(arguments: [String]) throws -> Int32 {
+        let effectiveArguments = arguments.isEmpty ? ["--check"] : arguments
+        let checking = effectiveArguments.contains("--check")
+        let applying = effectiveArguments.contains("--apply")
+        guard checking || applying || effectiveArguments.contains("--pinned") else {
+            throw TerminalCommandError.invalidArguments(
+                "Usage: update [--check|--apply] or update --pinned --manifest URL --manifest-sha256 SHA --version VERSION"
+            )
+        }
+        guard !(checking && applying) else {
+            throw TerminalCommandError.invalidArguments("Choose only one of --check or --apply.")
+        }
+        let fetcher = URLSessionUpdateAssetFetcher()
+        let installDirectory = ConfigurationStore.defaultDirectoryURL()
+            .appendingPathComponent("install", isDirectory: true)
+        let receiptStore = InstallationReceiptStore(directoryURL: installDirectory)
+        guard let receipt = try receiptStore.load(),
+              let currentVersion = try? SemanticVersion(receipt.productVersion) else {
+            throw TerminalCommandError.invalidArguments(
+                "No authenticated InstallationReceiptV1 exists; use the externally pinned Phase 2 recovery path first."
+            )
+        }
+        let lifecycle = ExternalMaintenanceLifecycleAdapter(controller: LaunchAgentMaintenanceController())
+        let driver = FilesystemUpdateTransactionDriver(
+            supportDirectory: ConfigurationStore.defaultDirectoryURL(),
+            fetcher: fetcher
+        )
+        let os = ProcessInfo.processInfo.operatingSystemVersion
+        let operatingSystem = try SemanticVersion("\(os.majorVersion).\(os.minorVersion).\(os.patchVersion)")
+        let engine = UpdateEngine(
+            currentVersion: currentVersion,
+            operatingSystem: operatingSystem,
+            discoverer: GitHubReleaseDiscoverer(fetcher: fetcher),
+            fetcher: fetcher,
+            ledger: MaintenanceTransactionLedger(directoryURL: installDirectory.appendingPathComponent("transactions", isDirectory: true)),
+            driver: driver,
+            lifecycle: lifecycle
+        )
+
+        let candidate: UpdateCandidate
+        if effectiveArguments.contains("--pinned") {
+            let manifestURL = try requiredURL(effectiveArguments, flag: "--manifest")
+            let manifestSHA = try requiredValue(effectiveArguments, flag: "--manifest-sha256")
+            let versionFlag = effectiveArguments.contains("--version") ? "--version" : "--release-version"
+            let version = try SemanticVersion(requiredValue(effectiveArguments, flag: versionFlag))
+            var signatureURL: URL?
+            if effectiveArguments.contains("--signature") {
+                signatureURL = try requiredURL(effectiveArguments, flag: "--signature")
+            }
+            candidate = try engine.checkPinned(
+                manifestURL: manifestURL,
+                manifestSHA256: manifestSHA,
+                releaseVersion: version,
+                signatureURL: signatureURL
+            )
+        } else {
+            candidate = try engine.checkForUpdate()
+        }
+        print("Authenticated update candidate: \(candidate.manifest.product.version)")
+        print("Manifest SHA-256: \(candidate.manifestSHA256)")
+        guard applying else { return 0 }
+        let result = try engine.apply(candidate)
+        print("Update committed: transaction \(result.transaction.id.uuidString)")
+        return 0
+    }
+
+    private static func runUninstall(arguments: [String]) throws -> Int32 {
+        let apply = arguments.contains("--apply")
+        if apply && !arguments.contains("--confirm-uninstall") {
+            throw TerminalCommandError.invalidArguments(
+                "uninstall --apply requires --confirm-uninstall after reviewing uninstall --plan."
+            )
+        }
+        let options = RemovalOptions(
+            removeApplication: arguments.contains("--remove-app"),
+            removeOwnedProcesses: arguments.contains("--remove-owned-processes"),
+            removeManagedRuntime: arguments.contains("--remove-runtime"),
+            removeManagedRemote: arguments.contains("--remove-remote"),
+            removeCaches: arguments.contains("--remove-caches"),
+            removeLogsAndSupport: arguments.contains("--remove-logs"),
+            removeLaunchAgent: arguments.contains("--remove-launch-agent"),
+            removeConfiguration: arguments.contains("--remove-config"),
+            deleteCredentials: arguments.contains("--delete-credentials")
+        )
+        let support = ConfigurationStore.defaultDirectoryURL()
+        let engine = try UninstallEngine(
+            supportDirectory: support,
+            logsDirectory: support.appendingPathComponent("logs", isDirectory: true),
+            keychain: KeychainStore(),
+            lifecycle: ExternalMaintenanceLifecycleAdapter(controller: LaunchAgentMaintenanceController())
+        )
+        let plan = try engine.plan(options: options)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        encoder.dateEncodingStrategy = .iso8601
+        print(String(decoding: try encoder.encode(plan), as: UTF8.self))
+        guard apply else { return 0 }
+        let receipt = engine.apply(plan)
+        print(String(decoding: try receipt.encoded(), as: UTF8.self))
+        return receipt.outcomes.contains { $0.status == .failedManualActionRequired } ? 1 : 0
+    }
+
+    private static func requiredValue(_ arguments: [String], flag: String) throws -> String {
+        guard let index = arguments.firstIndex(of: flag), arguments.count > index + 1 else {
+            throw TerminalCommandError.invalidArguments("Missing value for \(flag).")
+        }
+        return arguments[index + 1]
+    }
+
+    private static func requiredURL(_ arguments: [String], flag: String) throws -> URL {
+        guard let url = URL(string: try requiredValue(arguments, flag: flag)) else {
+            throw TerminalCommandError.invalidArguments("Invalid URL for \(flag).")
+        }
+        return url
     }
 
     private static func restartRunningSupervisorIfLoaded() throws -> Bool {

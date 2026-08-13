@@ -99,6 +99,32 @@ final class SensitiveDataRedactorTests: XCTestCase {
         XCTAssertFalse(output.contains("fake-auth"))
     }
 
+    func testRedactsAbsoluteConnectorURLsRouteOnlyFormsAndBareCredentialAssignments() {
+        let connectorToken = "connector-route-secret-abcdefghijklmnopqrstuvwxyz"
+        let redactor = SensitiveDataRedactor(
+            exactSecrets: [connectorToken],
+            homeDirectory: "/Users/synthetic"
+        )
+        let input = """
+        endpoint=https://connector.example.test/health?capability=abc
+        route=/\(connectorToken)/mcp?token=\(connectorToken)
+        token=bare-token bot_token=bare-bot auth_token=bare-auth ngrok_authtoken=bare-ngrok password=bare-password authorization=Bearer bare-authz
+        safe-context=preserved
+        """
+
+        let output = redactor.redact(input)
+
+        XCTAssertFalse(output.contains("https://connector.example.test/health"))
+        XCTAssertFalse(output.contains(connectorToken))
+        XCTAssertFalse(output.contains("bare-token"))
+        XCTAssertFalse(output.contains("bare-bot"))
+        XCTAssertFalse(output.contains("bare-auth"))
+        XCTAssertFalse(output.contains("bare-ngrok"))
+        XCTAssertFalse(output.contains("bare-password"))
+        XCTAssertFalse(output.contains("bare-authz"))
+        XCTAssertTrue(output.contains("safe-context=preserved"))
+    }
+
     func testRotatingLogRedactsCurrentAndRotatedFilesAndPreservesPermissions() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("mac-orchestrator-redactor-\(UUID().uuidString)", isDirectory: true)

@@ -13,6 +13,10 @@ struct SupportBundleRedactionSummary: Codable, Equatable, Sendable {
             "home-path-normalization"
         ],
         excludedSensitiveCategories: [String] = [
+            "api-keys",
+            "authorization",
+            "bot-token",
+            "chat-id",
             "credentials",
             "keychain-values",
             "clipboard",
@@ -24,7 +28,12 @@ struct SupportBundleRedactionSummary: Codable, Equatable, Sendable {
             "connector-token",
             "ngrok-credentials",
             "request-response-bodies",
-            "mcp-request-response-bodies"
+            "mcp-request-response-bodies",
+            "secret-material",
+            "telegram-bot-secret",
+            "telegram-bot-token",
+            "telegram-chat-id",
+            "telegram-secret"
         ]
     ) {
         self.appliedTransforms = appliedTransforms.sorted()
@@ -253,6 +262,13 @@ struct DittoSupportBundleArchiveWriter: SupportBundleArchiveWriting {
 
         guard process.terminationStatus == 0,
               isRegularFile(destination) else {
+            try? FileManager.default.removeItem(at: destination)
+            throw SupportBundleError.archiveWriteFailed
+        }
+        do {
+            try setSecurePermissions(destination, mode: 0o600)
+        } catch {
+            try? FileManager.default.removeItem(at: destination)
             throw SupportBundleError.archiveWriteFailed
         }
     }
@@ -360,6 +376,15 @@ struct DittoSupportBundleArchiveWriter: SupportBundleArchiveWriting {
     private func isRegularFile(_ url: URL) -> Bool {
         var info = stat()
         return lstat(url.path, &info) == 0 && (info.st_mode & S_IFMT) == S_IFREG
+    }
+
+    private func setSecurePermissions(_ url: URL, mode: mode_t) throws {
+        guard chmod(url.path, mode) == 0 else { throw SupportBundleError.archiveWriteFailed }
+        var info = stat()
+        guard lstat(url.path, &info) == 0,
+              (info.st_mode & 0o777) == mode else {
+            throw SupportBundleError.archiveWriteFailed
+        }
     }
 
     private func validatedArchivePath(_ path: String) throws -> String {
@@ -498,6 +523,12 @@ final class SupportBundleEngine: @unchecked Sendable {
             .filter { $0.isLetter || $0.isNumber }
             .lowercased()
         let exact = [
+            "apikey",
+            "authorization",
+            "authtoken",
+            "bottoken",
+            "chatid",
+            "chatsecret",
             "credential",
             "credentials",
             "keychain",
@@ -526,13 +557,26 @@ final class SupportBundleEngine: @unchecked Sendable {
             "connectorurl",
             "connectortoken",
             "connectorsecret",
+            "password",
+            "privatekey",
+            "secret",
             "secretmaterial",
+            "telegrambottoken",
+            "telegrambotsecret",
+            "telegramchatid",
+            "telegramsecret",
             "ngrokcredential",
             "ngrokcredentials",
             "ngrokauthtoken",
             "shellbrowserhistory"
         ]
         return exact.contains(normalized) || [
+            "apikey",
+            "authorization",
+            "authtoken",
+            "bottoken",
+            "chatid",
+            "chatsecret",
             "credential",
             "keychain",
             "clipboard",
@@ -547,7 +591,11 @@ final class SupportBundleEngine: @unchecked Sendable {
             "connectorurl",
             "connectortoken",
             "connectorsecret",
+            "password",
+            "privatekey",
+            "secret",
             "secretmaterial",
+            "telegram",
             "ngrokcredential",
             "ngrokauthtoken"
         ].contains(where: normalized.contains)
@@ -651,6 +699,9 @@ final class SupportBundleEngine: @unchecked Sendable {
                 collected = try source.collect(logicalID: issuedEntry.original.logicalID)
             } catch {
                 throw SupportBundleError.sourceUnavailable(entry.logicalID)
+            }
+            guard collected.archivePath == issuedEntry.original.archivePath else {
+                throw SupportBundleError.invalidPlan("collector returned an unapproved archive path")
             }
             guard redactor.redactedPath(collected.archivePath) == entry.archivePath else {
                 throw SupportBundleError.invalidPlan("collector returned an unapproved archive path")

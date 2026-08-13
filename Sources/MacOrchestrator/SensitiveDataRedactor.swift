@@ -64,22 +64,21 @@ struct SensitiveDataRedactor: Sendable {
     }
 
     private func replaceConnectorURLs(in value: String) -> String {
-        var redacted = replacingMatches(
-            pattern: #"https?://[A-Za-z0-9._-]+(?::[0-9]+)?/[A-Za-z0-9._~-]+/mcp(?:[/?#][^\s"'<>]*)?"#,
+        let redacted = replacingMatches(
+            pattern: #"(?i)https?://[^\s"'<>]+"#,
             in: value,
             with: "<redacted>"
         )
-        redacted = replacingMatches(
-            pattern: #"(?i)(https?://[^\s"'<>]*/mcp(?:[/?#][^\s"'<>]*)?)"#,
+        return replacingMatches(
+            pattern: #"(?i)(?<![A-Za-z0-9_])(?:/[A-Za-z0-9._~%-]+)?/mcp(?:[/?#][^\s"'<>]*)?"#,
             in: redacted,
             with: "<redacted>"
         )
-        return redacted
     }
 
     private func replaceSecretAssignments(in value: String) -> String {
         replacingMatches(
-            pattern: #"(?i)(\b(?:ngrok[_-]?authtoken|auth[_-]?token|access[_-]?token|refresh[_-]?token|capability[_-]?token|connector[_-]?(?:url|token|secret)|api[_-]?key|password|secret|authorization|credential)\b\s*[:=]\s*["']?(?:Bearer\s+)?)([^\s"'&,}\]]+)"#,
+            pattern: #"(?i)(\b(?:token|bot[_-]?token|auth[_-]?token|access[_-]?token|refresh[_-]?token|capability[_-]?token|connector[_-]?(?:url|token|secret)|api[_-]?(?:key|token|secret)|ngrok[_-]?authtoken|password|secret|authorization|credential|private[_-]?key|webhook[_-]?secret|client[_-]?secret)\b\s*[:=]\s*["']?(?:Bearer\s+)?)([^\s"'&,}\]]+)"#,
             in: value,
             with: "$1<redacted>"
         )

@@ -20,7 +20,11 @@ final class SupportBundleTests: XCTestCase {
         XCTAssertEqual(writer.writeCalls, 0)
         XCTAssertFalse(FileManager.default.fileExists(atPath: archiveURL.path))
         XCTAssertEqual(plan.excludedSensitiveCategories, [
+            "api-keys",
+            "authorization",
+            "bot-token",
             "browser-data",
+            "chat-id",
             "clipboard",
             "connector-token",
             "connector-url",
@@ -29,8 +33,13 @@ final class SupportBundleTests: XCTestCase {
             "mcp-request-response-bodies",
             "ngrok-credentials",
             "request-response-bodies",
+            "secret-material",
             "shell-browser-data",
             "shell-history",
+            "telegram-bot-secret",
+            "telegram-bot-token",
+            "telegram-chat-id",
+            "telegram-secret",
             "user-documents"
         ])
     }
@@ -136,12 +145,33 @@ final class SupportBundleTests: XCTestCase {
     }
 
     func testSensitiveEntryIsNotCollectedEvenWhenSelectedByPublishedID() throws {
-        let source = RecordingBundleSource(entries: [.doctorReport, .credential])
+        let source = RecordingBundleSource(entries: [.doctorReport, .credential, .telegramBotToken])
         let engine = SupportBundleEngine(sources: [source])
         let plan = engine.preview()
 
         XCTAssertThrowsError(try plan.selecting(logicalIDs: ["credentials"]))
+        XCTAssertThrowsError(try plan.selecting(logicalIDs: ["telegram-bot-token"]))
         XCTAssertEqual(source.collectCalls, [])
+    }
+
+    func testCollectorRawPathMustMatchIssuedSourceBeforeRedaction() throws {
+        let token = "path-secret-token"
+        let source = RecordingBundleSource(entries: [sourceEntry(
+            logicalID: "path-entry",
+            archivePath: "logs/\(token).log",
+            data: Data("safe".utf8),
+            collectedArchivePath: "logs/other-secret-token.log"
+        )])
+        let engine = SupportBundleEngine(
+            sources: [source],
+            redactor: SensitiveDataRedactor(exactSecrets: [token], homeDirectory: nil)
+        )
+
+        XCTAssertThrowsError(try engine.create(
+            plan: engine.preview(),
+            to: temporaryArchiveURL()
+        ))
+        XCTAssertEqual(source.collectCalls, ["path-entry"])
     }
 
     func testUnsafePathsDuplicatesAndMaliciousFilenamesFailClosed() throws {
@@ -268,6 +298,25 @@ final class SupportBundleTests: XCTestCase {
         ))
     }
 
+    func testArchiveWriterSetsFinalArchivePermissionsToOwnerOnly() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let staging = root.appendingPathComponent("staging", isDirectory: true)
+        try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: false)
+        try Data("approved".utf8).write(to: staging.appendingPathComponent("approved.txt"))
+        let destination = root.appendingPathComponent("bundle.zip")
+
+        try DittoSupportBundleArchiveWriter().write(
+            stagingDirectory: staging,
+            entries: [SupportBundleArchiveEntry(archivePath: "approved.txt", data: Data("approved".utf8))],
+            to: destination
+        )
+
+        var info = stat()
+        XCTAssertEqual(lstat(destination.path, &info), 0)
+        XCTAssertEqual(info.st_mode & 0o777, 0o600)
+    }
+
     func testDecodedArchiveContainsNoPlantedSecretsOrPrivatePaths() throws {
         let connectorToken = "capability-token-synthetic-123"
         let ngrokToken = "2f7b8e3c9a1d4e6f8a0b2c4d6e8f0a1b"
@@ -326,7 +375,8 @@ final class SupportBundleTests: XCTestCase {
         reason: String = "deterministic fixture",
         expectedRedaction: String = "canonical redaction",
         sourceURL: URL? = nil,
-        approvedRoot: URL? = nil
+        approvedRoot: URL? = nil,
+        collectedArchivePath: String? = nil
     ) -> FixtureEntry {
         FixtureEntry(
             plan: SupportBundleEntryPlan(
@@ -340,7 +390,8 @@ final class SupportBundleTests: XCTestCase {
             ),
             data: data,
             sourceURL: sourceURL,
-            approvedRoot: approvedRoot
+            approvedRoot: approvedRoot,
+            collectedArchivePath: collectedArchivePath
         )
     }
 
@@ -394,6 +445,7 @@ private struct FixtureEntry: Sendable {
     let data: Data
     let sourceURL: URL?
     let approvedRoot: URL?
+    let collectedArchivePath: String?
 }
 
 private final class RecordingBundleSource: @unchecked Sendable, SupportBundleSource {
@@ -419,7 +471,8 @@ private final class RecordingBundleSource: @unchecked Sendable, SupportBundleSou
             ),
             data: Data("{\"status\":\"pass\"}".utf8),
             sourceURL: nil,
-            approvedRoot: nil
+            approvedRoot: nil,
+            collectedArchivePath: nil
         )
     }
 
@@ -436,7 +489,8 @@ private final class RecordingBundleSource: @unchecked Sendable, SupportBundleSou
             ),
             data: Data("safe log".utf8),
             sourceURL: nil,
-            approvedRoot: nil
+            approvedRoot: nil,
+            collectedArchivePath: nil
         )
     }
 
@@ -453,7 +507,8 @@ private final class RecordingBundleSource: @unchecked Sendable, SupportBundleSou
             ),
             data: Data("{\"enabled\":true}".utf8),
             sourceURL: nil,
-            approvedRoot: nil
+            approvedRoot: nil,
+            collectedArchivePath: nil
         )
     }
 
@@ -469,7 +524,25 @@ private final class RecordingBundleSource: @unchecked Sendable, SupportBundleSou
             ),
             data: Data("{\"token\":\"must-not-appear\"}".utf8),
             sourceURL: nil,
-            approvedRoot: nil
+            approvedRoot: nil,
+            collectedArchivePath: nil
+        )
+    }
+
+    static var telegramBotToken: FixtureEntry {
+        FixtureEntry(
+            plan: SupportBundleEntryPlan(
+                sourceID: "recording",
+                logicalID: "telegram-bot-token",
+                archivePath: "telegram.json",
+                category: "Telegram bot token",
+                reason: "must never be collected",
+                expectedRedaction: "excluded"
+            ),
+            data: Data("bot-token-must-not-appear".utf8),
+            sourceURL: nil,
+            approvedRoot: nil,
+            collectedArchivePath: nil
         )
     }
 
@@ -485,7 +558,7 @@ private final class RecordingBundleSource: @unchecked Sendable, SupportBundleSou
             throw SupportBundleError.sourceUnavailable(logicalID)
         }
         return SupportBundleCollectedEntry(
-            archivePath: entry.plan.archivePath,
+            archivePath: entry.collectedArchivePath ?? entry.plan.archivePath,
             data: entry.data,
             sourceURL: entry.sourceURL,
             approvedRoot: entry.approvedRoot

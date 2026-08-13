@@ -96,6 +96,96 @@ final class LocalActivationProbeTests: XCTestCase {
         )
     }
 
+    func testDetailedProbeReturnsSanitizedToolInventoryFromTheCanonicalSequence() async throws {
+        let sessionID = "session-detailed"
+        ActivationProbeURLProtocol.handler = { request in
+            switch request.url?.path {
+            case "/__mac_orchestrator_health":
+                return .init(status: 200, body: Data(#"{"status":"ok"}"#.utf8))
+            case "/connector-token/mcp":
+                let payload = try XCTUnwrap(Self.jsonBody(from: request))
+                switch payload["method"] as? String {
+                case "initialize":
+                    XCTAssertEqual(request.value(forHTTPHeaderField: "MCP-Protocol-Version"), "2025-06-18")
+                    return .init(
+                        status: 200,
+                        body: Self.rpcResult(["protocolVersion": "2025-06-18"], id: 1),
+                        headers: ["Mcp-Session-Id": sessionID]
+                    )
+                case "notifications/initialized":
+                    XCTAssertEqual(request.value(forHTTPHeaderField: "Mcp-Session-Id"), sessionID)
+                    return .init(status: 202, body: Data())
+                case "tools/list":
+                    XCTAssertEqual(request.value(forHTTPHeaderField: "Mcp-Session-Id"), sessionID)
+                    return .init(
+                        status: 200,
+                        body: Self.rpcResult([
+                            "tools": [
+                                ["name": "describe"],
+                                ["name": "get_capabilities"],
+                                ["name": "get_session_state"],
+                            ],
+                        ], id: 2)
+                    )
+                case "tools/call":
+                    XCTAssertEqual((payload["params"] as? [String: Any])?["name"] as? String, "get_session_state")
+                    return .init(
+                        status: 200,
+                        body: Self.rpcResult([
+                            "structuredContent": ["status": "success"],
+                            "isError": false,
+                        ], id: 3)
+                    )
+                default:
+                    XCTFail("Unexpected MCP request: \(payload)")
+                    return .init(status: 500, body: Data())
+                }
+            default:
+                XCTFail("Unexpected URL: \(request.url?.absoluteString ?? "nil")")
+                return .init(status: 404, body: Data())
+            }
+        }
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ActivationProbeURLProtocol.self]
+        let probe = LocalActivationProbe(session: URLSession(configuration: configuration))
+
+        let detail = try await probe.runDetailed(
+            port: 8_000,
+            capabilityToken: "connector-token",
+            requiresInteractiveUI: false
+        )
+
+        XCTAssertEqual(detail.exposedTools, ["describe", "get_capabilities", "get_session_state"])
+        XCTAssertTrue(detail.safeCallSucceeded)
+        XCTAssertFalse(String(describing: detail).contains("connector-token"))
+    }
+
+    func testDetailedProbeRejectsRedirectedHealthResponse() async throws {
+        ActivationProbeURLProtocol.handler = { request in
+            XCTAssertEqual(request.url?.path, "/__mac_orchestrator_health")
+            return .init(
+                status: 200,
+                body: Data(#"{"status":"ok"}"#.utf8),
+                responseURL: URL(string: "http://127.0.0.1:8001/__mac_orchestrator_health")!
+            )
+        }
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ActivationProbeURLProtocol.self]
+        let probe = LocalActivationProbe(session: URLSession(configuration: configuration))
+
+        do {
+            _ = try await probe.runDetailed(
+                port: 8_000,
+                capabilityToken: "connector-token"
+            )
+            XCTFail("A redirected health response must not activate the runtime.")
+        } catch let error as LocalActivationProbeError {
+            XCTAssertEqual(error, .transport("unexpected redirect"))
+        }
+    }
+
     func testProbeRejectsManagedUIReadinessFailureWhenRequired() async throws {
         ActivationProbeURLProtocol.handler = { request in
             switch request.url?.path {
@@ -178,6 +268,35 @@ final class LocalActivationProbeTests: XCTestCase {
             XCTAssertEqual(status, 200)
             XCTAssertEqual(body, #"{"status":"healthy"}"#)
         }
+    }
+
+    func testProbeOutcomeRetainsPostHealthPhaseForRedirectedMCPResponse() async throws {
+        ActivationProbeURLProtocol.handler = { request in
+            switch request.url?.path {
+            case "/__mac_orchestrator_health":
+                return .init(status: 200, body: Data(#"{"status":"ok"}"#.utf8))
+            case "/connector-token/mcp":
+                return .init(
+                    status: 200,
+                    body: Self.rpcResult(["protocolVersion": "2025-06-18"], id: 1),
+                    headers: ["Mcp-Session-Id": "session-123"],
+                    responseURL: URL(string: "http://127.0.0.1:8001/redirected")
+                )
+            default:
+                XCTFail("Unexpected URL: \(request.url?.absoluteString ?? "nil")")
+                return .init(status: 404, body: Data())
+            }
+        }
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ActivationProbeURLProtocol.self]
+        let probe = LocalActivationProbe(session: URLSession(configuration: configuration))
+
+        let outcome = await probe.runOutcome(port: 8_000, capabilityToken: "connector-token")
+
+        XCTAssertEqual(outcome.phase, .initialize)
+        XCTAssertEqual(outcome.error, .transport("unexpected redirect"))
+        XCTAssertNil(outcome.details)
     }
 
     func testProbeRejectsMismatchedJSONRPCResponseID() async throws {
@@ -462,11 +581,18 @@ private final class ActivationProbeURLProtocol: URLProtocol {
         let status: Int
         let body: Data
         let headers: [String: String]
+        let responseURL: URL?
 
-        init(status: Int, body: Data, headers: [String: String] = [:]) {
+        init(
+            status: Int,
+            body: Data,
+            headers: [String: String] = [:],
+            responseURL: URL? = nil
+        ) {
             self.status = status
             self.body = body
             self.headers = headers
+            self.responseURL = responseURL
         }
     }
 
@@ -480,9 +606,15 @@ private final class ActivationProbeURLProtocol: URLProtocol {
         Self.requests.append(request)
         do {
             let response = try XCTUnwrap(Self.handler?(request))
+            let responseURL: URL
+            if let explicitResponseURL = response.responseURL {
+                responseURL = explicitResponseURL
+            } else {
+                responseURL = try XCTUnwrap(request.url)
+            }
             let httpResponse = try XCTUnwrap(
                 HTTPURLResponse(
-                    url: try XCTUnwrap(request.url),
+                    url: responseURL,
                     statusCode: response.status,
                     httpVersion: nil,
                     headerFields: response.headers

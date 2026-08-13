@@ -594,20 +594,23 @@ struct LaunchAgentOwnershipFacts: Equatable, Sendable {
 
 struct ManagedLaunchAgentContract: Equatable, Sendable {
     static let label = "com.jay.mac-orchestrator"
-    static let executablePath = "/Applications/Mac Orchestrator.app/Contents/MacOS/MacOrchestrator"
 
     let homeDirectory: URL
     let launchAgentURL: URL
     let executableURL: URL
     let launcherLogURL: URL
 
-    init(homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser) {
+    init(
+        homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser,
+        executableURL: URL? = nil
+    ) {
         let normalizedHome = homeDirectory.standardizedFileURL
         self.homeDirectory = normalizedHome
         self.launchAgentURL = normalizedHome
             .appendingPathComponent("Library/LaunchAgents", isDirectory: true)
             .appendingPathComponent(Self.label + ".plist", isDirectory: false)
-        self.executableURL = URL(fileURLWithPath: Self.executablePath)
+        self.executableURL = (executableURL ?? normalizedHome
+            .appendingPathComponent("Library/Application Support/Mac Orchestrator/app/Mac Orchestrator.app/Contents/MacOS/MacOrchestrator", isDirectory: false)).standardizedFileURL
         self.launcherLogURL = normalizedHome
             .appendingPathComponent("Library/Logs/Mac Orchestrator", isDirectory: true)
             .appendingPathComponent("launcher.log", isDirectory: false)
@@ -619,11 +622,7 @@ struct ManagedLaunchAgentContract: Equatable, Sendable {
             "ProgramArguments": [executableURL.path],
             "RunAtLoad": true,
             "KeepAlive": ["SuccessfulExit": false],
-            "ThrottleInterval": 5,
-            "ProcessType": "Interactive",
             "LimitLoadToSessionType": "Aqua",
-            "StandardOutPath": launcherLogURL.path,
-            "StandardErrorPath": launcherLogURL.path,
         ]
     }
 
@@ -633,11 +632,7 @@ struct ManagedLaunchAgentContract: Equatable, Sendable {
               plist["Label"] as? String == Self.label,
               plist["ProgramArguments"] as? [String] == [executableURL.path],
               plist["RunAtLoad"] as? Bool == true,
-              plist["ThrottleInterval"] as? Int == 5,
-              plist["ProcessType"] as? String == "Interactive",
               plist["LimitLoadToSessionType"] as? String == "Aqua",
-              plist["StandardOutPath"] as? String == launcherLogURL.path,
-              plist["StandardErrorPath"] as? String == launcherLogURL.path,
               let keepAlive = plist["KeepAlive"] as? [String: Any],
               Set(keepAlive.keys) == ["SuccessfulExit"],
               keepAlive["SuccessfulExit"] as? Bool == false else {

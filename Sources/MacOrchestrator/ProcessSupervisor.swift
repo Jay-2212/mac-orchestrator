@@ -34,6 +34,9 @@ final class ProcessSupervisor {
     private var activationSucceeded = false
     private var activationInFlight = false
     private var serverLaunchGeneration: UInt64 = 0
+    private var tunnelLaunchGeneration: UInt64 = 0
+    private var serverProcessGroupOwned = false
+    private var tunnelProcessGroupOwned = false
 
     private var serverDesired: Bool {
         lifecycle.desiredState(for: .mcpServer).isEnabled
@@ -376,11 +379,13 @@ final class ProcessSupervisor {
         }
         do {
             try process.run()
+            serverProcessGroupOwned = setpgid(process.processIdentifier, process.processIdentifier) == 0
             serverProcess = process
             persistState()
             lifecycle.markProcessRunning(for: .mcpServer)
             appLog.write("Started owned server pid=\(process.processIdentifier)")
         } catch {
+            serverProcessGroupOwned = false
             serverProcess = nil
             lifecycle.recordFailure(
                 for: .mcpServer,
@@ -393,6 +398,7 @@ final class ProcessSupervisor {
         guard !quitting, !lifecycle.isQuiescing, tunnelDesired,
               lifecycle.snapshot.mcpServer.isReady, tunnelProcess == nil,
               let contract = activeContract else { return }
+        let launchGeneration = beginTunnelLaunch()
         lifecycle.markStarting(for: .remoteConnector)
         guard FileManager.default.isExecutableFile(atPath: ngrokBinaryURL.path) else {
             lifecycle.markFailed(
@@ -436,10 +442,11 @@ final class ProcessSupervisor {
         process.terminationHandler = { [weak self] terminated in
             let processID = ObjectIdentifier(terminated)
             let terminationStatus = terminated.terminationStatus
-            Task { @MainActor [weak self, processID, terminationStatus] in
+            Task { @MainActor [weak self, processID, terminationStatus, launchGeneration] in
                 guard let self,
                       let process = self.tunnelProcess,
-                      ObjectIdentifier(process) == processID else { return }
+                      ObjectIdentifier(process) == processID,
+                      self.tunnelLaunchGeneration == launchGeneration else { return }
                 self.tunnelProcess = nil
                 self.persistState()
                 self.snapshot.connectorURL = nil
@@ -455,12 +462,13 @@ final class ProcessSupervisor {
         }
         do {
             try process.run()
-            _ = setpgid(process.processIdentifier, process.processIdentifier)
+            tunnelProcessGroupOwned = setpgid(process.processIdentifier, process.processIdentifier) == 0
             tunnelProcess = process
             persistState()
             lifecycle.markProcessRunning(for: .remoteConnector)
             appLog.write("Started owned tunnel pid=\(process.processIdentifier)")
         } catch {
+            tunnelProcessGroupOwned = false
             tunnelProcess = nil
             lifecycle.recordFailure(
                 for: .remoteConnector,
@@ -475,20 +483,23 @@ final class ProcessSupervisor {
             lifecycle.markStopped(for: .mcpServer)
             return
         }
-        terminateOwned(process, group: true, label: "server")
+        terminateOwned(process, group: serverProcessGroupOwned, label: "server")
+        serverProcessGroupOwned = false
         serverProcess = nil
         persistState()
         lifecycle.markStopped(for: .mcpServer)
     }
 
     private func stopTunnelProcess() {
+        invalidateTunnelLaunch()
         guard let process = tunnelProcess else {
             snapshot.connectorURL = nil
             lifecycle.markStopped(for: .remoteConnector)
             return
         }
         snapshot.connectorURL = nil
-        terminateOwned(process, group: true, label: "tunnel")
+        terminateOwned(process, group: tunnelProcessGroupOwned, label: "tunnel")
+        tunnelProcessGroupOwned = false
         tunnelProcess = nil
         persistState()
         lifecycle.markStopped(for: .remoteConnector)
@@ -677,6 +688,16 @@ final class ProcessSupervisor {
         activationInFlight = false
     }
 
+    @discardableResult
+    private func beginTunnelLaunch() -> UInt64 {
+        tunnelLaunchGeneration &+= 1
+        return tunnelLaunchGeneration
+    }
+
+    private func invalidateTunnelLaunch() {
+        tunnelLaunchGeneration &+= 1
+    }
+
     private func queryTunnelURL() {
         var request = URLRequest(url: URL(string: "http://127.0.0.1:4040/api/endpoints")!)
         request.timeoutInterval = 1
@@ -691,16 +712,27 @@ final class ProcessSupervisor {
             return
         }
         let processID = ObjectIdentifier(process)
-        NoRedirectURLSession.make().dataTask(with: request) { [weak self, processID] data, response, _ in
-            Task { @MainActor [weak self, processID] in
+        let launchGeneration = tunnelLaunchGeneration
+        let expectedTunnelTarget = contract.tunnelTarget
+        let expectedConnectorToken = connectorToken
+        NoRedirectURLSession.make().dataTask(with: request) { [weak self, processID, launchGeneration, expectedTunnelTarget, expectedConnectorToken] data, response, _ in
+            Task { @MainActor [weak self, processID, launchGeneration, expectedTunnelTarget, expectedConnectorToken] in
                 guard let self, let process = self.tunnelProcess, process.isRunning,
-                      ObjectIdentifier(process) == processID else { return }
+                      ObjectIdentifier(process) == processID,
+                      self.tunnelLaunchGeneration == launchGeneration,
+                      self.tunnelDesired,
+                      self.serverDesired,
+                      !self.quitting,
+                      !self.lifecycle.isQuiescing,
+                      self.lifecycle.snapshot.mcpServer.isReady,
+                      self.activeContract?.tunnelTarget == expectedTunnelTarget,
+                      self.activeContract?.environment["MAC_ORCHESTRATOR_CONNECTOR_TOKEN"] == expectedConnectorToken else { return }
                 guard (response as? HTTPURLResponse)?.statusCode == 200,
                       (response as? HTTPURLResponse)?.url == request.url,
                       let data,
                       let base = NgrokEndpointParser.publicURL(
                           from: data,
-                          matching: contract.tunnelTarget
+                          matching: expectedTunnelTarget
                       ) else {
                     // A previously observed public URL is never current
                     // evidence. Clear it until the owned tunnel is confirmed
@@ -814,12 +846,15 @@ final class ProcessSupervisor {
             ownerID: ownerID
         ) else { return }
         appLog.write("Cleaning \(label) pid=\(pid)")
-        _ = kill(-pid, SIGTERM)
+        let ownsProcessGroup = getpgid(pid) == pid
+        _ = ownsProcessGroup ? kill(-pid, SIGTERM) : kill(pid, SIGTERM)
         let deadline = Date().addingTimeInterval(3)
         while kill(pid, 0) == 0 && Date() < deadline {
             Thread.sleep(forTimeInterval: 0.05)
         }
-        if kill(pid, 0) == 0 { _ = kill(-pid, SIGKILL) }
+        if kill(pid, 0) == 0 {
+            _ = ownsProcessGroup ? kill(-pid, SIGKILL) : kill(pid, SIGKILL)
+        }
     }
 
     private func commandLine(for pid: Int32) -> String {

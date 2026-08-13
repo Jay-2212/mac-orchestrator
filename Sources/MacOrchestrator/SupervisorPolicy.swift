@@ -49,7 +49,15 @@ enum ProcessOwnership {
         component: SupervisorComponent,
         ownerID: String
     ) -> Bool {
-        commandLine.contains(marker(for: component, ownerID: ownerID))
+        let tokens = commandLine.split { $0 == " " || $0 == "\t" }.map(String.init)
+        switch component {
+        case .server:
+            return zip(tokens, tokens.dropFirst()).contains { option, value in
+                option == "--managed-owner" && value == ownerID
+            }
+        case .tunnel:
+            return tokens.contains("mac-orchestrator-owner=\(ownerID)")
+        }
     }
 
     /// Pure authorization policy for cleanup of a recorded process ID.

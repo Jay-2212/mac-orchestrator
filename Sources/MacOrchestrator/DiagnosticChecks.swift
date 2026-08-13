@@ -396,16 +396,27 @@ enum DiagnosticChecks {
     }
 
     static func lifecycleProcessOwnership(_ facts: LifecycleFacts?, desired: Bool) -> DiagnosticResult {
-        guard desired else { return result("lifecycle.process-ownership", "Process ownership", .skip, Text.notApplicable) }
+        lifecycleProcessOwnership(facts, desiredServer: desired, desiredRemote: desired)
+    }
+
+    static func lifecycleProcessOwnership(
+        _ facts: LifecycleFacts?,
+        desiredServer: Bool,
+        desiredRemote: Bool
+    ) -> DiagnosticResult {
+        guard desiredServer || desiredRemote else {
+            return result("lifecycle.process-ownership", "Process ownership", .skip, Text.notApplicable)
+        }
         guard let facts else {
             return result("lifecycle.process-ownership", "Process ownership", .fail, Text.providerUnavailable, repair: .retryMCPServer)
         }
         guard facts.serviceRunning,
-              facts.ownedProcessCount > 0,
+              facts.ownedProcessCount == (desiredServer ? 1 : 0) + (desiredRemote ? 1 : 0),
               facts.ownershipMarkerPresent,
               !facts.duplicateOwnedProcesses,
               !facts.pidReuseDetected else {
-            return result("lifecycle.process-ownership", "Process ownership", .fail, Text.ownershipInvalid, repair: .retryMCPServer)
+            let repair: RepairActionID = desiredServer ? .retryMCPServer : .retryRemoteConnector
+            return result("lifecycle.process-ownership", "Process ownership", .fail, Text.ownershipInvalid, repair: repair)
         }
         return result("lifecycle.process-ownership", "Process ownership", .pass, Text.verified)
     }

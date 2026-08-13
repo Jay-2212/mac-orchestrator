@@ -140,6 +140,7 @@ struct FilesystemUpdateTransactionDriver: UpdateTransactionDriver {
         guard fileManager.isExecutableFile(atPath: remote.path) else {
             throw FilesystemUpdateError.structuralValidationFailed("candidate ngrok")
         }
+        try validateNgrokBinary(remote, candidate: candidate)
         let payloads: [(String, URL, String)] = [
             ("helper", staged.rootURL.appendingPathComponent("payloads/Mac-Orchestrator-arm64.zip"), candidate.manifest.helper.sha256),
             ("bootstrap", staged.rootURL.appendingPathComponent("payloads/bootstrap.sh"), candidate.manifest.bootstrap.sha256),
@@ -156,7 +157,7 @@ struct FilesystemUpdateTransactionDriver: UpdateTransactionDriver {
             staged.rootURL.appendingPathComponent("candidate/app", isDirectory: true),
             staged.rootURL.appendingPathComponent("candidate/runtime", isDirectory: true),
             staged.rootURL.appendingPathComponent("candidate/remote", isDirectory: true),
-        ] where containsSymlink(path) {
+        ] where containsSymlinkInTree(path) {
             throw FilesystemUpdateError.unsafePath
         }
     }
@@ -260,12 +261,14 @@ struct FilesystemUpdateTransactionDriver: UpdateTransactionDriver {
         for file in ["automac_mcp.py", "pyproject.toml", "uv.lock", "bin/uv"] where !fileManager.fileExists(atPath: runtime.appendingPathComponent(file).path) {
             throw FilesystemUpdateError.structuralValidationFailed("installed runtime \(file)")
         }
-        guard fileManager.isExecutableFile(atPath: supportDirectory.appendingPathComponent("remote/ngrok/ngrok", isDirectory: false).path),
-              !containsSymlink(supportDirectory.appendingPathComponent("app", isDirectory: true)),
-              !containsSymlink(supportDirectory.appendingPathComponent("runtime", isDirectory: true)),
-              !containsSymlink(supportDirectory.appendingPathComponent("remote", isDirectory: true)) else {
+        let installedNgrok = supportDirectory.appendingPathComponent("remote/ngrok/ngrok", isDirectory: false)
+        guard fileManager.isExecutableFile(atPath: installedNgrok.path),
+              !containsSymlinkInTree(supportDirectory.appendingPathComponent("app", isDirectory: true)),
+              !containsSymlinkInTree(supportDirectory.appendingPathComponent("runtime", isDirectory: true)),
+              !containsSymlinkInTree(supportDirectory.appendingPathComponent("remote", isDirectory: true)) else {
             throw FilesystemUpdateError.structuralValidationFailed("installed remote payload")
         }
+        try validateNgrokBinary(installedNgrok, candidate: candidate)
         guard try MaintenanceDigest.sha256(file: runtime.appendingPathComponent("uv.lock"))
             .caseInsensitiveCompare(candidate.manifest.runtime.lockSha256) == .orderedSame else {
             throw FilesystemUpdateError.structuralValidationFailed("runtime lock")
@@ -279,14 +282,12 @@ struct FilesystemUpdateTransactionDriver: UpdateTransactionDriver {
         }
         guard !containsSymlink(launchAgentsDirectory), isOwned(launchAgentsDirectory) else { throw FilesystemUpdateError.unsafePath }
         let helper = supportDirectory.appendingPathComponent("app/Mac Orchestrator.app/Contents/MacOS/MacOrchestrator")
-        let plist: [String: Any] = [
-            "Label": "com.jay.mac-orchestrator",
-            "ProgramArguments": [helper.path],
-            "RunAtLoad": true,
-            "KeepAlive": true,
-        ]
         do {
-            let data = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+            let contract = ManagedLaunchAgentContract(
+                homeDirectory: fileManager.homeDirectoryForCurrentUser,
+                executableURL: helper
+            )
+            let data = try contract.propertyListData()
             try writeOwned(data, to: launchAgentURL)
         } catch let error as FilesystemUpdateError {
             throw error
@@ -563,11 +564,59 @@ struct FilesystemUpdateTransactionDriver: UpdateTransactionDriver {
         try validateCandidateHelper(app: app, binary: binary, candidate: candidate)
     }
 
+    private func validateNgrokBinary(_ binary: URL, candidate: UpdateCandidate) throws {
+        let signature = try? commandRunner.run(
+            executable: URL(fileURLWithPath: "/usr/bin/codesign"),
+            arguments: ["--verify", "--deep", "--strict", binary.path]
+        )
+        guard signature?.status == 0 else {
+            throw FilesystemUpdateError.structuralValidationFailed("ngrok signature")
+        }
+        let details = try? commandRunner.run(
+            executable: URL(fileURLWithPath: "/usr/bin/codesign"),
+            arguments: ["-dv", "--verbose=4", binary.path]
+        )
+        guard details?.status == 0,
+              details?.output.contains("Authority=\(candidate.manifest.ngrok.developerIdAuthority)") == true,
+              details?.output.contains("TeamIdentifier=\(candidate.manifest.ngrok.developerIdTeam)") == true else {
+            throw FilesystemUpdateError.structuralValidationFailed("ngrok Developer ID identity")
+        }
+        let architectures = try? commandRunner.run(
+            executable: URL(fileURLWithPath: "/usr/bin/lipo"),
+            arguments: ["-archs", binary.path]
+        )
+        guard architectures?.status == 0,
+              architectures?.output.split(whereSeparator: { $0 == " " || $0 == "\n" || $0 == "\r" })
+                .contains(Substring(candidate.manifest.platform.architecture)) == true else {
+            throw FilesystemUpdateError.structuralValidationFailed("ngrok architecture")
+        }
+    }
+
     private func containsSymlink(_ url: URL) -> Bool {
         var current = url.standardizedFileURL
         while current.path != "/" {
             if (try? fileManager.destinationOfSymbolicLink(atPath: current.path)) != nil { return true }
             current.deleteLastPathComponent()
+        }
+        return false
+    }
+
+    private func containsSymlinkInTree(_ url: URL) -> Bool {
+        guard !containsSymlink(url) else { return true }
+        guard fileManager.fileExists(atPath: url.path) else { return false }
+        var stack = [url.standardizedFileURL]
+        while let current = stack.popLast() {
+            var metadata = stat()
+            guard lstat(current.path, &metadata) == 0 else { return true }
+            let type = UInt32(metadata.st_mode) & UInt32(S_IFMT)
+            if type == UInt32(S_IFLNK) { return true }
+            guard type == UInt32(S_IFDIR) else { continue }
+            guard let children = try? fileManager.contentsOfDirectory(
+                at: current,
+                includingPropertiesForKeys: nil,
+                options: []
+            ) else { return true }
+            stack.append(contentsOf: children)
         }
         return false
     }

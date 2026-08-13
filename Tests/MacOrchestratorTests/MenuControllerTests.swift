@@ -16,13 +16,28 @@ final class MenuControllerTests: XCTestCase {
         )
 
         XCTAssertEqual(MenuController.runtimeStatusTitles(for: snapshot), [
-            "Server: Running",
-            "Tunnel: Stopped",
+            "Readiness: Needs attention",
+            "Local automation: Running",
+            "Optional remote access: Optional and disabled",
             "Profile: Full Control",
             "Capabilities ready: 7/11",
             "Error: Configuration could not be loaded",
             "MCP client refresh/reconnection required",
         ])
+    }
+
+    @MainActor
+    func testRuntimeStatusTitlesUseNontechnicalReadinessAndRemoteLanguage() {
+        let snapshot = ServiceSnapshot(
+            server: .running,
+            tunnel: .running,
+            productReadiness: .ready
+        )
+
+        XCTAssertEqual(
+            MenuController.runtimeStatusTitles(for: snapshot).prefix(3),
+            ["Readiness: Ready", "Local automation: Running", "Optional remote access: Ready"]
+        )
     }
 
     @MainActor

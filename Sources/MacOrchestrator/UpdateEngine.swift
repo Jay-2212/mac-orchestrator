@@ -441,6 +441,14 @@ final class UpdateEngine {
             let registry = try migrationProvider.registry(for: candidate)
             try faultInjector.check(.beforeMigrationPreparation)
             let prepared = try driver.prepareMigration(candidate: candidate, staged: staged, registry: registry)
+            // Phase 3 validates and stages candidate bytes in the current
+            // helper, but does not execute an extracted candidate helper.
+            // Refuse schema-changing migrations until the bounded
+            // candidate-helper execution handoff exists; same-schema updates
+            // remain safe and truthful.
+            if let prepared, prepared.plan.sourceSchema != prepared.plan.targetSchema {
+                throw UpdateEngineError.migrationUnavailable
+            }
             try faultInjector.check(.afterMigrationPreparation)
             try ledger.advance(transaction.id, to: .migrationPrepared)
 

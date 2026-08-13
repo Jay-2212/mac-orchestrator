@@ -23,29 +23,29 @@ final class MenuController: NSObject {
         for title in Self.runtimeStatusTitles(for: snapshot) {
             menu.addItem(label(title))
         }
-        if let url = snapshot.connectorURL {
-            menu.addItem(label("URL: \(url.host ?? "Available")"))
-            menu.addItem(action("Copy Connector URL", #selector(copyURL)))
-        } else {
-            menu.addItem(label("Connector URL unavailable"))
-        }
         menu.addItem(.separator())
 
         if snapshot.server == .stopped || snapshot.server == .failed {
-            menu.addItem(action("Start Server", #selector(startServer)))
+            menu.addItem(action("Start Local Automation", #selector(startServer)))
         } else {
-            menu.addItem(action("Stop Server", #selector(stopServer)))
+            menu.addItem(action("Stop Local Automation", #selector(stopServer)))
         }
         if snapshot.tunnel == .running || snapshot.tunnel == .starting || snapshot.tunnel == .reconnecting {
-            menu.addItem(action("Disable Public Connector", #selector(disableConnector)))
+            menu.addItem(action("Disable Optional Remote Access", #selector(disableConnector)))
         } else {
-            menu.addItem(action("Enable Public Connector", #selector(enableConnector)))
+            menu.addItem(action("Enable Optional Remote Access", #selector(enableConnector)))
         }
-        menu.addItem(action("Restart", #selector(restart)))
+        menu.addItem(action("Run Doctor", #selector(runDoctor)))
+        menu.addItem(action("Repair Primary Failure", #selector(repairPrimaryFailure)))
+        menu.addItem(action("Restart Services", #selector(restart)))
         menu.addItem(.separator())
+        menu.addItem(action("Support Bundle Preview", #selector(previewSupportBundle)))
+        menu.addItem(action("Create Redacted Support Bundle", #selector(createSupportBundle)))
+        menu.addItem(action("Check for Authenticated Updates", #selector(checkForUpdates)))
+        menu.addItem(action("Apply Authenticated Update…", #selector(applyUpdate)))
         menu.addItem(action("Open Logs", #selector(openLogs)))
-        menu.addItem(action("Open Privacy & Security Settings (then Restart)", #selector(openPrivacySettings)))
-        menu.addItem(label("Launch at Login: Enabled"))
+        menu.addItem(action("Open Privacy & Security Settings", #selector(openPrivacySettings)))
+        menu.addItem(action("Plan Removal…", #selector(planUninstall)))
         menu.addItem(.separator())
         menu.addItem(action("Quit Mac Orchestrator", #selector(quit)))
         statusItem.menu = menu
@@ -65,9 +65,23 @@ final class MenuController: NSObject {
     }
 
     static func runtimeStatusTitles(for snapshot: ServiceSnapshot) -> [String] {
+        let readiness: String
+        switch snapshot.productReadiness {
+        case .ready: readiness = "Ready"
+        case .partiallyReady: readiness = "Partially ready"
+        case .needsAttention: readiness = "Needs attention"
+        }
+        let local = snapshot.server == .running ? "Running" : snapshot.server.rawValue
+        let remote: String
+        switch snapshot.tunnel {
+        case .running: remote = "Ready"
+        case .stopped: remote = "Optional and disabled"
+        default: remote = snapshot.tunnel.rawValue
+        }
         var titles = [
-            "Server: \(snapshot.server.rawValue)",
-            "Tunnel: \(snapshot.tunnel.rawValue)",
+            "Readiness: \(readiness)",
+            "Local automation: \(local)",
+            "Optional remote access: \(remote)",
         ]
         if let profile = snapshot.controlProfile {
             let profileName = profile == .guided ? "Guided Control" : "Full Control"
@@ -100,17 +114,29 @@ final class MenuController: NSObject {
         return item
     }
 
-    @objc private func copyURL() {
-        guard let url = snapshot.connectorURL else { return }
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(url.absoluteString, forType: .string)
-    }
-
     @objc private func startServer() { supervisor.startServerRequested() }
     @objc private func stopServer() { supervisor.stopServerRequested() }
     @objc private func enableConnector() { supervisor.enableConnectorRequested() }
     @objc private func disableConnector() { supervisor.disableConnectorRequested() }
     @objc private func restart() { supervisor.restartRequested() }
+    @objc private func runDoctor() { _ = TerminalCommand.run(arguments: ["doctor"]) }
+    @objc private func repairPrimaryFailure() {
+        let action = snapshot.server == .failed ? "retryMCPServer" : "retryRemoteConnector"
+        _ = TerminalCommand.run(arguments: ["doctor", "--repair", action])
+    }
+    @objc private func previewSupportBundle() { _ = TerminalCommand.run(arguments: ["support-bundle", "--preview"]) }
+    @objc private func createSupportBundle() { _ = TerminalCommand.run(arguments: ["support-bundle", "--create"]) }
+    @objc private func checkForUpdates() { _ = TerminalCommand.run(arguments: ["update", "--check"]) }
+    @objc private func applyUpdate() {
+        let alert = NSAlert()
+        alert.messageText = "Apply authenticated update?"
+        alert.informativeText = "Mac Orchestrator will stop its managed services, verify the release, and restore them after a successful update."
+        alert.addButton(withTitle: "Apply Update")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        _ = TerminalCommand.run(arguments: ["update", "--apply"])
+    }
+    @objc private func planUninstall() { _ = TerminalCommand.run(arguments: ["uninstall", "--plan"]) }
     @objc private func openLogs() { supervisor.openLogs() }
     @objc private func openPrivacySettings() { supervisor.openPrivacySettings() }
     @objc private func quit() { NSApp.terminate(nil) }

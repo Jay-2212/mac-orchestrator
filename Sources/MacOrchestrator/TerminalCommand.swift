@@ -19,6 +19,22 @@ private final class TerminalProbeErrorBox: @unchecked Sendable {
     }
 }
 
+private final class TerminalDoctorResultBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: DoctorReport?
+
+    func store(_ value: DoctorReport) { lock.lock(); self.value = value; lock.unlock() }
+    func load() -> DoctorReport? { lock.lock(); defer { lock.unlock() }; return value }
+}
+
+private final class TerminalRepairResultBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: RepairOutcome?
+
+    func store(_ value: RepairOutcome) { lock.lock(); self.value = value; lock.unlock() }
+    func load() -> RepairOutcome? { lock.lock(); defer { lock.unlock() }; return value }
+}
+
 enum TerminalCommandError: Error, LocalizedError, Sendable {
     case invalidArguments(String)
     case tokenInputUnavailable
@@ -42,7 +58,145 @@ enum TerminalCommandError: Error, LocalizedError, Sendable {
     }
 }
 
+enum TerminalMaintenanceIntent: Equatable, Sendable {
+    case doctor(json: Bool, repair: RepairActionID?)
+    case supportBundle(preview: Bool, output: String?)
+}
+
+private struct TerminalUnavailableLocalMCPProvider: LocalMCPDiagnosticProviding {
+    func inspect() throws -> LocalMCPFacts { throw DiagnosticProviderError.unavailable }
+}
+
+private struct TerminalUnavailableUpdateProvider: UpdateAvailabilityProviding {
+    func inspect() throws -> UpdateAvailabilityFacts { throw DiagnosticProviderError.unavailable }
+}
+
+private struct TerminalUpdateAvailabilityProvider: UpdateAvailabilityProviding {
+    let currentVersion: String
+    let check: () throws -> UpdateCandidate
+
+    func inspect() throws -> UpdateAvailabilityFacts {
+        do {
+            let candidate = try check()
+            return UpdateAvailabilityFacts(
+                status: .available,
+                currentVersion: currentVersion,
+                availableVersion: candidate.manifest.product.version
+            )
+        } catch UpdateEngineError.noStableUpdate {
+            return UpdateAvailabilityFacts(status: .current, currentVersion: currentVersion)
+        } catch {
+            throw DiagnosticProviderError.unavailable
+        }
+    }
+}
+
+private struct TerminalLaunchctlLifecycleRetryer: LifecycleRetrying, @unchecked Sendable {
+    let runner: MaintenanceCommandRunner = SystemMaintenanceCommandRunner()
+    let launchctlURL = URL(fileURLWithPath: "/bin/launchctl")
+    let label = "gui/\(getuid())/com.jay.mac-orchestrator"
+
+    func retry(_ target: LifecycleRepairTarget) async -> RepairAdapterResult {
+        guard (try? runner.run(executable: launchctlURL, arguments: ["print", label]))?.status == 0 else {
+            return .refused
+        }
+        let result = try? runner.run(executable: launchctlURL, arguments: ["kickstart", "-k", label])
+        return result?.status == 0 ? .repaired : .failed
+    }
+}
+
+private struct TerminalPortOccupancy: LocalPortOccupancyChecking, @unchecked Sendable {
+    let ownerID: String
+
+    func inspect(port: Int) async -> LocalPortOccupancy {
+        LocalPortAllocator.isOccupied(port) ? .occupiedUnrelated : .free
+    }
+}
+
+private struct TerminalLaunchAgentReloader: ManagedLaunchAgentReloading, @unchecked Sendable {
+    let runner: MaintenanceCommandRunner = SystemMaintenanceCommandRunner()
+    let launchctlURL = URL(fileURLWithPath: "/bin/launchctl")
+
+    func reloadManagedLaunchAgent(_ contract: ManagedLaunchAgentContract) async -> RepairAdapterResult {
+        let label = "gui/\(getuid())/\(ManagedLaunchAgentContract.label)"
+        _ = try? runner.run(executable: launchctlURL, arguments: ["bootout", label])
+        guard let result = try? runner.run(
+            executable: launchctlURL,
+            arguments: ["bootstrap", "gui/\(getuid())", contract.launchAgentURL.path]
+        ), result.status == 0 else { return .failed }
+        return .repaired
+    }
+}
+
 enum TerminalCommand {
+    static func parseMaintenanceCommand(arguments: [String]) throws -> TerminalMaintenanceIntent {
+        guard let command = arguments.first else {
+            throw TerminalCommandError.invalidArguments("A terminal command is required.")
+        }
+        switch command {
+        case "doctor":
+            var index = 1
+            var json = false
+            var repair: RepairActionID?
+            while index < arguments.count {
+                switch arguments[index] {
+                case "--json":
+                    guard !json else { throw TerminalCommandError.invalidArguments("Use --json at most once.") }
+                    json = true
+                    index += 1
+                case "--repair":
+                    guard repair == nil, index + 1 < arguments.count,
+                          let action = RepairActionID(rawValue: arguments[index + 1]) else {
+                        throw TerminalCommandError.invalidArguments("Usage: doctor [--json] [--repair ACTION].")
+                    }
+                    repair = action
+                    index += 2
+                default:
+                    throw TerminalCommandError.invalidArguments("Usage: doctor [--json] [--repair ACTION].")
+                }
+            }
+            guard !(json && repair != nil) else {
+                throw TerminalCommandError.invalidArguments("Choose either --json or --repair.")
+            }
+            return .doctor(json: json, repair: repair)
+        case "support-bundle":
+            var index = 1
+            var preview = false
+            var create = false
+            var output: String?
+            while index < arguments.count {
+                switch arguments[index] {
+                case "--preview":
+                    guard !preview else { throw TerminalCommandError.invalidArguments("Use --preview at most once.") }
+                    preview = true
+                    index += 1
+                case "--create":
+                    guard !create else { throw TerminalCommandError.invalidArguments("Use --create at most once.") }
+                    create = true
+                    index += 1
+                case "--output":
+                    guard output == nil, index + 1 < arguments.count,
+                          !arguments[index + 1].hasPrefix("--") else {
+                        throw TerminalCommandError.invalidArguments("Missing value for --output.")
+                    }
+                    output = arguments[index + 1]
+                    index += 2
+                default:
+                    throw TerminalCommandError.invalidArguments("Usage: support-bundle --preview|--create [--output PATH].")
+                }
+            }
+            guard preview != create else {
+                throw TerminalCommandError.invalidArguments("Usage: support-bundle --preview|--create [--output PATH].")
+            }
+            guard !preview || output == nil else {
+                throw TerminalCommandError.invalidArguments("--output is only valid with --create.")
+            }
+            return .supportBundle(preview: preview, output: output)
+        default:
+            throw TerminalCommandError.invalidArguments("Unknown maintenance command: \(command)")
+        }
+    }
+
     static func run(arguments: [String]) -> Int32? {
         guard let command = arguments.first else { return nil }
 
@@ -147,6 +301,14 @@ enum TerminalCommand {
                 return try runUpdate(arguments: Array(arguments.dropFirst()))
             case "uninstall":
                 return try runUninstall(arguments: Array(arguments.dropFirst()))
+            case "doctor":
+                let intent = try parseMaintenanceCommand(arguments: arguments)
+                guard case let .doctor(json, repair) = intent else { throw TerminalCommandError.invalidArguments("Invalid doctor command.") }
+                return try runDoctor(json: json, repair: repair)
+            case "support-bundle":
+                let intent = try parseMaintenanceCommand(arguments: arguments)
+                guard case let .supportBundle(preview, output) = intent else { throw TerminalCommandError.invalidArguments("Invalid support-bundle command.") }
+                return try runSupportBundle(preview: preview, output: output)
             default:
                 if command.hasPrefix("-") {
                     throw TerminalCommandError.invalidArguments("Unknown Mac Orchestrator command: \(command)")
@@ -169,11 +331,13 @@ enum TerminalCommand {
               --set-profile full        Select Full Control with --confirm-full-control.
               --enable-remote            Opt in to the ngrok connector after storing a token.
               --disable-remote           Stop requesting remote ingress.
-              --print-connector-url      Print the current live HTTPS connector URL.
+              --print-connector-url      Confirm the live connector without printing its credential-bearing URL.
               --wait-for-local-activation Wait for the authenticated local MCP activation oracle.
-              --print-local-connector-url Confirm activation and print the local MCP URL.
-              --wait-for-remote-connector Wait for and print a confirmed live HTTPS connector URL.
+              --print-local-connector-url Confirm activation without printing the credential-bearing URL.
+              --wait-for-remote-connector Wait for a confirmed live HTTPS connector without printing its URL.
               update [--check|--apply] Check or apply an authenticated release update.
+              doctor [--json] [--repair ACTION] Run read-only diagnostics or one explicit bounded repair.
+              support-bundle --preview|--create [--output PATH] Review or create a redacted support bundle.
               update --pinned --manifest URL --manifest-sha256 SHA --version VERSION
               uninstall --plan [removal options] Preview an explicit uninstall plan.
               uninstall --apply --confirm-uninstall [removal options] Apply that plan.
@@ -269,9 +433,11 @@ enum TerminalCommand {
         let support = ConfigurationStore.defaultDirectoryURL()
         let engine = try UninstallEngine(
             supportDirectory: support,
-            logsDirectory: support.appendingPathComponent("logs", isDirectory: true),
+            logsDirectory: FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Library/Logs/Mac Orchestrator", isDirectory: true),
             keychain: KeychainStore(),
-            lifecycle: ExternalMaintenanceLifecycleAdapter(controller: LaunchAgentMaintenanceController())
+            lifecycle: ExternalMaintenanceLifecycleAdapter(controller: LaunchAgentMaintenanceController()),
+            homeDirectory: FileManager.default.homeDirectoryForCurrentUser
         )
         let plan = try engine.plan(options: options)
         let encoder = JSONEncoder()
@@ -281,7 +447,309 @@ enum TerminalCommand {
         guard apply else { return 0 }
         let receipt = engine.apply(plan)
         print(String(decoding: try receipt.encoded(), as: UTF8.self))
-        return receipt.outcomes.contains { $0.status == .failedManualActionRequired } ? 1 : 0
+        return receipt.outcomes.contains { $0.status == UninstallOutcomeStatus.failedManualActionRequired } ? 1 : 0
+    }
+
+    private static func runDoctor(json: Bool, repair: RepairActionID?) throws -> Int32 {
+        let engine = try makeDoctorEngine()
+        let report = try runDoctorReport(engine)
+        if json {
+            print(String(decoding: try report.encodedJSON(), as: UTF8.self))
+            return report.summary.fail == 0 ? 0 : 1
+        }
+
+        printDoctorReport(report)
+        if let repair {
+            let outcome = try runRepair(repair)
+            print("Repair \(repair.rawValue): \(outcome.status.rawValue) — \(outcome.safeReason)")
+            let after = try runDoctorReport(engine)
+            print("After repair:")
+            printDoctorReport(after)
+            return after.summary.fail == 0 && outcome.status != .failed && outcome.status != .refused ? 0 : 1
+        }
+        return report.summary.fail == 0 ? 0 : 1
+    }
+
+    private static func runSupportBundle(preview: Bool, output: String?) throws -> Int32 {
+        let doctor = try makeDoctorEngine()
+        let report = try runDoctorReport(doctor)
+        let engine = makeSupportBundleEngine(report: report)
+        let plan = engine.preview()
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        encoder.dateEncodingStrategy = .iso8601
+        print("Support bundle preview (no files collected):")
+        print(String(decoding: try encoder.encode(plan), as: UTF8.self))
+        guard !preview else { return 0 }
+
+        let destinationPath = output.map { NSString(string: $0).expandingTildeInPath }
+            ?? FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Desktop", isDirectory: true)
+                .appendingPathComponent("Mac-Orchestrator-support-\(Int(Date().timeIntervalSince1970)).zip")
+                .path
+        let destination = URL(fileURLWithPath: destinationPath)
+        let archive = try engine.create(plan: plan, to: destination)
+        print("Redacted support bundle created: \(archive.path)")
+        return 0
+    }
+
+    private static func runDoctorReport(_ engine: DoctorEngine) throws -> DoctorReport {
+        let box = TerminalDoctorResultBox()
+        let semaphore = DispatchSemaphore(value: 0)
+        Task {
+            box.store(await engine.run())
+            semaphore.signal()
+        }
+        guard semaphore.wait(timeout: .now() + 60) == .success,
+              let report = box.load() else {
+            throw TerminalCommandError.agentRequestFailed("Doctor timed out")
+        }
+        return report
+    }
+
+    private static func printDoctorReport(_ report: DoctorReport) {
+        for result in report.results {
+            print("[\(result.status.rawValue.uppercased())] \(result.title): \(result.reason)")
+        }
+        print("Summary: PASS \(report.summary.pass), WARN \(report.summary.warn), FAIL \(report.summary.fail), SKIP \(report.summary.skip)")
+    }
+
+    private static func makeDoctorEngine() throws -> DoctorEngine {
+        let fileManager = FileManager.default
+        let support = ConfigurationStore.defaultDirectoryURL()
+        let paths = DiagnosticPathSet.defaultPaths(fileManager: fileManager)
+        let configurationProvider = ReadOnlyDoctorConfigurationContextProvider(
+            directoryURL: support,
+            fileManager: fileManager
+        )
+        let configuration = (try? configurationProvider.inspect())?.validatedConfiguration
+        let serverDesired = configuration?.process.serverDesired == true
+        let remoteDesired = configuration?.process.tunnelDesired == true
+            || configuration?.desiredCapabilities["remote.connector"] == true
+        let ownerID = configuration?.ownerID ?? ""
+        let port = configuration?.localMCPPort ?? 0
+
+        let updateProvider: any UpdateAvailabilityProviding
+        if let receipt = try? InstallationReceiptStore(
+            directoryURL: support.appendingPathComponent("install", isDirectory: true),
+            fileManager: fileManager
+        ).load(), (try? SemanticVersion(receipt.productVersion)) != nil {
+            let updateEngine = try makeUpdateEngine()
+            updateProvider = TerminalUpdateAvailabilityProvider(
+                currentVersion: receipt.productVersion,
+                check: { try updateEngine.checkForUpdate() }
+            )
+        } else {
+            updateProvider = TerminalUnavailableUpdateProvider()
+        }
+
+        return DoctorEngine(dependencies: DoctorDependencies(
+            configurationContextProvider: configurationProvider,
+            installedReleaseProvider: ReadOnlyInstalledReleaseFactsProvider(
+                paths: paths,
+                fileManager: fileManager
+            ),
+            keychainPresenceProvider: SystemDoctorKeychainPresenceProvider(),
+            portProvider: ReadOnlyPortFactsProvider(port: port, ownerID: ownerID),
+            localMCPProvider: TerminalUnavailableLocalMCPProvider(),
+            lifecycleProvider: ReadOnlyLifecycleFactsProvider(
+                paths: paths,
+                ownerID: ownerID,
+                serverDesired: serverDesired,
+                remoteDesired: remoteDesired,
+                fileManager: fileManager
+            ),
+            remoteConnectorProvider: ReadOnlyRemoteConnectorFactsProvider(
+                desired: remoteDesired,
+                paths: paths,
+                target: "http://127.0.0.1:\(port)",
+                httpRunner: SystemDiagnosticHTTPRunner(),
+                ownerID: ownerID,
+                processRunner: SystemDiagnosticProcessRunner()
+            ),
+            diskSpaceProvider: ReadOnlyDiskSpaceProvider(
+                filesystemURL: fileManager.homeDirectoryForCurrentUser,
+                criticalPaths: [support, paths.launchAgentURL]
+            ),
+            logDirectoryProvider: ReadOnlyLogDirectoryPermissionsProvider(
+                directoryURL: fileManager.homeDirectoryForCurrentUser
+                    .appendingPathComponent("Library/Logs/Mac Orchestrator", isDirectory: true)
+            ),
+            updateProvider: updateProvider
+        ))
+    }
+
+    private static func runRepair(_ action: RepairActionID) throws -> RepairOutcome {
+        let fileManager = FileManager.default
+        let support = ConfigurationStore.defaultDirectoryURL()
+        let paths = DiagnosticPathSet.defaultPaths(fileManager: fileManager)
+        let configuration = try? ReadOnlyDoctorConfigurationContextProvider(directoryURL: support).inspect().validatedConfiguration
+        var portRepair: (any LocalPortReassigning)?
+        if let configuration,
+           let candidate = try? LocalPortAllocator.select(
+               preferred: configuration.localMCPPort,
+               isOccupied: LocalPortAllocator.isOccupied
+           ) {
+            portRepair = SafeLocalPortReassigner(
+                request: LocalPortReassignmentRequest(
+                    currentPort: configuration.localMCPPort,
+                    candidatePort: candidate,
+                    expectedOwnerID: configuration.ownerID
+                ),
+                occupancy: TerminalPortOccupancy(ownerID: configuration.ownerID),
+                configuration: ConfigurationStorePortUpdater(store: ConfigurationStore())
+            )
+        }
+        let contract = ManagedLaunchAgentContract(
+            homeDirectory: paths.homeDirectory,
+            executableURL: paths.helperExecutableURL
+        )
+        let launchAgentRepairer = ManagedLaunchAgentRepairer(
+            contract: contract,
+            ownership: FileSystemLaunchAgentOwnershipInspector(fileManager: fileManager),
+            writer: FileSystemManagedLaunchAgentWriter(
+                fileManager: fileManager,
+                reloader: TerminalLaunchAgentReloader()
+            )
+        )
+        let backupRestorer: (any ConfigurationBackupRestoring)? = configuration.map {
+            ConfigurationStoreBackupRestorer(
+                store: ConfigurationStore(),
+                expectedOwnerID: $0.ownerID
+            )
+        }
+        let outcomeBox = TerminalRepairResultBox()
+        let semaphore = DispatchSemaphore(value: 0)
+        Task {
+            outcomeBox.store(await RepairEngine(dependencies: RepairDependencies(
+                lifecycleRetrying: TerminalLaunchctlLifecycleRetryer(),
+                configurationBackupRestoring: backupRestorer,
+                localPortReassigning: portRepair,
+                launchAgentRepairing: launchAgentRepairer
+            )).execute(action))
+            semaphore.signal()
+        }
+        guard semaphore.wait(timeout: .now() + 60) == .success,
+              let outcome = outcomeBox.load() else {
+            throw TerminalCommandError.agentRequestFailed("Repair timed out")
+        }
+        return outcome
+    }
+
+    private static func makeSupportBundleEngine(report: DoctorReport) -> SupportBundleEngine {
+        let reportData = (try? report.encodedJSON()) ?? Data("{}".utf8)
+        let support = ConfigurationStore.defaultDirectoryURL()
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let receiptURL = support.appendingPathComponent("install/receipt.json")
+        let receiptData = (try? Data(contentsOf: receiptURL)) ?? Data("{\"available\":false}".utf8)
+        let entries = [
+            Phase3SupportBundleSource.Entry(
+                plan: SupportBundleEntryPlan(
+                    sourceID: "phase3", logicalID: "doctor-report", archivePath: "doctor/report.json",
+                    category: "diagnostic", reason: "read-only Doctor report", expectedRedaction: "canonical redaction"
+                ), data: { reportData }
+            ),
+            Phase3SupportBundleSource.Entry(
+                plan: SupportBundleEntryPlan(
+                    sourceID: "phase3", logicalID: "installation-receipt", archivePath: "installation/receipt.json",
+                    category: "installation", reason: "nonsecret receipt integrity metadata", expectedRedaction: "canonical redaction"
+                ), data: { receiptData }
+            ),
+            Phase3SupportBundleSource.Entry(
+                plan: SupportBundleEntryPlan(
+                    sourceID: "phase3", logicalID: "bounded-logs", archivePath: "logs/bounded.log",
+                    category: "logs", reason: "bounded product-owned log excerpt", expectedRedaction: "canonical redaction"
+                ), data: { try readBoundedLogs(at: home.appendingPathComponent("Library/Logs/Mac Orchestrator", isDirectory: true)) }
+            ),
+            Phase3SupportBundleSource.Entry(
+                plan: SupportBundleEntryPlan(
+                    sourceID: "phase3", logicalID: "maintenance-transactions", archivePath: "maintenance/transactions.json",
+                    category: "maintenance", reason: "bounded update transaction and recovery summary", expectedRedaction: "canonical redaction"
+                ), data: { try readBoundedTransactions(at: support.appendingPathComponent("install/transactions", isDirectory: true)) }
+            )
+        ]
+        return SupportBundleEngine(
+            sources: [Phase3SupportBundleSource(entries: entries)],
+            redactor: SensitiveDataRedactor(exactSecrets: [], homeDirectory: home.path)
+        )
+    }
+
+    private static func readBoundedLogs(at directory: URL) throws -> Data {
+        guard !pathHasSymlinkComponent(directory) else { return Data() }
+        var directoryInfo = stat()
+        if lstat(directory.path, &directoryInfo) == 0,
+           ((directoryInfo.st_mode & S_IFMT) != S_IFDIR || directoryInfo.st_uid != getuid()) {
+            return Data()
+        }
+        var combined = ""
+        let names = ["app.log", "server.log", "tunnel.log", "launcher.log"]
+        for name in names {
+            let url = directory.appendingPathComponent(name, isDirectory: false)
+            var metadata = stat()
+            guard lstat(url.path, &metadata) == 0 else { continue }
+            guard (metadata.st_mode & S_IFMT) == S_IFREG, metadata.st_uid == getuid() else { continue }
+            let data = try Data(contentsOf: url)
+            let bounded = data.suffix(16 * 1024)
+            combined += "## \(name)\n\(String(decoding: bounded, as: UTF8.self))\n"
+        }
+        return Data(combined.utf8)
+    }
+
+    private static func readBoundedTransactions(at directory: URL) throws -> Data {
+        var directoryInfo = stat()
+        guard !pathHasSymlinkComponent(directory),
+              lstat(directory.path, &directoryInfo) == 0,
+              (directoryInfo.st_mode & S_IFMT) == S_IFDIR,
+              directoryInfo.st_uid == getuid() else {
+            return Data("{\"available\":false}\n".utf8)
+        }
+        let urls = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil, options: [])
+            .filter { $0.lastPathComponent.hasPrefix("transaction-") && $0.pathExtension == "json" }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+            .suffix(10)
+        var values: [[String: Any]] = []
+        for url in urls {
+            var metadata = stat()
+            guard lstat(url.path, &metadata) == 0,
+                  (metadata.st_mode & S_IFMT) == S_IFREG,
+                  metadata.st_uid == getuid() else { continue }
+            let bounded = Data(try Data(contentsOf: url).suffix(16 * 1024))
+            if let object = try? JSONSerialization.jsonObject(with: bounded) as? [String: Any] {
+                values.append(object)
+            }
+        }
+        return try JSONSerialization.data(withJSONObject: values, options: [.prettyPrinted, .sortedKeys])
+    }
+
+    private static func pathHasSymlinkComponent(_ url: URL) -> Bool {
+        var current = url.standardizedFileURL
+        while current.path != "/" {
+            if (try? FileManager.default.destinationOfSymbolicLink(atPath: current.path)) != nil { return true }
+            current.deleteLastPathComponent()
+        }
+        return false
+    }
+
+    private static func makeUpdateEngine() throws -> UpdateEngine {
+        let fileManager = FileManager.default
+        let support = ConfigurationStore.defaultDirectoryURL()
+        let installDirectory = support.appendingPathComponent("install", isDirectory: true)
+        let receipt = try InstallationReceiptStore(directoryURL: installDirectory, fileManager: fileManager).load()
+        guard let receipt, let currentVersion = try? SemanticVersion(receipt.productVersion) else {
+            throw TerminalCommandError.invalidArguments("No authenticated InstallationReceiptV1 exists; use the externally pinned Phase 2 recovery path first.")
+        }
+        let fetcher = URLSessionUpdateAssetFetcher()
+        let os = ProcessInfo.processInfo.operatingSystemVersion
+        let operatingSystem = try SemanticVersion("\(os.majorVersion).\(os.minorVersion).\(os.patchVersion)")
+        return UpdateEngine(
+            currentVersion: currentVersion,
+            operatingSystem: operatingSystem,
+            discoverer: GitHubReleaseDiscoverer(fetcher: fetcher),
+            fetcher: fetcher,
+            ledger: MaintenanceTransactionLedger(directoryURL: installDirectory.appendingPathComponent("transactions", isDirectory: true)),
+            driver: FilesystemUpdateTransactionDriver(supportDirectory: support, fetcher: fetcher),
+            lifecycle: ExternalMaintenanceLifecycleAdapter(controller: LaunchAgentMaintenanceController())
+        )
     }
 
     private static func requiredValue(_ arguments: [String], flag: String) throws -> String {
@@ -371,7 +839,8 @@ enum TerminalCommand {
     }
 
     private static func printConnectorURL() throws {
-        print(try currentConnectorURL().absoluteString)
+        _ = try currentConnectorURL()
+        print("Remote connector confirmed. Its credential-bearing URL was intentionally not printed.")
     }
 
     private static func waitForLocalActivation() throws {
@@ -393,10 +862,7 @@ enum TerminalCommand {
                     Thread.sleep(forTimeInterval: 1)
                     continue
                 }
-                print("Local activation confirmed.")
-                print(
-                    "Local MCP URL: http://127.0.0.1:\(configuration.localMCPPort)/\(connectorToken)/mcp"
-                )
+                print("Local activation confirmed. The credential-bearing local MCP URL was intentionally not printed.")
                 printClientHandoff()
                 printPermissionGuidance(configuration: configuration)
                 return
@@ -443,8 +909,7 @@ enum TerminalCommand {
     }
 
     private static func printClientHandoff() {
-        print("Paste the full URL into your MCP client's HTTP or Streamable HTTP URL field.")
-        print("Treat the connector URL like a password and do not share it.")
+        print("Use the installed authenticated client handoff to connect; credential-bearing URLs are not printed by the terminal.")
     }
 
     private static func waitForRemoteConnector() throws {
@@ -453,8 +918,8 @@ enum TerminalCommand {
         while Date() < deadline {
             do {
                 let url = try currentConnectorURL()
+                _ = url
                 print("Remote connector confirmed.")
-                print(url.absoluteString)
                 printClientHandoff()
                 return
             } catch {
@@ -605,8 +1070,10 @@ enum TerminalCommand {
             configuration.process.tunnelDesired = false
             configuration.desiredCapabilities["remote.connector"] = false
         }
-        _ = try restartRunningSupervisorIfLoaded()
-        try waitForRemoteConnectorToDisappear()
+        let supervisorWasReloaded = try restartRunningSupervisorIfLoaded()
+        if supervisorWasReloaded {
+            try waitForRemoteConnectorToDisappear()
+        }
 
         let deleteQuery: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,

@@ -19,6 +19,14 @@ struct MaintenanceQuiesceReceipt: Codable, Equatable, Sendable {
 protocol MaintenanceLifecycleAdapter {
     func quiesce() throws -> MaintenanceQuiesceReceipt
     func restore() throws
+    func removeManagedLaunchAgent() throws
+}
+
+extension MaintenanceLifecycleAdapter {
+    func removeManagedLaunchAgent() throws {
+        // Adapters without a loaded LaunchAgent have nothing to unload. The
+        // production LaunchAgent adapter supplies the real action.
+    }
 }
 
 enum MaintenanceLifecycleError: Error, Equatable, LocalizedError, Sendable {
@@ -43,6 +51,7 @@ protocol MaintenanceServiceController {
     func verifyOwnership(ownerID: String) throws -> Bool
     func stopRemote() throws
     func stopLocalServer() throws
+    func unloadManagedService() throws
     func restore() throws
 }
 
@@ -69,6 +78,9 @@ struct ExternalMaintenanceLifecycleAdapter: MaintenanceLifecycleAdapter {
         do {
             try controller.stopLocalServer()
         } catch {
+            // Remote ingress may already be stopped. Best-effort recovery
+            // prevents a partial quiesce from stranding desired services.
+            try? controller.restore()
             throw MaintenanceLifecycleError.localQuiesceFailed
         }
         return MaintenanceQuiesceReceipt(ownerID: ownerID, remoteStopped: true, localServerStopped: true)
@@ -80,6 +92,10 @@ struct ExternalMaintenanceLifecycleAdapter: MaintenanceLifecycleAdapter {
         } catch {
             throw MaintenanceLifecycleError.restoreFailed
         }
+    }
+
+    func removeManagedLaunchAgent() throws {
+        try controller.unloadManagedService()
     }
 }
 
@@ -114,28 +130,67 @@ struct LaunchAgentMaintenanceController: MaintenanceServiceController {
     let runner: MaintenanceCommandRunner
     let launchctlURL: URL
     let launchAgentLabel: String
+    let launchAgentURL: URL
     let remoteStop: () throws -> Void
     let localStop: () throws -> Void
+    let unloadService: () throws -> Void
     let restoreServices: () throws -> Void
 
     init(
         runner: MaintenanceCommandRunner = SystemMaintenanceCommandRunner(),
         launchctlURL: URL = URL(fileURLWithPath: "/bin/launchctl"),
         launchAgentLabel: String = "gui/\(getuid())/com.jay.mac-orchestrator",
-        remoteStop: @escaping () throws -> Void = { throw MaintenanceLifecycleError.actionNotConfigured },
-        localStop: @escaping () throws -> Void = { throw MaintenanceLifecycleError.actionNotConfigured },
-        restoreServices: @escaping () throws -> Void = { throw MaintenanceLifecycleError.actionNotConfigured }
+        launchAgentURL: URL? = nil,
+        remoteStop: (() throws -> Void)? = nil,
+        localStop: (() throws -> Void)? = nil,
+        restoreServices: (() throws -> Void)? = nil
     ) {
         self.runner = runner
         self.launchctlURL = launchctlURL
         self.launchAgentLabel = launchAgentLabel
-        self.remoteStop = remoteStop
-        self.localStop = localStop
-        self.restoreServices = restoreServices
+        let resolvedLaunchAgentURL = (launchAgentURL ?? FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/LaunchAgents", isDirectory: true)
+            .appendingPathComponent("com.jay.mac-orchestrator.plist", isDirectory: false)).standardizedFileURL
+        self.launchAgentURL = resolvedLaunchAgentURL
+
+        let stopLoadedService: () throws -> Void = {
+            let result = try runner.run(executable: launchctlURL, arguments: ["bootout", launchAgentLabel])
+            guard result.status == 0 else {
+                let printResult = try runner.run(executable: launchctlURL, arguments: ["print", launchAgentLabel])
+                guard printResult.status != 0 else {
+                    throw MaintenanceLifecycleError.remoteQuiesceFailed
+                }
+                return
+            }
+        }
+        let verifyStopped: () throws -> Void = {
+            let result = try runner.run(executable: launchctlURL, arguments: ["print", launchAgentLabel])
+            guard result.status != 0 else { throw MaintenanceLifecycleError.localQuiesceFailed }
+        }
+        let restoreLoadedService: () throws -> Void = {
+            guard LaunchAgentMaintenanceController.isSafeLaunchAgentPath(resolvedLaunchAgentURL),
+                  FileManager.default.fileExists(atPath: resolvedLaunchAgentURL.path) else {
+                throw MaintenanceLifecycleError.restoreFailed
+            }
+            let domain = launchAgentLabel.split(separator: "/").dropLast().joined(separator: "/")
+            let result = try runner.run(
+                executable: launchctlURL,
+                arguments: ["bootstrap", domain, resolvedLaunchAgentURL.path]
+            )
+            guard result.status == 0 else {
+                let printResult = try runner.run(executable: launchctlURL, arguments: ["print", launchAgentLabel])
+                guard printResult.status == 0 else { throw MaintenanceLifecycleError.restoreFailed }
+                return
+            }
+        }
+        self.remoteStop = remoteStop ?? stopLoadedService
+        self.localStop = localStop ?? verifyStopped
+        self.unloadService = stopLoadedService
+        self.restoreServices = restoreServices ?? restoreLoadedService
     }
 
     func verifyOwnership(ownerID: String) throws -> Bool {
-        guard ownerID == String(getuid()) else { return false }
+        guard ownerID == String(getuid()), Self.isSafeLaunchAgentPath(launchAgentURL) else { return false }
         let result = try runner.run(executable: launchctlURL, arguments: ["print", launchAgentLabel])
         return result.status == 0 && result.output.contains("com.jay.mac-orchestrator")
     }
@@ -144,7 +199,25 @@ struct LaunchAgentMaintenanceController: MaintenanceServiceController {
 
     func stopLocalServer() throws { try localStop() }
 
+    func unloadManagedService() throws { try unloadService() }
+
     func restore() throws { try restoreServices() }
+
+    private static func isSafeLaunchAgentPath(_ url: URL) -> Bool {
+        let fileManager = FileManager.default
+        var fileInfo = stat()
+        guard lstat(url.path, &fileInfo) == 0,
+              UInt32(fileInfo.st_mode) & UInt32(S_IFMT) == UInt32(S_IFREG),
+              fileInfo.st_uid == getuid(),
+              UInt32(fileInfo.st_mode) & 0o777 == 0o600 else { return false }
+        let parent = url.deletingLastPathComponent()
+        var parentInfo = stat()
+        guard lstat(parent.path, &parentInfo) == 0,
+              UInt32(parentInfo.st_mode) & UInt32(S_IFMT) == UInt32(S_IFDIR),
+              parentInfo.st_uid == getuid(),
+              UInt32(parentInfo.st_mode) & 0o777 == 0o700 else { return false }
+        return (try? fileManager.destinationOfSymbolicLink(atPath: url.path)) == nil
+    }
 }
 
 struct CandidateHelperMaintenanceHandoff: Codable, Equatable, Sendable {
@@ -188,22 +261,28 @@ struct LocalCandidateHelperMaintenanceAdapter: CandidateHelperMaintenanceAdapter
         ownerID: String = String(getuid()),
         digest: @escaping (URL) throws -> String = { url in try MaintenanceDigest.sha256(file: url) },
         exists: @escaping (URL) -> Bool = { FileManager.default.fileExists(atPath: $0.path) },
-        isSafeCandidate: @escaping (URL) -> Bool = { url in
-            let fileManager = FileManager.default
-            guard (try? fileManager.destinationOfSymbolicLink(atPath: url.path)) == nil,
-                  let attributes = try? fileManager.attributesOfItem(atPath: url.path),
-                  let type = attributes[.type] as? FileAttributeType,
-                  type == .typeRegular,
-                  let owner = attributes[.ownerAccountID] as? NSNumber else {
-                return false
-            }
-            return owner.uint32Value == getuid()
-        }
+        isSafeCandidate: @escaping (URL) -> Bool = { LocalCandidateHelperMaintenanceAdapter.defaultIsSafeCandidate($0) }
     ) {
         self.ownerID = ownerID
         self.digest = digest
         self.exists = exists
         self.isSafeCandidate = isSafeCandidate
+    }
+
+    private static func defaultIsSafeCandidate(_ url: URL) -> Bool {
+        var current = url.standardizedFileURL
+        while current.path != "/" {
+            var metadata = stat()
+            guard lstat(current.path, &metadata) == 0 else { return false }
+            guard UInt32(metadata.st_mode) & UInt32(S_IFMT) != UInt32(S_IFLNK),
+                  metadata.st_uid == getuid() else { return false }
+            current.deleteLastPathComponent()
+        }
+        var metadata = stat()
+        guard lstat(url.path, &metadata) == 0,
+              UInt32(metadata.st_mode) & UInt32(S_IFMT) == UInt32(S_IFREG),
+              metadata.st_uid == getuid() else { return false }
+        return true
     }
 
     func prepareHandoff(candidateURL: URL, candidateVersion: String, expectedSHA256: String) throws -> CandidateHelperMaintenanceHandoff {

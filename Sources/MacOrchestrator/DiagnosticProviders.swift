@@ -515,6 +515,8 @@ protocol PortFactsProviding {
 }
 
 struct LifecycleFacts: Codable, Equatable, Sendable {
+    let serverDesired: Bool
+    let remoteDesired: Bool
     let launchAgentPresent: Bool
     let launchAgentValid: Bool
     let serviceRunning: Bool
@@ -527,6 +529,8 @@ struct LifecycleFacts: Codable, Equatable, Sendable {
     let pidReuseDetected: Bool
 
     init(
+        serverDesired: Bool = true,
+        remoteDesired: Bool = true,
         launchAgentPresent: Bool = false,
         launchAgentValid: Bool = false,
         serviceRunning: Bool = false,
@@ -538,6 +542,8 @@ struct LifecycleFacts: Codable, Equatable, Sendable {
         duplicateHelperInstances: Bool = false,
         pidReuseDetected: Bool = false
     ) {
+        self.serverDesired = serverDesired
+        self.remoteDesired = remoteDesired
         self.launchAgentPresent = launchAgentPresent
         self.launchAgentValid = launchAgentValid
         self.serviceRunning = serviceRunning

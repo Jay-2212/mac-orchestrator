@@ -59,10 +59,12 @@ re-signs it. Config and Keychain state remain outside runtime promotion.
 
 The native maintenance layer persists `InstallationReceiptV1` at the install
 root and records update transactions through durable states from discovery to
-postflight. Candidate helper handoff is digest-checked and re-verified before
-maintenance quiescing. Candidate-owned migrations run on a copy and are
-validated before active configuration mutation; the current schema remains 1
-until a real candidate requires a compatible migration.
+postflight. The staged helper archive is digest-checked and re-verified before
+maintenance quiescing. Phase 3 deliberately does not execute an extracted
+candidate helper: same-schema updates use the current authenticated helper,
+while schema-changing or candidate-owned migration fails closed with
+`migrationUnavailable` until a bounded candidate-helper handoff exists. The
+current configuration schema remains 1.
 
 Pre-commit failures restore the transaction backup. A post-commit TCC or human
 onboarding failure is reported as postflight and does not roll back structurally

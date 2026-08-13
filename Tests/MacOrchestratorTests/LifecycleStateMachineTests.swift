@@ -335,6 +335,38 @@ final class LifecycleStateMachineTests: XCTestCase {
         XCTAssertFalse(effects.contains(.start(.remoteConnector)))
     }
 
+    func testEnablingDuringStoppingReconcilesAfterStopCompletes() {
+        var effects = [LifecycleEffect]()
+        let (machine, _) = makeMachine(onEffect: { effects.append($0) })
+
+        machine.setDesiredState(.enabled, for: .mcpServer)
+        effects.removeAll()
+        machine.stop(component: .mcpServer)
+        XCTAssertEqual(machine.snapshot.mcpServer.lifecycle, .stopping)
+
+        // The desired state remains enabled while the owned process drains;
+        // the completion callback is the safe point to start a replacement.
+        machine.setDesiredState(.enabled, for: .mcpServer)
+        XCTAssertFalse(effects.contains(.start(.mcpServer)))
+        machine.markStopped(for: .mcpServer)
+
+        XCTAssertEqual(machine.snapshot.mcpServer.lifecycle, .starting)
+        XCTAssertTrue(effects.contains(.start(.mcpServer)))
+    }
+
+    func testSynchronizingDisabledStateClearsFailureEvidence() {
+        let (machine, _) = makeMachine()
+        machine.setDesiredState(.enabled, for: .mcpServer)
+        machine.recordFailure(for: .mcpServer, reason: "temporary failure")
+
+        machine.synchronizeDesiredStates(mcpServer: false, remoteConnector: false)
+
+        XCTAssertEqual(machine.snapshot.mcpServer.desired, .disabled)
+        XCTAssertEqual(machine.snapshot.mcpServer.recentFailureCount, 0)
+        XCTAssertNil(machine.snapshot.mcpServer.reason)
+        XCTAssertEqual(machine.snapshot.mcpServer.circuit, .closed)
+    }
+
     func testSchedulerAdvancesLogicalNowBeforeNestedWorkRuns() {
         let start = Date(timeIntervalSince1970: 1_000_000)
         let scheduler = TestLifecycleScheduler(start: start)
@@ -354,6 +386,15 @@ final class LifecycleStateMachineTests: XCTestCase {
             [start.addingTimeInterval(10), start.addingTimeInterval(15)]
         )
         XCTAssertEqual(scheduler.now, start.addingTimeInterval(20))
+    }
+
+    func testSchedulerRejectsBackwardsClockMovement() {
+        let start = Date(timeIntervalSince1970: 1_000_000)
+        let scheduler = TestLifecycleScheduler(start: start)
+        scheduler.advance(to: start.addingTimeInterval(10))
+        scheduler.advance(to: start.addingTimeInterval(5))
+
+        XCTAssertEqual(scheduler.now, start.addingTimeInterval(10))
     }
 
     func testRemoteFailureWhileMCPIsRetryingWaitsWithoutSpendingRemoteBudget() {

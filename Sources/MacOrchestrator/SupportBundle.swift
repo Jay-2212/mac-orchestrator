@@ -171,6 +171,39 @@ protocol SupportBundleSourceCollecting: Sendable {
 
 protocol SupportBundleSource: SupportBundleSourceDescribing, SupportBundleSourceCollecting {}
 
+/// A bounded, in-memory-at-preview source for product-owned summaries. It
+/// keeps support collection behind the approved plan while allowing the
+/// terminal and menu surfaces to add Doctor, receipt, lifecycle, update, and
+/// redacted-log facts without exposing arbitrary filesystem roots.
+struct Phase3SupportBundleSource: SupportBundleSource, @unchecked Sendable {
+    struct Entry: Sendable {
+        let plan: SupportBundleEntryPlan
+        let data: @Sendable () throws -> Data
+    }
+
+    let sourceID: String
+    private let entries: [Entry]
+
+    init(sourceID: String = "phase3", entries: [Entry]) {
+        self.sourceID = sourceID
+        self.entries = entries
+    }
+
+    func describeEntries() -> [SupportBundleEntryPlan] {
+        entries.map(\.plan)
+    }
+
+    func collect(logicalID: String) throws -> SupportBundleCollectedEntry {
+        guard let entry = entries.first(where: { $0.plan.logicalID == logicalID }) else {
+            throw SupportBundleError.sourceUnavailable(logicalID)
+        }
+        return SupportBundleCollectedEntry(
+            archivePath: entry.plan.archivePath,
+            data: try entry.data()
+        )
+    }
+}
+
 struct SupportBundleCollectedEntry: Sendable {
     let archivePath: String
     let data: Data

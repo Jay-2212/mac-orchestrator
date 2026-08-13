@@ -98,6 +98,9 @@ final class MaintenanceTransactionLedger {
     func load(_ id: UUID) throws -> MaintenanceTransactionRecord? {
         let url = url(for: id)
         guard fileManager.fileExists(atPath: url.path) else { return nil }
+        guard safeWritePath(url), !isSymlink(url), isOwned(url) else {
+            throw MaintenanceTransactionError.persistenceFailed
+        }
         do {
             return try decoder.decode(MaintenanceTransactionRecord.self, from: Data(contentsOf: url))
         } catch {
@@ -150,15 +153,24 @@ final class MaintenanceTransactionLedger {
 
     private func persist(_ record: MaintenanceTransactionRecord) throws {
         do {
+            guard safeWritePath(directoryURL) else { throw MaintenanceTransactionError.persistenceFailed }
             try fileManager.createDirectory(
                 at: directoryURL,
                 withIntermediateDirectories: true,
                 attributes: [.posixPermissions: 0o700]
             )
             try fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directoryURL.path)
+            guard safeWritePath(directoryURL), isOwned(directoryURL) else {
+                throw MaintenanceTransactionError.persistenceFailed
+            }
             let data = try encoder.encode(record)
             let destination = url(for: record.id)
+            guard !isSymlink(destination),
+                  !fileManager.fileExists(atPath: destination.path) || isOwned(destination) else {
+                throw MaintenanceTransactionError.persistenceFailed
+            }
             let temporary = directoryURL.appendingPathComponent(".transaction-\(UUID().uuidString).tmp")
+            guard !isSymlink(temporary) else { throw MaintenanceTransactionError.persistenceFailed }
             try data.write(to: temporary, options: [.atomic])
             try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: temporary.path)
             if fileManager.fileExists(atPath: destination.path) {
@@ -170,6 +182,28 @@ final class MaintenanceTransactionLedger {
         } catch {
             throw MaintenanceTransactionError.persistenceFailed
         }
+    }
+
+    private func safeWritePath(_ url: URL) -> Bool {
+        var current = url.standardizedFileURL
+        while current.path != "/" {
+            if isSymlink(current) { return false }
+            if fileManager.fileExists(atPath: current.path) {
+                return isOwned(current)
+            }
+            current.deleteLastPathComponent()
+        }
+        return false
+    }
+
+    private func isSymlink(_ url: URL) -> Bool {
+        (try? fileManager.destinationOfSymbolicLink(atPath: url.path)) != nil
+    }
+
+    private func isOwned(_ url: URL) -> Bool {
+        guard let attributes = try? fileManager.attributesOfItem(atPath: url.path),
+              let owner = attributes[.ownerAccountID] as? NSNumber else { return false }
+        return owner.uint32Value == getuid()
     }
 }
 

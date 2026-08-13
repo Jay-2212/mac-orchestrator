@@ -178,7 +178,9 @@ final class InstallationReceiptStore {
 
     func load() throws -> InstallationReceiptV1? {
         guard fileManager.fileExists(atPath: receiptURL.path) else { return nil }
-        guard !isSymlink(receiptURL) else { throw InstallationReceiptError.unavailable }
+        guard !containsSymlinkInPath(receiptURL), isOwned(receiptURL) else {
+            throw InstallationReceiptError.unavailable
+        }
         do {
             return try InstallationReceiptV1.decode(Data(contentsOf: receiptURL))
         } catch let error as InstallationReceiptError {
@@ -254,6 +256,7 @@ final class InstallationReceiptStore {
             throw InstallationReceiptError.unavailable
         }
         let temporary = directoryURL.appendingPathComponent(".receipt.\(UUID().uuidString).tmp")
+        guard !isSymlink(temporary) else { throw InstallationReceiptError.unavailable }
         try data.write(to: temporary, options: [.atomic])
         try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: temporary.path)
         if fileManager.fileExists(atPath: destination.path) {

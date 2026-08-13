@@ -326,6 +326,8 @@ final class LifecycleStateMachine {
                 record.lifecycle = .stopped
                 record.liveness = .stopped
                 record.readiness = .notReady
+                record.failureDates.removeAll()
+                record.reason = nil
                 record.nextRetryAt = nil
                 record.circuit = .closed
             }
@@ -490,6 +492,9 @@ final class LifecycleStateMachine {
         publish()
         if component == .mcpServer {
             blockRemoteForPrerequisite(cancelRemoteRetry: false)
+        }
+        if record.desired == .enabled, !isQuiescing {
+            reconcileStart(for: component)
         }
     }
 

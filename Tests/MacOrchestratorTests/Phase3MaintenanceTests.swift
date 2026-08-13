@@ -259,6 +259,68 @@ private struct TestUpdateLifecycle: MaintenanceLifecycleAdapter {
     func restore() throws {}
 }
 
+final class Phase3MaintenanceLifecycleIntegrationTests: XCTestCase {
+    func testQuiesceStopsRemoteIngressBeforeLocalServerAndRestoresBoth() throws {
+        let controller = RecordingMaintenanceController()
+        let adapter = ExternalMaintenanceLifecycleAdapter(ownerID: "test-owner", controller: controller)
+
+        _ = try adapter.quiesce()
+        try adapter.restore()
+
+        XCTAssertEqual(controller.events, ["verify", "remote", "local", "restore"])
+    }
+
+    func testPartialQuiesceAttemptsRecoveryWithoutClaimingSuccess() {
+        let controller = RecordingMaintenanceController(failLocal: true)
+        let adapter = ExternalMaintenanceLifecycleAdapter(ownerID: "test-owner", controller: controller)
+
+        XCTAssertThrowsError(try adapter.quiesce()) { error in
+            XCTAssertEqual(error as? MaintenanceLifecycleError, .localQuiesceFailed)
+        }
+        XCTAssertEqual(controller.events, ["verify", "remote", "local", "restore"])
+    }
+
+    func testLaunchAgentRemovalIsExplicitAndDoesNotRestoreByItself() throws {
+        let controller = RecordingMaintenanceController()
+        let adapter = ExternalMaintenanceLifecycleAdapter(ownerID: "test-owner", controller: controller)
+
+        try adapter.removeManagedLaunchAgent()
+
+        XCTAssertEqual(controller.events, ["unload"])
+    }
+}
+
+private final class RecordingMaintenanceController: MaintenanceServiceController {
+    private(set) var events: [String] = []
+    let failLocal: Bool
+
+    init(failLocal: Bool = false) {
+        self.failLocal = failLocal
+    }
+
+    func verifyOwnership(ownerID: String) throws -> Bool {
+        events.append("verify")
+        return ownerID == "test-owner"
+    }
+
+    func stopRemote() throws {
+        events.append("remote")
+    }
+
+    func stopLocalServer() throws {
+        events.append("local")
+        if failLocal { throw MaintenanceLifecycleError.localQuiesceFailed }
+    }
+
+    func unloadManagedService() throws {
+        events.append("unload")
+    }
+
+    func restore() throws {
+        events.append("restore")
+    }
+}
+
 final class Phase3MaintenanceStorageTests: XCTestCase {
     func testInstallationReceiptRoundTripsWithoutSecretsOrPersonalPaths() throws {
         let receipt = try InstallationReceiptV1(
@@ -391,13 +453,13 @@ final class Phase3KeychainAndUninstallTests: XCTestCase {
     }
 
     func testUninstallPlanPreservesConfigurationAndKeychainByDefault() throws {
-        let support = try temporaryDirectory()
-        let logs = support.appendingPathComponent("logs", isDirectory: true)
+        let layout = try uninstallLayout()
         let plan = try UninstallEngine(
-            supportDirectory: support,
-            logsDirectory: logs,
+            supportDirectory: layout.support,
+            logsDirectory: layout.logs,
             keychain: KeychainStore(client: DeletingKeychainClient()),
-            lifecycle: FakeMaintenanceLifecycle()
+            lifecycle: FakeMaintenanceLifecycle(),
+            homeDirectory: layout.home
         ).plan(options: RemovalOptions())
 
         XCTAssertTrue(plan.entries.contains { $0.kind == .configuration && $0.intent == .retain })
@@ -417,7 +479,8 @@ final class Phase3KeychainAndUninstallTests: XCTestCase {
     }
 
     func testUninstallRejectsSymlinkedRemovalRootAndStillReturnsReceipt() throws {
-        let support = try temporaryDirectory()
+        let layout = try uninstallLayout()
+        let support = layout.support
         let target = support.appendingPathComponent("runtime", isDirectory: true)
         let outside = support.deletingLastPathComponent().appendingPathComponent("outside-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
@@ -426,15 +489,76 @@ final class Phase3KeychainAndUninstallTests: XCTestCase {
 
         let engine = try UninstallEngine(
             supportDirectory: support,
-            logsDirectory: support.appendingPathComponent("logs", isDirectory: true),
+            logsDirectory: layout.logs,
             keychain: KeychainStore(client: DeletingKeychainClient()),
-            lifecycle: FakeMaintenanceLifecycle()
+            lifecycle: FakeMaintenanceLifecycle(),
+            homeDirectory: layout.home
         )
         let plan = try engine.plan(options: RemovalOptions(removeManagedRuntime: true))
         let receipt = engine.apply(plan)
 
         XCTAssertTrue(receipt.outcomes.contains { $0.status == .failedManualActionRequired })
         XCTAssertTrue(FileManager.default.fileExists(atPath: outside.path))
+    }
+
+    func testPartialNonTerminalUninstallRestoresServices() throws {
+        let layout = try uninstallLayout()
+        let caches = layout.support.appendingPathComponent("caches", isDirectory: true)
+        try FileManager.default.createDirectory(at: caches, withIntermediateDirectories: true)
+        let lifecycle = FakeMaintenanceLifecycle()
+        let engine = try UninstallEngine(
+            supportDirectory: layout.support,
+            logsDirectory: layout.logs,
+            keychain: KeychainStore(client: DeletingKeychainClient()),
+            lifecycle: lifecycle,
+            homeDirectory: layout.home
+        )
+
+        let receipt = engine.apply(try engine.plan(options: RemovalOptions(removeCaches: true)))
+
+        XCTAssertEqual(lifecycle.quiesceCalls, 1)
+        XCTAssertEqual(lifecycle.restoreCalls, 1)
+        XCTAssertTrue(receipt.outcomes.contains { $0.kind == .caches && $0.status == .removed })
+    }
+
+    func testDestructiveUninstallRemainsQuiescedAndDoesNotRestoreServices() throws {
+        let layout = try uninstallLayout()
+        let app = layout.support.appendingPathComponent("app", isDirectory: true)
+        try FileManager.default.createDirectory(at: app, withIntermediateDirectories: true)
+        try Data("managed".utf8).write(to: app.appendingPathComponent("marker"))
+        let lifecycle = FakeMaintenanceLifecycle()
+        let engine = try UninstallEngine(
+            supportDirectory: layout.support,
+            logsDirectory: layout.logs,
+            keychain: KeychainStore(client: DeletingKeychainClient()),
+            lifecycle: lifecycle,
+            homeDirectory: layout.home
+        )
+
+        let plan = try engine.plan(options: RemovalOptions(removeApplication: true))
+        XCTAssertTrue(plan.servicesRemainQuiesced)
+        _ = engine.apply(plan)
+
+        XCTAssertEqual(lifecycle.quiesceCalls, 1)
+        XCTAssertEqual(lifecycle.restoreCalls, 0)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: app.path))
+    }
+
+    private struct UninstallLayout {
+        let root: URL
+        let support: URL
+        let home: URL
+        let logs: URL
+    }
+
+    private func uninstallLayout() throws -> UninstallLayout {
+        let root = try temporaryDirectory()
+        let support = root.appendingPathComponent("support", isDirectory: true)
+        let home = root.appendingPathComponent("home", isDirectory: true)
+        let logs = home.appendingPathComponent("Library/Logs/Mac Orchestrator", isDirectory: true)
+        try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: logs, withIntermediateDirectories: true)
+        return UninstallLayout(root: root, support: support, home: home, logs: logs)
     }
 
     private func temporaryDirectory() throws -> URL {
@@ -470,10 +594,14 @@ final class Phase3KeychainAndUninstallTests: XCTestCase {
     }
 
     private final class FakeMaintenanceLifecycle: MaintenanceLifecycleAdapter {
+        private(set) var quiesceCalls = 0
+        private(set) var restoreCalls = 0
+
         func quiesce() throws -> MaintenanceQuiesceReceipt {
+            quiesceCalls += 1
             MaintenanceQuiesceReceipt(ownerID: "test-owner", remoteStopped: true, localServerStopped: true)
         }
 
-        func restore() throws {}
+        func restore() throws { restoreCalls += 1 }
     }
 }

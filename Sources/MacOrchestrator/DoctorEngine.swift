@@ -291,7 +291,11 @@ struct DoctorEngine {
             DiagnosticChecks.mcpReadiness(localMCPFacts, desired: serverDesired),
             DiagnosticChecks.mcpInventory(localMCPFacts, desired: serverDesired),
             DiagnosticChecks.lifecycleLaunchAgent(lifecycleFacts, desired: hasValidatedConfiguration && (serverDesired || remoteDesired)),
-            DiagnosticChecks.lifecycleProcessOwnership(lifecycleFacts, desired: hasValidatedConfiguration && (serverDesired || remoteDesired)),
+            DiagnosticChecks.lifecycleProcessOwnership(
+                lifecycleFacts,
+                desiredServer: hasValidatedConfiguration && serverDesired,
+                desiredRemote: hasValidatedConfiguration && remoteDesired
+            ),
             DiagnosticChecks.remoteNgrok(
                 remoteFacts,
                 auth: remoteDesired ? keychainFacts?.presence(for: .ngrokAuthtoken) : nil,

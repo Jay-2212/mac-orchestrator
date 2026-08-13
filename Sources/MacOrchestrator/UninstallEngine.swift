@@ -1,7 +1,7 @@
 import Darwin
 import Foundation
 
-enum RemovalKind: String, Codable, CaseIterable, Equatable, Sendable {
+enum RemovalKind: String, Codable, CaseIterable, Equatable, Hashable, Sendable {
     case application
     case ownedProcesses
     case managedRuntime
@@ -74,6 +74,7 @@ struct RemovalPlan: Codable, Equatable, Sendable {
     let entries: [RemovalPlanEntry]
     let keychainItemsToDelete: [KeychainItem]
     let providerResourcesUntouched: Bool
+    let servicesRemainQuiesced: Bool
 }
 
 struct UninstallOutcome: Codable, Equatable, Sendable {
@@ -128,21 +129,26 @@ struct NoOwnedProcessRemovalAdapter: OwnedProcessRemovalAdapter {
 struct UninstallPathValidator {
     let fileManager: FileManager
     let ownerID: UInt32
+    let homeDirectory: URL
 
-    init(fileManager: FileManager = .default, ownerID: UInt32 = getuid()) {
+    init(
+        fileManager: FileManager = .default,
+        ownerID: UInt32 = getuid(),
+        homeDirectory: URL? = nil
+    ) {
         self.fileManager = fileManager
         self.ownerID = ownerID
+        self.homeDirectory = (homeDirectory ?? fileManager.homeDirectoryForCurrentUser).standardizedFileURL
     }
 
     func validateRoot(_ root: URL) throws {
         guard root.isFileURL,
               root.path.hasPrefix("/"),
               root.path != "/",
-              root.standardizedFileURL != fileManager.homeDirectoryForCurrentUser else {
+              root.standardizedFileURL != homeDirectory else {
             throw UninstallError.invalidRoot
         }
-        let home = fileManager.homeDirectoryForCurrentUser.standardizedFileURL
-        let broadLibrary = home.appendingPathComponent("Library", isDirectory: true).standardizedFileURL
+        let broadLibrary = homeDirectory.appendingPathComponent("Library", isDirectory: true).standardizedFileURL
         let broadApplicationSupport = broadLibrary.appendingPathComponent("Application Support", isDirectory: true).standardizedFileURL
         guard root.standardizedFileURL != broadLibrary,
               root.standardizedFileURL != broadApplicationSupport,
@@ -153,6 +159,31 @@ struct UninstallPathValidator {
         }
         guard !isSymlink(root) else { throw UninstallError.rootIsSymlink }
         guard isOwned(root) else { throw UninstallError.rootOwnershipNotProven }
+    }
+
+    /// Validates a known product-owned path whose parent is outside the
+    /// Application Support tree. The path must equal the expected production
+    /// location; callers cannot turn arbitrary configuration into a deletion
+    /// root.
+    func safeKnownPath(_ path: URL, expected: URL, directory: Bool) -> Bool {
+        let normalizedPath = path.standardizedFileURL
+        let normalizedExpected = expected.standardizedFileURL
+        guard normalizedPath == normalizedExpected,
+              normalizedPath.path.hasPrefix(homeDirectory.path + "/"),
+              !isSymlink(homeDirectory),
+              isOwned(homeDirectory) else { return false }
+
+        var current = homeDirectory
+        let relative = String(normalizedExpected.path.dropFirst(homeDirectory.path.count))
+            .split(separator: "/")
+        for component in relative {
+            current.appendPathComponent(String(component), isDirectory: false)
+            guard !isSymlink(current) else { return false }
+            if fileManager.fileExists(atPath: current.path), !isOwned(current) { return false }
+        }
+        guard fileManager.fileExists(atPath: normalizedExpected.path) else { return true }
+        return isExpectedTarget(normalizedExpected, directory: directory)
+            && isOwnedProjectTree(normalizedExpected)
     }
 
     func safeRemovalPath(_ path: URL, inside root: URL) -> Bool {
@@ -235,6 +266,7 @@ struct UninstallPathValidator {
 final class UninstallEngine {
     let supportDirectory: URL
     let logsDirectory: URL
+    let homeDirectory: URL
     private let keychain: KeychainStore
     private let lifecycle: MaintenanceLifecycleAdapter
     private let fileManager: FileManager
@@ -250,19 +282,21 @@ final class UninstallEngine {
         keychain: KeychainStore,
         lifecycle: MaintenanceLifecycleAdapter,
         fileManager: FileManager = .default,
+        homeDirectory: URL? = nil,
         faultInjector: MaintenanceFaultInjector = NoMaintenanceFaultInjector(),
         processRemoval: OwnedProcessRemovalAdapter = NoOwnedProcessRemovalAdapter(),
         launchAgentURL: URL? = nil
     ) throws {
         self.supportDirectory = supportDirectory.standardizedFileURL
         self.logsDirectory = logsDirectory.standardizedFileURL
+        self.homeDirectory = (homeDirectory ?? fileManager.homeDirectoryForCurrentUser).standardizedFileURL
         self.keychain = keychain
         self.lifecycle = lifecycle
         self.fileManager = fileManager
-        self.pathValidator = UninstallPathValidator(fileManager: fileManager)
+        self.pathValidator = UninstallPathValidator(fileManager: fileManager, homeDirectory: self.homeDirectory)
         self.faultInjector = faultInjector
         self.processRemoval = processRemoval
-        self.launchAgentURL = (launchAgentURL ?? fileManager.homeDirectoryForCurrentUser
+        self.launchAgentURL = (launchAgentURL ?? self.homeDirectory
             .appendingPathComponent("Library", isDirectory: true)
             .appendingPathComponent("LaunchAgents", isDirectory: true)
             .appendingPathComponent("com.jay.mac-orchestrator.plist", isDirectory: false)).standardizedFileURL
@@ -270,16 +304,20 @@ final class UninstallEngine {
             .appendingPathComponent("install", isDirectory: true)
             .appendingPathComponent("uninstall-receipt.json", isDirectory: false)
         try pathValidator.validateRoot(self.supportDirectory)
-        guard self.launchAgentURL.lastPathComponent == "com.jay.mac-orchestrator.plist" else {
+        let expectedLaunchAgentURL = self.homeDirectory
+            .appendingPathComponent("Library/LaunchAgents", isDirectory: true)
+            .appendingPathComponent("com.jay.mac-orchestrator.plist", isDirectory: false)
+            .standardizedFileURL
+        let expectedLogsDirectory = self.homeDirectory
+            .appendingPathComponent("Library/Logs/Mac Orchestrator", isDirectory: true)
+            .standardizedFileURL
+        guard self.launchAgentURL == expectedLaunchAgentURL else {
             throw UninstallError.invalidRoot
         }
-        guard pathValidator.safeRemovalPath(self.logsDirectory, inside: self.supportDirectory) else {
+        guard pathValidator.safeKnownPath(self.logsDirectory, expected: expectedLogsDirectory, directory: true) else {
             throw UninstallError.invalidRoot
         }
-        guard pathValidator.safeRemovalPath(
-            self.launchAgentURL,
-            inside: self.launchAgentURL.deletingLastPathComponent()
-        ) else {
+        guard pathValidator.safeKnownPath(self.launchAgentURL, expected: expectedLaunchAgentURL, directory: false) else {
             throw UninstallError.invalidRoot
         }
     }
@@ -292,11 +330,11 @@ final class UninstallEngine {
         let configurationURL = supportDirectory.appendingPathComponent("config.json", isDirectory: false)
         let entries = [
             makeEntry(kind: .application, url: appURL, relativePath: "app", remove: options.removeApplication),
-            RemovalPlanEntry(
+            makeEntry(
                 kind: .ownedProcesses,
-                relativePath: "owned-processes",
-                intent: options.removeOwnedProcesses ? .remove : .retain,
-                reason: nil
+                url: supportDirectory.appendingPathComponent("owned-processes.json", isDirectory: false),
+                relativePath: "owned-processes.json",
+                remove: options.removeOwnedProcesses
             ),
             makeEntry(kind: .managedRuntime, url: runtimeURL, relativePath: "runtime", remove: options.removeManagedRuntime),
             makeEntry(kind: .managedRemote, url: remoteURL, relativePath: "remote", remove: options.removeManagedRemote),
@@ -321,12 +359,20 @@ final class UninstallEngine {
             .meridianTelegramBotToken,
             .meridianTelegramWebhookSecret,
         ] : []
+        let terminalKinds: Set<RemovalKind> = [
+            .application, .ownedProcesses, .managedRuntime, .managedRemote,
+            .supportArtifacts, .configuration, .launchAgent,
+        ]
+        let servicesRemainQuiesced = entries.contains { entry in
+            entry.intent == .remove && terminalKinds.contains(entry.kind)
+        } || !keychainItems.isEmpty
         return RemovalPlan(
             id: UUID(),
             createdAt: Date(),
             entries: entries,
             keychainItemsToDelete: keychainItems,
-            providerResourcesUntouched: true
+            providerResourcesUntouched: true,
+            servicesRemainQuiesced: servicesRemainQuiesced
         )
     }
 
@@ -392,6 +438,9 @@ final class UninstallEngine {
                         guard safeRemovalPath(for: entry, url: url) else {
                             throw UninstallError.invalidRoot
                         }
+                        if entry.kind == .launchAgent {
+                            try lifecycle.removeManagedLaunchAgent()
+                        }
                         if fileManager.fileExists(atPath: url.path) {
                             try fileManager.removeItem(at: url)
                             try faultInjector.check(.uninstallAfterRemoval)
@@ -424,7 +473,7 @@ final class UninstallEngine {
             }
         }
 
-        if servicesQuiesced {
+        if servicesQuiesced && !plan.servicesRemainQuiesced {
             do { try lifecycle.restore() } catch {
                 outcomes.append(UninstallOutcome(
                     kind: .launchAgent,
@@ -443,8 +492,24 @@ final class UninstallEngine {
             keychainItemsDeleted: deletedKeychainItems.sorted(),
             providerResourcesUntouched: true
         )
-        try? writeReceipt(receipt)
-        return receipt
+        do {
+            try writeReceipt(receipt)
+            return receipt
+        } catch {
+            return UninstallReceipt(
+                schemaVersion: receipt.schemaVersion,
+                planID: receipt.planID,
+                completedAt: receipt.completedAt,
+                outcomes: receipt.outcomes + [UninstallOutcome(
+                    kind: .supportArtifacts,
+                    relativePath: "install/uninstall-receipt.json",
+                    status: .failedManualActionRequired,
+                    detail: "The uninstall completed, but its receipt could not be stored safely."
+                )],
+                keychainItemsDeleted: receipt.keychainItemsDeleted,
+                providerResourcesUntouched: receipt.providerResourcesUntouched
+            )
+        }
     }
 
     private func makeEntry(kind: RemovalKind, url: URL, relativePath: String, remove: Bool) -> RemovalPlanEntry {
@@ -466,7 +531,7 @@ final class UninstallEngine {
     private func url(for entry: RemovalPlanEntry) -> URL {
         switch entry.kind {
         case .application: return supportDirectory.appendingPathComponent("app", isDirectory: true)
-        case .ownedProcesses: return supportDirectory.appendingPathComponent("owned-processes", isDirectory: true)
+        case .ownedProcesses: return supportDirectory.appendingPathComponent("owned-processes.json", isDirectory: false)
         case .managedRuntime: return supportDirectory.appendingPathComponent("runtime", isDirectory: true)
         case .managedRemote: return supportDirectory.appendingPathComponent("remote", isDirectory: true)
         case .caches: return supportDirectory.appendingPathComponent("caches", isDirectory: true)
@@ -484,7 +549,11 @@ final class UninstallEngine {
     private func safeRemovalPath(for kind: RemovalKind, url: URL) -> Bool {
         if kind == .ownedProcesses { return true }
         if kind == .launchAgent {
-            return pathValidator.safeRemovalPath(url, inside: launchAgentURL.deletingLastPathComponent())
+            return pathValidator.safeKnownPath(url, expected: launchAgentURL, directory: false)
+        }
+        if kind == .logsAndSupport {
+            let expected = homeDirectory.appendingPathComponent("Library/Logs/Mac Orchestrator", isDirectory: true)
+            return pathValidator.safeKnownPath(url, expected: expected, directory: true)
         }
         return pathValidator.safeRemovalPath(url, inside: supportDirectory)
     }
@@ -501,13 +570,28 @@ final class UninstallEngine {
     private func relativePath(of url: URL) -> String {
         let root = supportDirectory.path
         let path = url.standardizedFileURL.path
-        return path.hasPrefix(root + "/") ? String(path.dropFirst(root.count + 1)) : url.lastPathComponent
+        if path.hasPrefix(root + "/") {
+            return String(path.dropFirst(root.count + 1))
+        }
+        if path.hasPrefix(homeDirectory.path + "/") {
+            return "~/" + String(path.dropFirst(homeDirectory.path.count + 1))
+        }
+        return url.lastPathComponent
     }
 
     private func writeReceipt(_ receipt: UninstallReceipt) throws {
+        guard pathValidator.safeRemovalPath(uninstallReceiptURL, inside: supportDirectory) else {
+            throw UninstallError.invalidRoot
+        }
         let directory = uninstallReceiptURL.deletingLastPathComponent()
         try fileManager.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        guard pathValidator.safeRemovalPath(uninstallReceiptURL, inside: supportDirectory) else {
+            throw UninstallError.invalidRoot
+        }
         let temporary = directory.appendingPathComponent(".uninstall-receipt.\(UUID().uuidString).tmp")
+        guard !isSymlink(temporary), !isSymlink(uninstallReceiptURL) else {
+            throw UninstallError.invalidRoot
+        }
         try receipt.encoded().write(to: temporary, options: [.atomic])
         try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: temporary.path)
         if fileManager.fileExists(atPath: uninstallReceiptURL.path) {
@@ -516,5 +600,9 @@ final class UninstallEngine {
             try fileManager.moveItem(at: temporary, to: uninstallReceiptURL)
         }
         try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: uninstallReceiptURL.path)
+    }
+
+    private func isSymlink(_ url: URL) -> Bool {
+        (try? fileManager.destinationOfSymbolicLink(atPath: url.path)) != nil
     }
 }

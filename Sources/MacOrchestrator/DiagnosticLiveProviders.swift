@@ -480,6 +480,13 @@ struct ReadOnlyInstalledReleaseFactsProvider: InstalledReleaseFactsProviding {
         let runtimeArchitecture = architecture(from: runtimeFile.stdout)
         let parsedRuntimeVersion = pythonVersion(from: runtimeVersion.stdout + runtimeVersion.stderr)
         let details = signature.stderr + signature.stdout
+        let receipt = loadInstallationReceipt()
+        let receiptAvailable = receipt != nil
+        let receiptIntegrityAvailable = receipt.map {
+            $0.productVersion == releaseVersion
+                && $0.runtimeSchemaVersion > 0
+                && $0.configurationSchemaVersion > 0
+        } ?? false
         let helper = CodeSignFacts(
             bundleIdentifier: info?["CFBundleIdentifier"] as? String,
             version: info?["CFBundleShortVersionString"] as? String ?? info?["CFBundleVersion"] as? String,
@@ -487,8 +494,8 @@ struct ReadOnlyInstalledReleaseFactsProvider: InstalledReleaseFactsProviding {
             isSigned: verify.status == 0,
             isAdHoc: details.localizedCaseInsensitiveContains("adhoc") || details.localizedCaseInsensitiveContains("ad hoc"),
             developerIDTrusted: authoritativeDeveloperIDTrusted,
-            receiptAvailable: false,
-            integrityAvailable: false
+            receiptAvailable: receiptAvailable,
+            integrityAvailable: receiptIntegrityAvailable
         )
         let runtime = RuntimeFacts(
             runtimePresent: runtimePresent,
@@ -524,6 +531,24 @@ struct ReadOnlyInstalledReleaseFactsProvider: InstalledReleaseFactsProviding {
             paths.appURL.appendingPathComponent("Contents", isDirectory: true),
             paths.appURL.appendingPathComponent("Contents/MacOS", isDirectory: true),
         ].allSatisfy(isRegularNonSymlinkDirectory(at:))
+    }
+
+    private func loadInstallationReceipt() -> InstallationReceiptV1? {
+        let store = InstallationReceiptStore(
+            directoryURL: paths.supportDirectory.appendingPathComponent("install", isDirectory: true),
+            fileManager: fileManager
+        )
+        guard !isSymlink(store.receiptURL),
+              let attributes = try? fileManager.attributesOfItem(atPath: store.receiptURL.path),
+              let owner = attributes[.ownerAccountID] as? NSNumber,
+              owner.uint32Value == getuid() else {
+            return nil
+        }
+        return try? store.load()
+    }
+
+    private func isSymlink(_ url: URL) -> Bool {
+        (try? fileManager.destinationOfSymbolicLink(atPath: url.path)) != nil
     }
 
     private func runtimeLayoutIsSafe() -> Bool {
@@ -588,6 +613,8 @@ struct ReadOnlyLifecycleFactsProvider: LifecycleFactsProviding {
     private let paths: DiagnosticPathSet
     private let label: String
     private let ownerID: String
+    private let serverDesired: Bool
+    private let remoteDesired: Bool
     private let commandRunner: any DiagnosticCommandRunning
     private let processRunner: any DiagnosticProcessRunning
     private let fileManager: FileManager
@@ -596,6 +623,8 @@ struct ReadOnlyLifecycleFactsProvider: LifecycleFactsProviding {
         paths: DiagnosticPathSet,
         label: String = "com.jay.mac-orchestrator",
         ownerID: String,
+        serverDesired: Bool = true,
+        remoteDesired: Bool = true,
         commandRunner: any DiagnosticCommandRunning = SystemDiagnosticCommandRunner(),
         processRunner: any DiagnosticProcessRunning = SystemDiagnosticProcessRunner(),
         fileManager: FileManager = .default
@@ -603,6 +632,8 @@ struct ReadOnlyLifecycleFactsProvider: LifecycleFactsProviding {
         self.paths = paths
         self.label = label
         self.ownerID = ownerID
+        self.serverDesired = serverDesired
+        self.remoteDesired = remoteDesired
         self.commandRunner = commandRunner
         self.processRunner = processRunner
         self.fileManager = fileManager
@@ -611,6 +642,8 @@ struct ReadOnlyLifecycleFactsProvider: LifecycleFactsProviding {
     init(
         ownerID: String,
         label: String = "com.jay.mac-orchestrator",
+        serverDesired: Bool = true,
+        remoteDesired: Bool = true,
         commandRunner: any DiagnosticCommandRunning = SystemDiagnosticCommandRunner(),
         processRunner: any DiagnosticProcessRunning = SystemDiagnosticProcessRunner(),
         fileManager: FileManager = .default
@@ -619,6 +652,8 @@ struct ReadOnlyLifecycleFactsProvider: LifecycleFactsProviding {
             paths: .defaultPaths(fileManager: fileManager),
             label: label,
             ownerID: ownerID,
+            serverDesired: serverDesired,
+            remoteDesired: remoteDesired,
             commandRunner: commandRunner,
             processRunner: processRunner,
             fileManager: fileManager
@@ -659,22 +694,27 @@ struct ReadOnlyLifecycleFactsProvider: LifecycleFactsProviding {
         let serverPID = state?.serverPID
         let tunnelPID = state?.tunnelPID
         let stateOwnerMatches = state?.ownerID == ownerID
-        let stateHasAnyPID = serverPID != nil || tunnelPID != nil
         let duplicateAssignment = serverPID != nil && serverPID == tunnelPID
         let serverAssignmentValid = serverPID.map { pid in
             serverProcesses.count == 1 && serverProcesses[0].pid == pid
-        } ?? true
+        } ?? !serverDesired
         let tunnelAssignmentValid = tunnelPID.map { pid in
             tunnelProcesses.count == 1 && tunnelProcesses[0].pid == pid
-        } ?? true
+        } ?? !remoteDesired
+        let missingExpectedAssignment = (serverDesired && serverPID == nil)
+            || (remoteDesired && tunnelPID == nil)
+        let unexpectedServerState = !serverDesired && (serverPID != nil || !serverProcesses.isEmpty)
+        let unexpectedTunnelState = !remoteDesired && (tunnelPID != nil || !tunnelProcesses.isEmpty)
         let pidReuse = stateResult.malformed
-            || (state != nil && !stateHasAnyPID)
             || (state != nil && !stateOwnerMatches)
+            || missingExpectedAssignment
+            || unexpectedServerState
+            || unexpectedTunnelState
             || !serverAssignmentValid
             || !tunnelAssignmentValid
             || (state == nil && (!serverProcesses.isEmpty || !tunnelProcesses.isEmpty))
-            || (!serverProcesses.isEmpty && state?.serverPID == nil)
-            || (!tunnelProcesses.isEmpty && state?.tunnelPID == nil)
+            || (serverDesired && !serverProcesses.isEmpty && state?.serverPID == nil)
+            || (remoteDesired && !tunnelProcesses.isEmpty && state?.tunnelPID == nil)
         let duplicateOwnedProcesses = duplicateAssignment
             || serverProcesses.count > 1
             || tunnelProcesses.count > 1
@@ -686,12 +726,15 @@ struct ReadOnlyLifecycleFactsProvider: LifecycleFactsProviding {
         let ownedCount = serverProcesses.count + tunnelProcesses.count
         let ownershipMarkerPresent = state != nil
             && stateOwnerMatches
-            && stateHasAnyPID
             && serverAssignmentValid
             && tunnelAssignmentValid
+            && serverProcesses.count == (serverDesired ? 1 : 0)
+            && tunnelProcesses.count == (remoteDesired ? 1 : 0)
             && !pidReuse
             && !duplicateOwnedProcesses
         return LifecycleFacts(
+            serverDesired: serverDesired,
+            remoteDesired: remoteDesired,
             launchAgentPresent: launchAgentPresent,
             launchAgentValid: launchAgentValid,
             serviceRunning: serviceRunning,
@@ -708,43 +751,31 @@ struct ReadOnlyLifecycleFactsProvider: LifecycleFactsProviding {
     private func launchAgentIsValid() -> Bool {
         guard DiagnosticPathSafety.isSafe(paths.launchAgentURL),
               label == Self.expectedLabel,
+              hasCanonicalPermissions(),
               let data = try? Data(contentsOf: paths.launchAgentURL),
-              let object = try? PropertyListSerialization.propertyList(from: data, format: nil),
-              let plist = object as? [String: Any] else { return false }
+              let object = try? PropertyListSerialization.propertyList(from: data, format: nil) else { return false }
 
-        let baseKeys: Set<String> = [
-            "Label", "ProgramArguments", "RunAtLoad", "KeepAlive", "LimitLoadToSessionType",
-        ]
-        let distributionKeys = baseKeys.union([
-            "ThrottleInterval", "ProcessType", "StandardOutPath", "StandardErrorPath"
-        ])
-        guard let arguments = plist["ProgramArguments"] as? [String],
-              arguments.count == 1,
-              plist["Label"] as? String == label,
-              plist["RunAtLoad"] as? Bool == true,
-              plist["LimitLoadToSessionType"] as? String == "Aqua",
-              let keepAlive = plist["KeepAlive"] as? [String: Any],
-              keepAlive.count == 1,
-              keepAlive["SuccessfulExit"] as? Bool == false else { return false }
-
-        let isBootstrapContract = arguments == [paths.helperExecutableURL.path]
-        let distributionExecutable = "/Applications/Mac Orchestrator.app/Contents/MacOS/MacOrchestrator"
-        let isDistributionContract = arguments == [distributionExecutable]
-        guard isBootstrapContract || isDistributionContract else { return false }
-        if isBootstrapContract {
-            return Set(plist.keys) == baseKeys
-        }
-
-        guard Set(plist.keys) == distributionKeys,
-              plist["ThrottleInterval"] as? Int == 5,
-              plist["ProcessType"] as? String == "Interactive",
-              plist["StandardOutPath"] as? String == launcherLogPath,
-              plist["StandardErrorPath"] as? String == launcherLogPath else { return false }
-        return true
+        let contract = ManagedLaunchAgentContract(
+            homeDirectory: paths.homeDirectory,
+            executableURL: paths.helperExecutableURL
+        )
+        return contract.matches(object)
     }
 
-    private var launcherLogPath: String {
-        paths.homeDirectory.appendingPathComponent("Library/Logs/Mac Orchestrator/launcher.log").path
+    private func hasCanonicalPermissions() -> Bool {
+        var fileInfo = stat()
+        guard lstat(paths.launchAgentURL.path, &fileInfo) == 0,
+              UInt32(fileInfo.st_mode) & UInt32(S_IFMT) == UInt32(S_IFREG),
+              fileInfo.st_uid == getuid(),
+              UInt32(fileInfo.st_mode) & 0o777 == 0o600 else { return false }
+
+        let parent = paths.launchAgentURL.deletingLastPathComponent()
+        var parentInfo = stat()
+        guard lstat(parent.path, &parentInfo) == 0,
+              UInt32(parentInfo.st_mode) & UInt32(S_IFMT) == UInt32(S_IFDIR),
+              parentInfo.st_uid == getuid(),
+              UInt32(parentInfo.st_mode) & 0o777 == 0o700 else { return false }
+        return true
     }
 
     private func isSymlink(at url: URL) -> Bool {

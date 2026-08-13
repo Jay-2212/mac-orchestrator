@@ -98,16 +98,19 @@ final class TestLifecycleScheduler: LifecycleSchedulerProtocol {
         let id: UUID
         let date: Date
         let label: String?
+        fileprivate let sequence: UInt64
     }
 
     private struct Entry {
         let handle: LifecycleScheduledHandle
+        let sequence: UInt64
         let operation: @MainActor () -> Void
     }
 
     private(set) var now: Date
     private var entries: [UUID: Entry] = [:]
     private var retiredOperations: [UUID: @MainActor () -> Void] = [:]
+    private var nextSequence: UInt64 = 0
 
     init(start: Date = Date(timeIntervalSince1970: 0)) {
         now = start
@@ -124,7 +127,9 @@ final class TestLifecycleScheduler: LifecycleSchedulerProtocol {
         operation: @escaping @MainActor () -> Void
     ) -> LifecycleScheduledHandle {
         let handle = LifecycleScheduledHandle(date: date, label: label)
-        entries[handle.id] = Entry(handle: handle, operation: operation)
+        let sequence = nextSequence
+        nextSequence &+= 1
+        entries[handle.id] = Entry(handle: handle, sequence: sequence, operation: operation)
         return handle
     }
 
@@ -142,11 +147,12 @@ final class TestLifecycleScheduler: LifecycleSchedulerProtocol {
                 PendingWork(
                     id: $0.handle.id,
                     date: $0.handle.date,
-                    label: $0.handle.label
+                    label: $0.handle.label,
+                    sequence: $0.sequence
                 )
             }
             .sorted { lhs, rhs in
-                if lhs.date == rhs.date { return lhs.id.uuidString < rhs.id.uuidString }
+                if lhs.date == rhs.date { return lhs.sequence < rhs.sequence }
                 return lhs.date < rhs.date
             }
     }
@@ -169,7 +175,9 @@ final class TestLifecycleScheduler: LifecycleSchedulerProtocol {
 
     func advance(to date: Date) {
         guard date >= now else {
-            now = date
+            // The logical clock is monotonic. A caller that presents an old
+            // timestamp must not make retry windows appear newer or cause
+            // already-fired work to become eligible again.
             return
         }
         while let next = pending.first, next.date <= date {

@@ -893,6 +893,7 @@ final class DiagnosticLiveProviderTests: XCTestCase {
         let provider = ReadOnlyLifecycleFactsProvider(
             paths: fixture.paths,
             ownerID: "owner-1",
+            remoteDesired: false,
             commandRunner: launchctlRunner(),
             processRunner: RecordingDiagnosticProcessRunner(processes: [
                 DiagnosticProcessRecord(
@@ -919,6 +920,7 @@ final class DiagnosticLiveProviderTests: XCTestCase {
         let provider = ReadOnlyLifecycleFactsProvider(
             paths: fixture.paths,
             ownerID: "owner-1",
+            remoteDesired: false,
             commandRunner: launchctlRunner(),
             processRunner: RecordingDiagnosticProcessRunner(processes: [
                 DiagnosticProcessRecord(
@@ -1058,7 +1060,7 @@ final class DiagnosticLiveProviderTests: XCTestCase {
         XCTAssertFalse(facts.launchAgentValid)
     }
 
-    func testLifecycleAcceptsDistributionLaunchAgentContract() throws {
+    func testLifecycleRejectsNonCanonicalDistributionLaunchAgentContract() throws {
         let fixture = try makeLifecycleFixture()
         try writeSupportedLaunchAgent(
             to: fixture.paths.launchAgentURL,
@@ -1073,7 +1075,7 @@ final class DiagnosticLiveProviderTests: XCTestCase {
             processRunner: RecordingDiagnosticProcessRunner(processes: [])
         ).inspect()
 
-        XCTAssertTrue(facts.launchAgentValid)
+        XCTAssertFalse(facts.launchAgentValid)
     }
 
     func testLifecycleRejectsArbitraryLaunchAgentExecutablePath() throws {
@@ -1324,6 +1326,8 @@ final class DiagnosticLiveProviderTests: XCTestCase {
         }
         let data = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
         try data.write(to: url)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: url.deletingLastPathComponent().path)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
     }
 
     private func fixtureHome(from launchAgentURL: URL) -> URL {

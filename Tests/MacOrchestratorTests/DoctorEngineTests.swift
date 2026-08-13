@@ -108,6 +108,58 @@ final class DoctorEngineTests: XCTestCase {
         XCTAssertEqual(DiagnosticChecks.configurationGeneration(unsupported).status, .fail)
     }
 
+    func testConfigurationMigrationAndPermissionsCoverReviewBranches() {
+        let healthy = ConfigurationDiagnosticFacts(
+            directoryExists: true,
+            directoryMode: 0o700,
+            primary: DoctorFixture.file(state: .valid, valid: true, schemaVersion: 1, generation: 1),
+            backup: DoctorFixture.file(state: .valid, valid: true, schemaVersion: 1, generation: 1)
+        )
+        XCTAssertEqual(DiagnosticChecks.configurationPermissions(healthy).status, .pass)
+
+        let unsafeCases = [
+            ConfigurationDiagnosticFacts(
+                directoryExists: true,
+                directoryMode: 0o755,
+                primary: healthy.primary,
+                backup: healthy.backup
+            ),
+            ConfigurationDiagnosticFacts(
+                directoryExists: true,
+                directoryMode: 0o700,
+                directoryIsSymlink: true,
+                primary: healthy.primary,
+                backup: healthy.backup
+            ),
+            ConfigurationDiagnosticFacts(
+                directoryExists: true,
+                directoryMode: 0o700,
+                primary: DoctorFixture.file(state: .valid, valid: true, schemaVersion: 1, generation: 1, mode: 0o644),
+                backup: healthy.backup
+            ),
+            ConfigurationDiagnosticFacts(
+                directoryExists: true,
+                directoryMode: 0o700,
+                primary: healthy.primary,
+                backup: DoctorFixture.file(state: .valid, valid: true, schemaVersion: 1, generation: 1, isSymlink: true)
+            ),
+        ]
+        for facts in unsafeCases {
+            XCTAssertEqual(DiagnosticChecks.configurationPermissions(facts).status, .fail)
+        }
+
+        let configuration = AppConfiguration(ownerID: "owner")
+        XCTAssertEqual(DiagnosticChecks.configurationMigration(configuration).status, .pass)
+
+        var marked = configuration
+        marked.onboarding.migrationMarkers = ["phase2-keychain"]
+        XCTAssertEqual(DiagnosticChecks.configurationMigration(marked).status, .warn)
+
+        var cleanupPending = configuration
+        cleanupPending.onboarding.legacyPlaintextCleanupPending = true
+        XCTAssertEqual(DiagnosticChecks.configurationMigration(cleanupPending).status, .warn)
+    }
+
     func testInstallationVersionMismatchAndUnavailableIntegrityEvidenceAreConservative() {
         let healthy = InstalledReleaseFacts(
             releaseVersion: "1.0.0",
@@ -124,6 +176,50 @@ final class DoctorEngineTests: XCTestCase {
         )
         XCTAssertEqual(DiagnosticChecks.installationIntegrity(incomplete).status, .warn)
         XCTAssertEqual(DiagnosticChecks.trustCodeSign(incomplete).status, .warn)
+    }
+
+    func testInstallationRuntimeIntegrityAndAdHocTrustBranches() {
+        let healthy = InstalledReleaseFacts(
+            releaseVersion: "1.0.0",
+            helper: CodeSignFacts(
+                version: "1.0.0",
+                isSigned: true,
+                developerIDTrusted: true,
+                receiptAvailable: true,
+                integrityAvailable: true
+            ),
+            runtime: RuntimeFacts(
+                runtimePresent: true,
+                version: "1.0.0",
+                markerPresent: true,
+                payloadPresent: true,
+                structurallyValid: true
+            ),
+            helperPresent: true,
+            ownershipMarkerPresent: true
+        )
+        XCTAssertEqual(DiagnosticChecks.installationRuntime(healthy).status, .pass)
+        XCTAssertEqual(DiagnosticChecks.installationIntegrity(healthy).status, .pass)
+        XCTAssertEqual(DiagnosticChecks.installationVersionMatch(healthy).status, .pass)
+        XCTAssertEqual(DiagnosticChecks.trustCodeSign(healthy).status, .pass)
+
+        let incompleteVersions = InstalledReleaseFacts(
+            releaseVersion: "1.0.0",
+            helper: healthy.helper,
+            runtime: RuntimeFacts(runtimePresent: true, markerPresent: true, payloadPresent: true, structurallyValid: true),
+            helperPresent: true
+        )
+        XCTAssertEqual(DiagnosticChecks.installationVersionMatch(incompleteVersions).status, .warn)
+
+        let adHoc = InstalledReleaseFacts(
+            helper: CodeSignFacts(isSigned: true, isAdHoc: true, developerIDTrusted: false),
+            helperPresent: true
+        )
+        XCTAssertEqual(DiagnosticChecks.trustCodeSign(adHoc).status, .warn)
+
+        let unsigned = InstalledReleaseFacts(helper: CodeSignFacts(isSigned: false), helperPresent: true)
+        XCTAssertEqual(DiagnosticChecks.trustCodeSign(unsigned).status, .fail)
+        XCTAssertEqual(DiagnosticChecks.installationRuntime(InstalledReleaseFacts()).status, .fail)
     }
 
     func testPermissionFailuresAndLockedNonConsoleSessionsKeepRequesterTruth() {
@@ -157,6 +253,18 @@ final class DoctorEngineTests: XCTestCase {
             ).status,
             .fail
         )
+        XCTAssertEqual(
+            DiagnosticChecks.permissionsRequester(
+                PermissionFacts(requesterIsManagedRuntime: false),
+                configuration: configuration
+            ).status,
+            .skip
+        )
+        XCTAssertEqual(DiagnosticChecks.keychainConnector(KeychainPresenceFacts()).status, .skip)
+        XCTAssertEqual(
+            DiagnosticChecks.keychainConnector(KeychainPresenceFacts(states: [.connectorToken: .inaccessible])).status,
+            .warn
+        )
     }
 
     func testMCPLivenessNotReadyAndInventoryMismatchRemainDistinct() {
@@ -180,6 +288,45 @@ final class DoctorEngineTests: XCTestCase {
         )
         XCTAssertEqual(DiagnosticChecks.mcpInventory(mismatch, desired: true).status, .fail)
         XCTAssertEqual(DiagnosticChecks.mcpInventory(mismatch, desired: true).repair?.id, .retryMCPServer)
+
+        let partialReadiness = LocalMCPFacts(
+            livenessVerified: true,
+            readinessVerified: true,
+            sessionEstablished: false,
+            safeCallSucceeded: true,
+            expectedTools: ["describe"],
+            exposedTools: ["describe"],
+            expectedCapabilityGroups: ["core.session"],
+            exposedCapabilityGroups: ["core.session"]
+        )
+        XCTAssertEqual(DiagnosticChecks.mcpInventory(partialReadiness, desired: true).status, .skip)
+    }
+
+    func testOwnedAndMalformedPortsAreDistinguished() {
+        XCTAssertEqual(
+            DiagnosticChecks.portSelected(PortFacts(port: 8000), configuredPort: 8000).status,
+            .pass
+        )
+        XCTAssertEqual(
+            DiagnosticChecks.portSelected(
+                PortFacts(port: 8000, listenerPresent: true, listenerOwned: true),
+                configuredPort: 8000
+            ).status,
+            .pass
+        )
+
+        for malformedPort in [0, 65_536] {
+            let result = DiagnosticChecks.portSelected(PortFacts(port: malformedPort), configuredPort: malformedPort)
+            XCTAssertEqual(result.status, .fail)
+            XCTAssertEqual(result.repair?.id, .reassignLocalPort)
+        }
+
+        let occupied = DiagnosticChecks.portSelected(
+            PortFacts(port: 8000, listenerPresent: true, listenerOwned: false),
+            configuredPort: 8000
+        )
+        XCTAssertEqual(occupied.status, .fail)
+        XCTAssertEqual(occupied.repair?.id, .reassignLocalPort)
     }
 
     func testLifecycleRemoteDiskUpdateAndFutureBranches() {
@@ -194,21 +341,58 @@ final class DoctorEngineTests: XCTestCase {
         XCTAssertEqual(DiagnosticChecks.lifecycleProcessOwnership(reusedPID, desired: true).status, .fail)
         XCTAssertEqual(DiagnosticChecks.lifecycleProcessOwnership(reusedPID, desired: true).repair?.id, .retryMCPServer)
 
+        let stoppedService = LifecycleFacts(
+            launchAgentPresent: true,
+            launchAgentValid: true,
+            serviceRunning: false,
+            ownedProcessCount: 1,
+            ownershipMarkerPresent: true
+        )
+        XCTAssertEqual(DiagnosticChecks.lifecycleLaunchAgent(stoppedService, desired: true).status, .pass)
+        XCTAssertEqual(DiagnosticChecks.lifecycleProcessOwnership(stoppedService, desired: true).status, .fail)
+        XCTAssertEqual(DiagnosticChecks.lifecycleProcessOwnership(stoppedService, desired: true).repair?.id, .retryMCPServer)
+
+        let noOwnedProcesses = LifecycleFacts(
+            launchAgentPresent: true,
+            launchAgentValid: true,
+            serviceRunning: true,
+            ownedProcessCount: 0,
+            ownershipMarkerPresent: true
+        )
+        XCTAssertEqual(DiagnosticChecks.lifecycleProcessOwnership(noOwnedProcesses, desired: true).status, .fail)
+        XCTAssertEqual(DiagnosticChecks.lifecycleProcessOwnership(noOwnedProcesses, desired: true).repair?.id, .retryMCPServer)
+
         let remote = RemoteConnectorFacts(desired: true, binaryPresent: true, configurationPresent: false)
         XCTAssertEqual(DiagnosticChecks.remoteNgrok(remote, auth: .present, desired: true).status, .fail)
         XCTAssertEqual(DiagnosticChecks.remoteNgrok(remote, auth: .absent, desired: true).repair?.id, .retryRemoteConnector)
         XCTAssertEqual(DiagnosticChecks.remoteEndpoint(remote, desired: true).status, .fail)
 
+        let healthyRemote = RemoteConnectorFacts(
+            desired: true,
+            binaryPresent: true,
+            configurationPresent: true,
+            endpointAvailable: true,
+            endpointCount: 1,
+            ownershipMarkerPresent: true
+        )
+        XCTAssertEqual(DiagnosticChecks.remoteNgrok(healthyRemote, auth: .present, desired: true).status, .pass)
+        XCTAssertEqual(DiagnosticChecks.remoteEndpoint(healthyRemote, desired: true).status, .pass)
+
         XCTAssertEqual(DiagnosticChecks.remoteNgrok(nil, auth: nil, desired: false).status, .skip)
         XCTAssertEqual(DiagnosticChecks.remoteEndpoint(nil, desired: false).status, .skip)
         XCTAssertEqual(DiagnosticChecks.updateAvailability(nil).status, .skip)
+        XCTAssertEqual(DiagnosticChecks.updateAvailability(UpdateAvailabilityFacts(status: .current)).status, .pass)
+        XCTAssertEqual(DiagnosticChecks.updateAvailability(UpdateAvailabilityFacts(status: .available)).status, .warn)
         XCTAssertEqual(DiagnosticChecks.futureCapability("capability.future", title: "Future").status, .skip)
 
         XCTAssertEqual(DiagnosticChecks.diskFreeSpace(nil, thresholdBytes: 1).status, .fail)
+        XCTAssertEqual(DiagnosticChecks.diskFreeSpace(DiskSpaceFacts(filesystemAccessible: false), thresholdBytes: 1).status, .fail)
         XCTAssertEqual(DiagnosticChecks.diskFreeSpace(DiskSpaceFacts(filesystemAccessible: true, availableBytes: nil), thresholdBytes: 1).status, .skip)
         XCTAssertEqual(DiagnosticChecks.diskFreeSpace(DiskSpaceFacts(filesystemAccessible: true, availableBytes: 100), thresholdBytes: nil).status, .skip)
         XCTAssertEqual(DiagnosticChecks.diskFreeSpace(DiskSpaceFacts(filesystemAccessible: true, availableBytes: 100), thresholdBytes: 100).status, .pass)
         XCTAssertEqual(DiagnosticChecks.diskFreeSpace(DiskSpaceFacts(filesystemAccessible: true, availableBytes: 99), thresholdBytes: 100).status, .warn)
+        XCTAssertEqual(DiagnosticChecks.criticalPaths(DiskSpaceFacts(filesystemAccessible: true, criticalPathSymlinkCount: 0)).status, .pass)
+        XCTAssertEqual(DiagnosticChecks.criticalPaths(DiskSpaceFacts(filesystemAccessible: true, criticalPathSymlinkCount: 1)).status, .fail)
     }
 
     func testDoctorGathersContextBeforeProvidersAndSkipsDisabledDependencies() async throws {
@@ -270,18 +454,67 @@ final class DoctorEngineTests: XCTestCase {
         XCTAssertEqual(asyncProvider.calls, 0)
     }
 
+    func testPermissionProviderRequiresAConfiguredLocalProtectedConsumer() async {
+        let disabled = DoctorFixture.make(serverDesired: false, remoteDesired: false)
+        let disabledReport = await DoctorEngine(dependencies: disabled.dependencies).run()
+        XCTAssertEqual(disabledReport.result(withID: "permissions.requester")?.status, .skip)
+        XCTAssertTrue(disabled.permission.calls.isEmpty)
+
+        let remoteOnly = DoctorFixture.make(serverDesired: false, remoteDesired: true)
+        let remoteReport = await DoctorEngine(dependencies: remoteOnly.dependencies).run()
+        XCTAssertEqual(remoteReport.result(withID: "permissions.requester")?.status, .skip)
+        XCTAssertTrue(remoteOnly.permission.calls.isEmpty)
+
+        let local = DoctorFixture.make(serverDesired: true, remoteDesired: false)
+        _ = await DoctorEngine(dependencies: local.dependencies).run()
+        XCTAssertEqual(local.permission.calls.count, 1)
+    }
+
+    func testSuccessfulAsyncCanonicalMCPProviderWinsOverSyncProvider() async {
+        let asyncProvider = RecordingAsyncLocalProvider(facts: LocalMCPFacts(
+            livenessVerified: true,
+            readinessVerified: true,
+            sessionEstablished: true,
+            safeCallSucceeded: true,
+            expectedTools: ["describe"],
+            exposedTools: ["describe"],
+            expectedCapabilityGroups: ["core.session"],
+            exposedCapabilityGroups: ["core.session"]
+        ))
+        let fixture = DoctorFixture.make(asyncLocalMCPProvider: asyncProvider)
+
+        let report = await DoctorEngine(dependencies: fixture.dependencies).run()
+
+        XCTAssertEqual(asyncProvider.calls, 1)
+        XCTAssertTrue(fixture.local.calls.isEmpty)
+        XCTAssertEqual(report.result(withID: "mcp.inventory")?.status, .pass)
+    }
+
     func testMutationFreeNegativeControlSnapshotsExistingConfigAndAllProviderCalls() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
         let primary = root.appendingPathComponent("config.json")
-        let bytes = Data(#"{"schemaVersion":1,"generation":1,"ownerID":"fixture"}"#.utf8)
+        var configuration = AppConfiguration(
+            process: ProcessConfiguration(serverDesired: false, tunnelDesired: false),
+            ownerID: "fixture"
+        )
+        configuration.desiredCapabilities["mac.ui"] = false
+        configuration.desiredCapabilities["mac.screenOcr"] = false
+        configuration.desiredCapabilities["remote.connector"] = false
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let bytes = try encoder.encode(configuration)
         try bytes.write(to: primary)
         let beforeEntries = try FileManager.default.contentsOfDirectory(atPath: root.path)
         let beforeBytes = try Data(contentsOf: primary)
         let beforeGeneration = try JSONDecoder().decode(AppConfiguration.self, from: beforeBytes).generation
 
-        let fixture = DoctorFixture.make(serverDesired: false, remoteDesired: false)
+        let fixture = DoctorFixture.make(
+            serverDesired: false,
+            remoteDesired: false,
+            configurationContextProvider: ReadOnlyDoctorConfigurationContextProvider(directoryURL: root)
+        )
         let beforeCalls = fixture.mutationSnapshot
         let report = await DoctorEngine(dependencies: fixture.dependencies).run()
         let afterBytes = try Data(contentsOf: primary)
@@ -296,6 +529,11 @@ final class DoctorEngineTests: XCTestCase {
         XCTAssertTrue(fixture.keychain.updateCalls.isEmpty)
         XCTAssertTrue(fixture.keychain.tokenGenerationCalls.isEmpty)
         XCTAssertTrue(fixture.keychain.valueRetrievalCalls.isEmpty)
+        XCTAssertTrue(fixture.permission.calls.isEmpty)
+        XCTAssertTrue(fixture.local.calls.isEmpty)
+        XCTAssertTrue(fixture.remote.calls.isEmpty)
+        XCTAssertTrue(fixture.lifecycle.calls.isEmpty)
+        XCTAssertTrue(fixture.keychain.requests.isEmpty)
         XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("archive").path))
         XCTAssertEqual(report.results.compactMap(\.repair), [])
     }
@@ -315,6 +553,7 @@ private struct DoctorFixture {
     let remote: RecordingRemoteProvider
     let lifecycle: RecordingLifecycleProvider
     let keychain: RecordingDoctorKeychainProvider
+    let permission: RecordingPermissionProvider
 
     var mutationSnapshot: MutationSnapshot {
         MutationSnapshot(
@@ -331,7 +570,8 @@ private struct DoctorFixture {
         validatedContext: Bool = true,
         serverDesired: Bool = true,
         remoteDesired: Bool = false,
-        asyncLocalMCPProvider: (any DoctorAsyncLocalMCPDiagnosticProviding)? = nil
+        asyncLocalMCPProvider: (any DoctorAsyncLocalMCPDiagnosticProviding)? = nil,
+        configurationContextProvider: (any DoctorConfigurationContextProviding)? = nil
     ) -> DoctorFixture {
         var configuration = validatedConfiguration ?? AppConfiguration(
             process: ProcessConfiguration(serverDesired: serverDesired, tunnelDesired: remoteDesired),
@@ -347,13 +587,18 @@ private struct DoctorFixture {
             primary: file(state: .valid, valid: true, schemaVersion: configuration.schemaVersion, generation: configuration.generation),
             backup: file(state: .valid, valid: true, schemaVersion: configuration.schemaVersion, generation: configuration.generation)
         )
-        let context = FixtureConfigurationContextProvider(
-            snapshot: DoctorConfigurationSnapshot(
-                facts: facts,
-                validatedConfiguration: validatedContext ? (validatedConfiguration ?? configuration) : nil
-            ),
-            error: configurationError
-        )
+        let context: any DoctorConfigurationContextProviding
+        if let configurationContextProvider {
+            context = configurationContextProvider
+        } else {
+            context = FixtureConfigurationContextProvider(
+                snapshot: DoctorConfigurationSnapshot(
+                    facts: facts,
+                    validatedConfiguration: validatedContext ? (validatedConfiguration ?? configuration) : nil
+                ),
+                error: configurationError
+            )
+        }
         let local = RecordingLocalProvider(facts: LocalMCPFacts(
             livenessVerified: true,
             readinessVerified: true,
@@ -380,17 +625,18 @@ private struct DoctorFixture {
             ownershipMarkerPresent: true
         ))
         let keychain = RecordingDoctorKeychainProvider()
+        let permission = RecordingPermissionProvider(facts: PermissionFacts(
+            accessibility: true,
+            screenRecording: true,
+            automation: true,
+            activeConsole: true,
+            requesterIsManagedRuntime: true
+        ))
 
         let dependencies = DoctorDependencies(
             configurationContextProvider: context,
             installedReleaseProvider: FixtureInstalledProvider(),
-            permissionProvider: FixturePermissionProvider(facts: PermissionFacts(
-                accessibility: true,
-                screenRecording: true,
-                automation: true,
-                activeConsole: true,
-                requesterIsManagedRuntime: true
-            )),
+            permissionProvider: permission,
             keychainPresenceProvider: keychain,
             portProvider: FixturePortProvider(facts: PortFacts(port: configuration.localMCPPort)),
             localMCPProvider: local,
@@ -402,7 +648,14 @@ private struct DoctorFixture {
             thresholds: DoctorThresholds(lowDiskBytes: 1_000),
             clock: { Date(timeIntervalSince1970: 1_700_000_000) }
         )
-        return DoctorFixture(dependencies: dependencies, local: local, remote: remote, lifecycle: lifecycle, keychain: keychain)
+        return DoctorFixture(
+            dependencies: dependencies,
+            local: local,
+            remote: remote,
+            lifecycle: lifecycle,
+            keychain: keychain,
+            permission: permission
+        )
     }
 
     static func file(
@@ -410,7 +663,8 @@ private struct DoctorFixture {
         valid: Bool = false,
         schemaVersion: Int? = nil,
         generation: Int? = nil,
-        isSymlink: Bool = false
+        isSymlink: Bool = false,
+        mode: UInt16? = 0o600
     ) -> ConfigurationFileFacts {
         ConfigurationFileFacts(
             exists: true,
@@ -419,7 +673,7 @@ private struct DoctorFixture {
             state: state,
             schemaVersion: schemaVersion,
             generation: generation,
-            mode: 0o600,
+            mode: mode,
             isSymlink: isSymlink,
             byteCount: 1
         )
@@ -460,6 +714,18 @@ private struct FixturePermissionProvider: PermissionFactsProviding {
     func inspect() throws -> PermissionFacts { facts }
 }
 
+private final class RecordingPermissionProvider: PermissionFactsProviding, @unchecked Sendable {
+    let facts: PermissionFacts
+    var calls: [Void] = []
+
+    init(facts: PermissionFacts) { self.facts = facts }
+
+    func inspect() throws -> PermissionFacts {
+        calls.append(())
+        return facts
+    }
+}
+
 private struct FixturePortProvider: PortFactsProviding {
     let facts: PortFacts
     func inspect() throws -> PortFacts { facts }
@@ -484,11 +750,16 @@ private final class RecordingLocalProvider: LocalMCPDiagnosticProviding, @unchec
 }
 
 private final class RecordingAsyncLocalProvider: DoctorAsyncLocalMCPDiagnosticProviding, @unchecked Sendable {
+    let facts: LocalMCPFacts
     var calls = 0
+
+    init(facts: LocalMCPFacts = LocalMCPFacts(livenessVerified: true)) {
+        self.facts = facts
+    }
 
     func inspect() async throws -> LocalMCPFacts {
         calls += 1
-        return LocalMCPFacts(livenessVerified: true)
+        return facts
     }
 }
 

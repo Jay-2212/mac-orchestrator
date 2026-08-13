@@ -215,6 +215,9 @@ enum DiagnosticChecks {
         guard let configuration else {
             return result("permissions.requester", "Requester permissions", .skip, "Requester permissions require validated configuration.")
         }
+        guard consumesProtectedBehavior(configuration) else {
+            return result("permissions.requester", "Requester permissions", .skip, "No configured local protected behavior consumes requester permissions.")
+        }
         guard let facts else {
             return result("permissions.requester", "Requester permissions", .warn, Text.providerUnavailable)
         }
@@ -288,8 +291,12 @@ enum DiagnosticChecks {
 
     static func mcpInventory(_ facts: LocalMCPFacts?, desired: Bool) -> DiagnosticResult {
         guard desired else { return result("mcp.inventory", "Local MCP inventory", .skip, Text.notApplicable) }
-        guard let facts, facts.readinessVerified else {
-            return result("mcp.inventory", "Local MCP inventory", .skip, "Inventory requires canonical local readiness.")
+        guard let facts,
+              facts.livenessVerified,
+              facts.readinessVerified,
+              facts.sessionEstablished,
+              facts.safeCallSucceeded else {
+            return result("mcp.inventory", "Local MCP inventory", .skip, "Inventory requires complete canonical local readiness.")
         }
         guard facts.expectedTools == facts.exposedTools,
               facts.expectedCapabilityGroups == facts.exposedCapabilityGroups else {
@@ -311,7 +318,11 @@ enum DiagnosticChecks {
         guard let facts else {
             return result("lifecycle.process-ownership", "Process ownership", .fail, Text.providerUnavailable, repair: .retryMCPServer)
         }
-        guard facts.ownershipMarkerPresent, !facts.duplicateOwnedProcesses, !facts.pidReuseDetected else {
+        guard facts.serviceRunning,
+              facts.ownedProcessCount > 0,
+              facts.ownershipMarkerPresent,
+              !facts.duplicateOwnedProcesses,
+              !facts.pidReuseDetected else {
             return result("lifecycle.process-ownership", "Process ownership", .fail, Text.ownershipInvalid, repair: .retryMCPServer)
         }
         return result("lifecycle.process-ownership", "Process ownership", .pass, Text.verified)
@@ -437,5 +448,11 @@ enum DiagnosticChecks {
             && file.state == .valid
             && !file.isSymlink
             && file.schemaVersion == AppConfiguration.currentSchemaVersion
+    }
+
+    static func consumesProtectedBehavior(_ configuration: AppConfiguration?) -> Bool {
+        guard let configuration, configuration.process.serverDesired else { return false }
+        return configuration.desiredCapabilities["mac.ui"] == true
+            || configuration.desiredCapabilities["mac.screenOcr"] == true
     }
 }

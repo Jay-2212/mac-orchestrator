@@ -25,6 +25,54 @@ protocol DoctorConfigurationContextProviding {
     func inspect() throws -> DoctorConfigurationSnapshot
 }
 
+protocol ReadOnlyConfigurationDiagnosticProviding: ConfigurationDiagnosticProviding {}
+
+extension ReadOnlyConfigurationDiagnosticProvider: ReadOnlyConfigurationDiagnosticProviding {}
+
+struct ReadOnlyDoctorConfigurationContextProvider: DoctorConfigurationContextProviding {
+    private let diagnosticProvider: any ReadOnlyConfigurationDiagnosticProviding
+    private let primaryConfigurationURL: URL
+    private let decoder: JSONDecoder
+
+    init(directoryURL: URL, fileManager: FileManager = .default) {
+        self.init(
+            diagnosticProvider: ReadOnlyConfigurationDiagnosticProvider(
+                directoryURL: directoryURL,
+                fileManager: fileManager
+            ),
+            primaryConfigurationURL: directoryURL.appendingPathComponent("config.json", isDirectory: false)
+        )
+    }
+
+    init(
+        diagnosticProvider: any ReadOnlyConfigurationDiagnosticProviding,
+        primaryConfigurationURL: URL
+    ) {
+        self.diagnosticProvider = diagnosticProvider
+        self.primaryConfigurationURL = primaryConfigurationURL
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        self.decoder = decoder
+    }
+
+    func inspect() throws -> DoctorConfigurationSnapshot {
+        let facts = try diagnosticProvider.inspect()
+        return DoctorConfigurationSnapshot(
+            facts: facts,
+            validatedConfiguration: decodeValidatedConfiguration(facts: facts)
+        )
+    }
+
+    private func decodeValidatedConfiguration(facts: ConfigurationDiagnosticFacts) -> AppConfiguration? {
+        guard DiagnosticChecks.isUsableConfigurationFile(facts.primary),
+              let data = try? Data(contentsOf: primaryConfigurationURL),
+              let configuration = try? decoder.decode(AppConfiguration.self, from: data) else {
+            return nil
+        }
+        return try? configuration.validated()
+    }
+}
+
 protocol DoctorKeychainPresenceProviding {
     func inspect(items: Set<KeychainPresenceItem>) throws -> KeychainPresenceFacts
 }
@@ -112,7 +160,9 @@ struct DoctorEngine {
             || configuration?.desiredCapabilities["remote.connector"] == true
 
         let installedFacts = inspectInstalledRelease()
-        let permissionFacts = hasValidatedConfiguration ? inspectPermissions() : nil
+        let permissionFacts = DiagnosticChecks.consumesProtectedBehavior(configuration)
+            ? inspectPermissions()
+            : nil
         let portFacts = serverDesired ? inspectPort() : nil
         let localMCPFacts = serverDesired ? await inspectLocalMCP() : nil
         let lifecycleFacts = (serverDesired || remoteDesired) ? inspectLifecycle() : nil

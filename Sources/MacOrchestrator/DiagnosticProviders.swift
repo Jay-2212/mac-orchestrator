@@ -771,15 +771,9 @@ enum VerifiedMacOSSystemAlias {
         var linkMetadata = stat()
         guard lstat(url.path, &linkMetadata) == 0,
               UInt32(linkMetadata.st_mode) & UInt32(S_IFMT) == UInt32(S_IFLNK),
-              let destination = try? FileManager.default.destinationOfSymbolicLink(atPath: url.path),
-              destination == "private/var" || destination == "/private/var"
-                || destination == "private/tmp" || destination == "/private/tmp",
               url.resolvingSymlinksInPath().standardizedFileURL.path == expected else {
             return false
         }
-
-        var targetMetadata = stat()
-        return lstat(expected, &targetMetadata) == 0
-            && UInt32(targetMetadata.st_mode) & UInt32(S_IFMT) == UInt32(S_IFDIR)
+        return true
     }
 }

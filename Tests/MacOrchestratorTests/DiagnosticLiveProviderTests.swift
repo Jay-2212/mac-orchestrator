@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import XCTest
 @testable import MacOrchestrator
 
@@ -57,6 +58,43 @@ final class DiagnosticLiveProviderTests: XCTestCase {
         XCTAssertFalse(String(describing: facts).contains("secret response body"))
     }
 
+    func testActivationAdapterKeepsLivenessAfterHealthSuccessWhenMCPTransportFails() async {
+        let probe = RecordingActivationProbe(outcome: .init(
+            phase: .initialize,
+            error: .transport("network failure")
+        ))
+        let adapter = LocalActivationProbeAdapter(
+            probe: probe,
+            keychain: KeychainStore(client: RecordingDiagnosticKeychainClient(value: "connector-secret")),
+            configuration: AppConfiguration(ownerID: "owner-1"),
+            port: 8007
+        )
+
+        let facts = await adapter.inspect()
+
+        XCTAssertTrue(facts.livenessVerified)
+        XCTAssertFalse(facts.readinessVerified)
+        XCTAssertFalse(facts.sessionEstablished)
+    }
+
+    func testActivationAdapterKeepsLivenessAfterHealthSuccessWhenCapabilityTokenIsInvalid() async {
+        let probe = RecordingActivationProbe(outcome: .init(
+            phase: .initialize,
+            error: .invalidCapabilityToken
+        ))
+        let adapter = LocalActivationProbeAdapter(
+            probe: probe,
+            keychain: KeychainStore(client: RecordingDiagnosticKeychainClient(value: "connector-secret")),
+            configuration: AppConfiguration(ownerID: "owner-1"),
+            port: 8007
+        )
+
+        let facts = await adapter.inspect()
+
+        XCTAssertTrue(facts.livenessVerified)
+        XCTAssertFalse(facts.readinessVerified)
+    }
+
     func testMissingConnectorTokenIsUnavailableWithoutCreatingOne() async {
         let keychainClient = RecordingDiagnosticKeychainClient(value: nil)
         let probe = RecordingActivationProbe(result: .success(LocalActivationProbeDetails()))
@@ -107,10 +145,35 @@ final class DiagnosticLiveProviderTests: XCTestCase {
         XCTAssertTrue(expectations.skippedCapabilityGroups.contains("cloudflare"))
         XCTAssertTrue(expectations.expectedTools.contains("describe"))
         XCTAssertTrue(expectations.expectedTools.contains("get_session_state"))
+        XCTAssertTrue(expectations.expectedTools.contains("clipboard"))
         XCTAssertTrue(expectations.expectedTools.contains("write_file"))
         XCTAssertTrue(expectations.expectedTools.contains("run_terminal_command"))
         XCTAssertTrue(expectations.expectedTools.contains("send_file_to_telegram"))
         XCTAssertFalse(expectations.expectedTools.contains("vector_search"))
+    }
+
+    func testActivationAdapterReportsShippedClipboardGroupWhenClipboardToolIsExposed() async {
+        var configuration = AppConfiguration(ownerID: "owner-1")
+        configuration.desiredCapabilities["mac.clipboard.write"] = true
+        let probe = RecordingActivationProbe(outcome: .init(
+            phase: .safeCall,
+            details: LocalActivationProbeDetails(
+                exposedTools: ["describe", "get_capabilities", "get_session_state", "clipboard"],
+                safeCallSucceeded: true
+            )
+        ))
+        let adapter = LocalActivationProbeAdapter(
+            probe: probe,
+            keychain: KeychainStore(client: RecordingDiagnosticKeychainClient(value: "connector-secret")),
+            configuration: configuration,
+            port: 8007
+        )
+
+        let facts = await adapter.inspect()
+
+        XCTAssertTrue(facts.expectedTools.contains("clipboard"))
+        XCTAssertTrue(facts.expectedCapabilityGroups.contains("mac.clipboard.write"))
+        XCTAssertTrue(facts.exposedCapabilityGroups.contains("mac.clipboard.write"))
     }
 
     func testPortProviderUsesInjectedReadOnlyCommandAndDoesNotTreatPIDAsReadiness() throws {
@@ -132,6 +195,29 @@ final class DiagnosticLiveProviderTests: XCTestCase {
         XCTAssertEqual(facts.listenerPID, 4242)
         XCTAssertFalse(facts.pidReuseDetected)
         XCTAssertTrue(runner.requests.allSatisfy { !$0.executable.contains("kill") })
+    }
+
+    func testPortProviderFailsClosedWhenMultipleListenersAreReported() throws {
+        let runner = RecordingDiagnosticCommandRunner(outputs: [
+            DiagnosticCommandRequest(executable: "/usr/sbin/lsof", arguments: [
+                "-nP", "-iTCP:8007", "-sTCP:LISTEN", "-t"
+            ]): DiagnosticCommandResult(status: 0, stdout: "4242\n4343\n", stderr: "")
+        ])
+        let provider = ReadOnlyPortFactsProvider(
+            port: 8007,
+            ownerID: "owner-1",
+            commandRunner: runner,
+            processRunner: RecordingDiagnosticProcessRunner(processes: [
+                DiagnosticProcessRecord(pid: 4242, commandLine: "python automac_mcp.py --managed-owner owner-1", running: true),
+                DiagnosticProcessRecord(pid: 4343, commandLine: "python other-server", running: true),
+            ])
+        )
+
+        let facts = try provider.inspect()
+
+        XCTAssertTrue(facts.listenerPresent)
+        XCTAssertFalse(facts.listenerOwned)
+        XCTAssertNil(facts.listenerPID)
     }
 
     func testNgrokProviderParsesEndpointCountWithoutReturningURLOrBody() throws {
@@ -161,24 +247,241 @@ final class DiagnosticLiveProviderTests: XCTestCase {
         XCTAssertEqual(http.requests, [apiURL])
     }
 
+    func testNgrokProviderReportsOnlyAuthPresenceAndStillChecksAgentAPI() throws {
+        let apiURL = URL(string: "http://127.0.0.1:4040/api/endpoints")!
+        let http = RecordingDiagnosticHTTPRunner(response: DiagnosticHTTPResponse(
+            status: 200,
+            url: apiURL,
+            body: Data(#"{"endpoints":[]}"#.utf8)
+        ))
+        let keychain = RecordingDiagnosticKeychainPresenceProvider(
+            facts: KeychainPresenceFacts(states: [.ngrokAuthtoken: .present])
+        )
+        let provider = ReadOnlyRemoteConnectorFactsProvider(
+            desired: true,
+            binaryPresent: true,
+            configurationPresent: true,
+            target: "http://127.0.0.1:8007",
+            httpRunner: http,
+            keychainPresenceProvider: keychain
+        )
+
+        let inspection = try provider.inspectDetailed()
+
+        XCTAssertEqual(inspection.ngrokAuthtokenPresence, .present)
+        XCTAssertEqual(keychain.calls, 1)
+        XCTAssertEqual(http.requests, [apiURL])
+        XCTAssertFalse(String(describing: inspection).contains("ngrok_"))
+    }
+
+    func testNgrokProviderRejectsRedirectedAgentAPIWithoutExposingEndpoint() throws {
+        let apiURL = URL(string: "http://127.0.0.1:4040/api/endpoints")!
+        let redirectedURL = URL(string: "http://127.0.0.1:4040/redirected")!
+        let http = RecordingDiagnosticHTTPRunner(response: DiagnosticHTTPResponse(
+            status: 200,
+            url: redirectedURL,
+            body: Data(#"{"endpoints":[{"url":"https://public.example"}]}"#.utf8)
+        ))
+        let keychain = RecordingDiagnosticKeychainPresenceProvider(
+            facts: KeychainPresenceFacts(states: [.ngrokAuthtoken: .inaccessible])
+        )
+        let provider = ReadOnlyRemoteConnectorFactsProvider(
+            desired: true,
+            binaryPresent: true,
+            configurationPresent: true,
+            target: "http://127.0.0.1:8007",
+            httpRunner: http,
+            keychainPresenceProvider: keychain
+        )
+
+        let inspection = try provider.inspectDetailed()
+
+        XCTAssertEqual(inspection.ngrokAuthtokenPresence, .inaccessible)
+        XCTAssertFalse(inspection.facts.endpointAvailable)
+        XCTAssertEqual(inspection.facts.endpointCount, 0)
+        XCTAssertEqual(http.requests, [apiURL])
+    }
+
     func testDisabledRemoteProviderDoesNotContactTheAgentAPI() throws {
         let http = RecordingDiagnosticHTTPRunner(response: DiagnosticHTTPResponse(
             status: 200,
             url: URL(string: "http://127.0.0.1:4040/api/endpoints")!,
             body: Data(#"{"endpoints":[]}"#.utf8)
         ))
+        let keychain = RecordingDiagnosticKeychainPresenceProvider(
+            facts: KeychainPresenceFacts(states: [.ngrokAuthtoken: .present])
+        )
         let provider = ReadOnlyRemoteConnectorFactsProvider(
             desired: false,
             binaryPresent: false,
             configurationPresent: false,
             target: "http://127.0.0.1:8007",
-            httpRunner: http
+            httpRunner: http,
+            keychainPresenceProvider: keychain
         )
 
         let facts = try provider.inspect()
 
         XCTAssertFalse(facts.desired)
         XCTAssertTrue(http.requests.isEmpty)
+        XCTAssertEqual(keychain.calls, 0)
+    }
+
+    func testLifecycleRejectsMalformedStateAndNonRunningRecordedProcesses() throws {
+        let fixture = try makeLifecycleFixture()
+        try Data("{malformed".utf8).write(to: fixture.paths.ownedProcessesURL)
+        try writeSupportedLaunchAgent(to: fixture.paths.launchAgentURL, helper: fixture.paths.helperExecutableURL)
+        let processRunner = RecordingDiagnosticProcessRunner(processes: [
+            DiagnosticProcessRecord(
+                pid: 4242,
+                commandLine: "python automac_mcp.py --managed-owner owner-1",
+                running: false
+            )
+        ])
+        let provider = ReadOnlyLifecycleFactsProvider(
+            paths: fixture.paths,
+            ownerID: "owner-1",
+            commandRunner: launchctlRunner(),
+            processRunner: processRunner
+        )
+
+        let facts = try provider.inspect()
+
+        XCTAssertTrue(facts.launchAgentValid)
+        XCTAssertEqual(facts.ownedProcessCount, 0)
+        XCTAssertTrue(facts.pidReuseDetected)
+    }
+
+    func testLifecycleRejectsDuplicateComponentAssignmentsAndComponentMismatch() throws {
+        let fixture = try makeLifecycleFixture()
+        let state = OwnedProcessState(ownerID: "owner-1", serverPID: 42, tunnelPID: 42)
+        try JSONEncoder().encode(state).write(to: fixture.paths.ownedProcessesURL)
+        try writeSupportedLaunchAgent(to: fixture.paths.launchAgentURL, helper: fixture.paths.helperExecutableURL)
+        let provider = ReadOnlyLifecycleFactsProvider(
+            paths: fixture.paths,
+            ownerID: "owner-1",
+            commandRunner: launchctlRunner(),
+            processRunner: RecordingDiagnosticProcessRunner(processes: [
+                DiagnosticProcessRecord(pid: 42, commandLine: "ngrok mac-orchestrator-owner=owner-1", running: true),
+                DiagnosticProcessRecord(pid: 43, commandLine: "python automac_mcp.py --managed-owner owner-1", running: true),
+            ])
+        )
+
+        let facts = try provider.inspect()
+
+        XCTAssertTrue(facts.duplicateOwnedProcesses)
+        XCTAssertTrue(facts.pidReuseDetected)
+        XCTAssertEqual(facts.ownedProcessCount, 2)
+    }
+
+    func testLifecycleRejectsUnknownLaunchAgentKeysAndWrongContractValues() throws {
+        let fixture = try makeLifecycleFixture()
+        let plist: [String: Any] = [
+            "Label": "com.jay.mac-orchestrator",
+            "ProgramArguments": [fixture.paths.helperExecutableURL.path, "--unexpected"],
+            "RunAtLoad": true,
+            "KeepAlive": ["SuccessfulExit": false],
+            "Unexpected": true,
+        ]
+        let data = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+        try data.write(to: fixture.paths.launchAgentURL)
+
+        let facts = try ReadOnlyLifecycleFactsProvider(
+            paths: fixture.paths,
+            ownerID: "owner-1",
+            commandRunner: launchctlRunner(),
+            processRunner: RecordingDiagnosticProcessRunner(processes: [])
+        ).inspect()
+
+        XCTAssertFalse(facts.launchAgentValid)
+    }
+
+    func testInstalledReleaseProviderReportsCompleteFixtureWithoutSecrets() throws {
+        let fixture = try makeReleaseFixture()
+        let runner = RecordingDiagnosticCommandRunner(outputs: [
+            DiagnosticCommandRequest(executable: "/usr/bin/file", arguments: ["-b", fixture.paths.helperExecutableURL.path]): .init(status: 0, stdout: "Mach-O 64-bit executable arm64", stderr: ""),
+            DiagnosticCommandRequest(executable: "/usr/bin/codesign", arguments: ["-dv", "--verbose=4", fixture.paths.appURL.path]): .init(status: 0, stdout: "", stderr: "Authority=Developer ID Application"),
+            DiagnosticCommandRequest(executable: "/usr/bin/codesign", arguments: ["--verify", "--deep", "--strict", fixture.paths.appURL.path]): .init(status: 0, stdout: "", stderr: ""),
+            DiagnosticCommandRequest(executable: "/usr/bin/file", arguments: ["-b", fixture.paths.runtimePythonURL.path]): .init(status: 0, stdout: "Mach-O 64-bit executable arm64", stderr: ""),
+            DiagnosticCommandRequest(executable: fixture.paths.runtimePythonURL.path, arguments: ["--version"]): .init(status: 0, stdout: "Python 3.13.14\n", stderr: ""),
+        ])
+
+        let facts = try ReadOnlyInstalledReleaseFactsProvider(paths: fixture.paths, commandRunner: runner).inspect()
+
+        XCTAssertTrue(facts.helperPresent)
+        XCTAssertTrue(facts.ownershipMarkerPresent)
+        XCTAssertTrue(facts.runtime.structurallyValid)
+        XCTAssertEqual(facts.helper.architecture, "arm64")
+        XCTAssertFalse(String(describing: facts).contains("connector"))
+    }
+
+    func testDiskProviderReportsCriticalSymlinkWithoutFollowingIt() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let target = root.appendingPathComponent("target")
+        let link = root.appendingPathComponent("critical")
+        try Data("safe".utf8).write(to: target)
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: target)
+
+        let facts = try ReadOnlyDiskSpaceProvider(filesystemURL: root, criticalPaths: [link]).inspect()
+
+        XCTAssertTrue(facts.filesystemAccessible)
+        XCTAssertEqual(facts.criticalPathSymlinkCount, 1)
+    }
+
+    private struct LifecycleFixture {
+        let root: URL
+        let paths: DiagnosticPathSet
+    }
+
+    private func makeLifecycleFixture() throws -> LifecycleFixture {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let support = root.appendingPathComponent("support", isDirectory: true)
+        let home = root.appendingPathComponent("home", isDirectory: true)
+        try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: pathsLaunchAgentParent(home), withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+        return LifecycleFixture(root: root, paths: DiagnosticPathSet(supportDirectory: support, homeDirectory: home))
+    }
+
+    private func pathsLaunchAgentParent(_ home: URL) -> URL {
+        home.appendingPathComponent("Library/LaunchAgents", isDirectory: true)
+    }
+
+    private func writeSupportedLaunchAgent(to url: URL, helper: URL) throws {
+        let plist: [String: Any] = [
+            "Label": "com.jay.mac-orchestrator",
+            "ProgramArguments": [helper.path],
+            "RunAtLoad": true,
+            "KeepAlive": ["SuccessfulExit": false],
+            "LimitLoadToSessionType": "Aqua",
+        ]
+        let data = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+        try data.write(to: url)
+    }
+
+    private func launchctlRunner() -> RecordingDiagnosticCommandRunner {
+        RecordingDiagnosticCommandRunner(outputs: [
+            DiagnosticCommandRequest(
+                executable: "/bin/launchctl",
+                arguments: ["print", "gui/\(getuid())/com.jay.mac-orchestrator"]
+            ): .init(status: 0, stdout: "", stderr: "")
+        ])
+    }
+
+    private func makeReleaseFixture() throws -> (paths: DiagnosticPathSet, root: URL) {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let support = root.appendingPathComponent("support", isDirectory: true)
+        let paths = DiagnosticPathSet(supportDirectory: support, homeDirectory: root.appendingPathComponent("home"))
+        try FileManager.default.createDirectory(at: paths.helperExecutableURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: paths.runtimePythonURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("1.2.3".utf8).write(to: paths.runtimeMarkerURL)
+        try Data().write(to: paths.helperExecutableURL)
+        try Data().write(to: paths.runtimePythonURL)
+        try Data().write(to: paths.runtimeScriptURL)
+        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+        return (paths, root)
     }
 }
 
@@ -210,10 +513,17 @@ private final class RecordingActivationProbe: LocalActivationProbeRunning, @unch
     }
 
     let result: Result<LocalActivationProbeDetails, Error>
+    let outcome: LocalActivationProbeOutcome?
     var calls: [Call] = []
 
     init(result: Result<LocalActivationProbeDetails, Error>) {
         self.result = result
+        self.outcome = nil
+    }
+
+    init(outcome: LocalActivationProbeOutcome) {
+        self.result = .failure(LocalActivationProbeError.transport("recorded outcome"))
+        self.outcome = outcome
     }
 
     func runDetailed(
@@ -227,6 +537,40 @@ private final class RecordingActivationProbe: LocalActivationProbeRunning, @unch
             requiresInteractiveUI: requiresInteractiveUI
         ))
         return try result.get()
+    }
+
+    func runOutcome(
+        port: Int,
+        capabilityToken: String,
+        requiresInteractiveUI: Bool
+    ) async -> LocalActivationProbeOutcome {
+        calls.append(Call(
+            port: port,
+            token: capabilityToken,
+            requiresInteractiveUI: requiresInteractiveUI
+        ))
+        if let outcome { return outcome }
+        do {
+            return .init(phase: .safeCall, details: try result.get())
+        } catch let error as LocalActivationProbeError {
+            return .init(phase: .health, error: error)
+        } catch {
+            return .init(phase: .health, error: .transport("recorded failure"))
+        }
+    }
+}
+
+private final class RecordingDiagnosticKeychainPresenceProvider: KeychainPresenceProviding, @unchecked Sendable {
+    let facts: KeychainPresenceFacts
+    var calls = 0
+
+    init(facts: KeychainPresenceFacts) {
+        self.facts = facts
+    }
+
+    func inspect() throws -> KeychainPresenceFacts {
+        calls += 1
+        return facts
     }
 }
 

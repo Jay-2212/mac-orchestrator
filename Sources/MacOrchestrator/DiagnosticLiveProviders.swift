@@ -17,6 +17,12 @@ protocol LocalActivationProbeRunning: Sendable {
         capabilityToken: String,
         requiresInteractiveUI: Bool
     ) async throws -> LocalActivationProbeDetails
+
+    func runOutcome(
+        port: Int,
+        capabilityToken: String,
+        requiresInteractiveUI: Bool
+    ) async -> LocalActivationProbeOutcome
 }
 
 extension LocalActivationProbe: LocalActivationProbeRunning {}
@@ -29,7 +35,7 @@ struct CurrentCoreMCPExpectations: Equatable, Sendable {
 
 struct CurrentCoreMCPExpectationProvider: Sendable {
     private static let orientationTools: Set<String> = [
-        "describe", "get_capabilities", "get_session_state", "play_sound_for_user_prompt", "clipboard"
+        "describe", "get_capabilities", "get_session_state", "play_sound_for_user_prompt"
     ]
     fileprivate static let uiTools: Set<String> = [
         "get_available_apps", "get_screen_size", "get_screen_layout", "get_ui_tree",
@@ -40,6 +46,7 @@ struct CurrentCoreMCPExpectationProvider: Sendable {
     private static let fileReadTools: Set<String> = ["find_file", "read_file", "list_directory", "smart_search"]
     private static let fileWriteTools: Set<String> = ["write_file"]
     private static let shellTools: Set<String> = ["run_terminal_command"]
+    private static let clipboardTools: Set<String> = ["clipboard"]
     private static let telegramTools: Set<String> = ["send_file_to_telegram"]
 
     init() {}
@@ -53,6 +60,7 @@ struct CurrentCoreMCPExpectationProvider: Sendable {
         add("mac.files.read", tools: Self.fileReadTools, to: &tools, groups: &groups, configuration: configuration)
         add("mac.files.write", tools: Self.fileWriteTools, to: &tools, groups: &groups, configuration: configuration)
         add("mac.shell", tools: Self.shellTools, to: &tools, groups: &groups, configuration: configuration)
+        add("mac.clipboard.write", tools: Self.clipboardTools, to: &tools, groups: &groups, configuration: configuration)
         add("telegram.send", tools: Self.telegramTools, to: &tools, groups: &groups, configuration: configuration)
 
         let currentOptionalGroups = [
@@ -124,33 +132,36 @@ struct LocalActivationProbeAdapter {
         guard let token else { return empty }
 
         do {
-            let details = try await probe.runDetailed(
+            let outcome = await probe.runOutcome(
                 port: port,
                 capabilityToken: token,
                 requiresInteractiveUI: configuration.desiredCapabilities["mac.ui"] == true
             )
+            if let details = outcome.details {
+                return LocalMCPFacts(
+                    livenessVerified: true,
+                    readinessVerified: details.safeCallSucceeded,
+                    sessionEstablished: true,
+                    safeCallSucceeded: details.safeCallSucceeded,
+                    expectedTools: expectations.expectedTools,
+                    exposedTools: details.exposedTools,
+                    expectedCapabilityGroups: expectations.expectedCapabilityGroups,
+                    exposedCapabilityGroups: groups(for: details.exposedTools, expectations: expectations)
+                )
+            }
+            let liveness = outcome.phase != .health || outcome.error.map {
+                if case .healthCheckFailed = $0 { return true }
+                return false
+            } ?? false
+            let session = outcome.phase == .initialized || outcome.phase == .toolsList || outcome.phase == .safeCall
             return LocalMCPFacts(
-                livenessVerified: true,
-                readinessVerified: details.safeCallSucceeded,
-                sessionEstablished: true,
-                safeCallSucceeded: details.safeCallSucceeded,
-                expectedTools: expectations.expectedTools,
-                exposedTools: details.exposedTools,
-                expectedCapabilityGroups: expectations.expectedCapabilityGroups,
-                exposedCapabilityGroups: groups(for: details.exposedTools, expectations: expectations)
-            )
-        } catch let error as LocalActivationProbeError {
-            let state = state(for: error)
-            return LocalMCPFacts(
-                livenessVerified: state.liveness,
+                livenessVerified: liveness,
                 readinessVerified: false,
-                sessionEstablished: state.session,
+                sessionEstablished: session,
                 safeCallSucceeded: false,
                 expectedTools: expectations.expectedTools,
                 expectedCapabilityGroups: expectations.expectedCapabilityGroups
             )
-        } catch {
-            return empty
         }
     }
 
@@ -166,6 +177,7 @@ struct LocalActivationProbeAdapter {
             ("mac.files.read", ["find_file", "read_file", "list_directory", "smart_search"]),
             ("mac.files.write", ["write_file"]),
             ("mac.shell", ["run_terminal_command"]),
+            ("mac.clipboard.write", ["clipboard"]),
             ("telegram.send", ["send_file_to_telegram"]),
         ]
         for (group, requiredTools) in groupTools {
@@ -177,18 +189,6 @@ struct LocalActivationProbeAdapter {
         return exposed
     }
 
-    private func state(for error: LocalActivationProbeError) -> (liveness: Bool, session: Bool) {
-        switch error {
-        case .transport, .invalidCapabilityToken:
-            return (false, false)
-        case .healthCheckFailed:
-            return (true, false)
-        case let .mcpRequestFailed(method, _), let .mcpResponseInvalid(method), let .mcpError(method, _):
-            return (true, method != "initialize")
-        case .missingSessionID:
-            return (true, false)
-        }
-    }
 }
 
 struct DiagnosticPathSet: Sendable {
@@ -514,53 +514,103 @@ struct ReadOnlyLifecycleFactsProvider: LifecycleFactsProviding {
         } else {
             serviceRunning = false
         }
-        let state = readOwnedState()
+        let stateResult = readOwnedState()
+        let state = stateResult.state
         let processes = processRunner.snapshot()
-        let owned = processes.filter { process in
-            ProcessOwnership.matches(commandLine: process.commandLine, component: .server, ownerID: ownerID)
-                || ProcessOwnership.matches(commandLine: process.commandLine, component: .tunnel, ownerID: ownerID)
+        let runningProcesses = processes.filter(\.running)
+        let serverProcesses = runningProcesses.filter {
+            ProcessOwnership.matches(commandLine: $0.commandLine, component: .server, ownerID: ownerID)
+                && !ProcessOwnership.matches(commandLine: $0.commandLine, component: .tunnel, ownerID: ownerID)
+        }
+        let tunnelProcesses = runningProcesses.filter {
+            ProcessOwnership.matches(commandLine: $0.commandLine, component: .tunnel, ownerID: ownerID)
+                && !ProcessOwnership.matches(commandLine: $0.commandLine, component: .server, ownerID: ownerID)
         }
         let serverPID = state?.serverPID
         let tunnelPID = state?.tunnelPID
-        let pidReuse = [serverPID, tunnelPID].compactMap { $0 }.contains { pid in
-            guard let process = processes.first(where: { $0.pid == pid }) else { return true }
-            return !ProcessOwnership.matches(commandLine: process.commandLine, component: .server, ownerID: ownerID)
-                && !ProcessOwnership.matches(commandLine: process.commandLine, component: .tunnel, ownerID: ownerID)
-        }
-        let serverOwnedCount = owned.filter {
-            ProcessOwnership.matches(commandLine: $0.commandLine, component: .server, ownerID: ownerID)
-        }.count
-        let tunnelOwnedCount = owned.filter {
-            ProcessOwnership.matches(commandLine: $0.commandLine, component: .tunnel, ownerID: ownerID)
-        }.count
+        let stateOwnerMatches = state?.ownerID == ownerID
+        let duplicateAssignment = serverPID != nil && serverPID == tunnelPID
+        let serverAssignmentValid = serverPID.map { pid in
+            serverProcesses.count == 1 && serverProcesses[0].pid == pid
+        } ?? true
+        let tunnelAssignmentValid = tunnelPID.map { pid in
+            tunnelProcesses.count == 1 && tunnelProcesses[0].pid == pid
+        } ?? true
+        let pidReuse = stateResult.malformed
+            || (state != nil && !stateOwnerMatches)
+            || !serverAssignmentValid
+            || !tunnelAssignmentValid
+        let duplicateOwnedProcesses = duplicateAssignment
+            || serverProcesses.count > 1
+            || tunnelProcesses.count > 1
+            || runningProcesses.contains {
+                ProcessOwnership.matches(commandLine: $0.commandLine, component: .server, ownerID: ownerID)
+                    && ProcessOwnership.matches(commandLine: $0.commandLine, component: .tunnel, ownerID: ownerID)
+            }
+        let ownedCount = serverProcesses.count + tunnelProcesses.count
         return LifecycleFacts(
             launchAgentPresent: launchAgentPresent,
             launchAgentValid: launchAgentValid,
             serviceRunning: serviceRunning,
-            ownedProcessCount: owned.count,
+            ownedProcessCount: ownedCount,
             serverPID: serverPID,
             tunnelPID: tunnelPID,
-            ownershipMarkerPresent: state?.ownerID == ownerID,
-            duplicateOwnedProcesses: serverOwnedCount > 1 || tunnelOwnedCount > 1,
+            ownershipMarkerPresent: stateOwnerMatches,
+            duplicateOwnedProcesses: duplicateOwnedProcesses,
             pidReuseDetected: pidReuse
         )
     }
 
     private func launchAgentIsValid() -> Bool {
-        guard label == Self.expectedLabel,
+        var metadata = stat()
+        let isSymlink = lstat(paths.launchAgentURL.path, &metadata) == 0
+            && UInt32(metadata.st_mode) & UInt32(S_IFMT) == UInt32(S_IFLNK)
+        guard !isSymlink,
+              label == Self.expectedLabel,
               let data = try? Data(contentsOf: paths.launchAgentURL),
               let object = try? PropertyListSerialization.propertyList(from: data, format: nil),
-              let plist = object as? [String: Any],
+              let plist = object as? [String: Any] else { return false }
+
+        let allowedKeys: Set<String> = [
+            "Label", "ProgramArguments", "RunAtLoad", "KeepAlive", "LimitLoadToSessionType",
+            "ThrottleInterval", "ProcessType", "StandardOutPath", "StandardErrorPath"
+        ]
+        guard Set(plist.keys).isSubset(of: allowedKeys),
               plist["Label"] as? String == label,
-              let arguments = plist["ProgramArguments"] as? [String],
-              arguments.first == paths.helperExecutableURL.path else { return false }
+              plist["ProgramArguments"] as? [String] == [paths.helperExecutableURL.path],
+              plist["RunAtLoad"] as? Bool == true,
+              plist["LimitLoadToSessionType"] as? String == "Aqua",
+              let keepAlive = plist["KeepAlive"] as? [String: Any],
+              keepAlive.count == 1,
+              keepAlive["SuccessfulExit"] as? Bool == false else { return false }
+
+        if let throttle = plist["ThrottleInterval"] as? Int, throttle != 5 { return false }
+        if plist["ThrottleInterval"] != nil && plist["ThrottleInterval"] as? Int == nil { return false }
+        if let processType = plist["ProcessType"] as? String, processType != "Interactive" { return false }
+        if plist["ProcessType"] != nil && plist["ProcessType"] as? String == nil { return false }
+        guard (plist["ThrottleInterval"] == nil) == (plist["ProcessType"] == nil) else { return false }
+        guard (plist["StandardOutPath"] == nil) == (plist["StandardErrorPath"] == nil) else { return false }
+        for key in ["StandardOutPath", "StandardErrorPath"] {
+            if let path = plist[key] as? String,
+               !path.hasSuffix("/Library/Logs/Mac Orchestrator/launcher.log") {
+                return false
+            }
+            if plist[key] != nil && plist[key] as? String == nil { return false }
+        }
         return true
     }
 
-    private func readOwnedState() -> OwnedProcessState? {
+    private func readOwnedState() -> (state: OwnedProcessState?, malformed: Bool) {
+        guard fileManager.fileExists(atPath: paths.ownedProcessesURL.path) else {
+            return (nil, false)
+        }
         guard let data = try? Data(contentsOf: paths.ownedProcessesURL),
-              let state = try? JSONDecoder().decode(OwnedProcessState.self, from: data) else { return nil }
-        return state
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              Set(object.keys).isSubset(of: ["ownerID", "serverPID", "tunnelPID"]),
+              let state = try? JSONDecoder().decode(OwnedProcessState.self, from: data) else {
+            return (nil, true)
+        }
+        return (state, false)
     }
 }
 
@@ -589,11 +639,14 @@ struct ReadOnlyPortFactsProvider: PortFactsProviding {
             arguments: ["-nP", "-iTCP:\(port)", "-sTCP:LISTEN", "-t"]
         ))
         let pids = result.status == 0 ? result.stdout.split(whereSeparator: \.isWhitespace).compactMap { Int32($0) } : []
-        guard let pid = pids.first else { return PortFacts(port: port) }
+        guard pids.count == 1, let pid = pids.first else {
+            guard !pids.isEmpty else { return PortFacts(port: port) }
+            return PortFacts(port: port, listenerPresent: true)
+        }
         let process = processRunner.snapshot().first(where: { $0.pid == pid })
         let owned = ownerID.map { owner in
             process.map {
-                ProcessOwnership.matches(commandLine: $0.commandLine, component: .server, ownerID: owner)
+                $0.running && ProcessOwnership.matches(commandLine: $0.commandLine, component: .server, ownerID: owner)
             } ?? false
         } ?? false
         let pidReuse = ownerID != nil && process != nil && !owned
@@ -607,6 +660,11 @@ struct ReadOnlyPortFactsProvider: PortFactsProviding {
     }
 }
 
+struct RemoteConnectorInspection: Equatable, Sendable {
+    let facts: RemoteConnectorFacts
+    let ngrokAuthtokenPresence: KeychainPresence?
+}
+
 struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
     private let desired: Bool
     private let binaryPresent: Bool
@@ -614,6 +672,7 @@ struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
     private let ownershipMarkerPresent: Bool
     private let target: String
     private let httpRunner: any DiagnosticHTTPRunning
+    private let keychainPresenceProvider: any KeychainPresenceProviding
 
     init(
         desired: Bool,
@@ -621,7 +680,8 @@ struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
         configurationPresent: Bool,
         target: String,
         ownershipMarkerPresent: Bool = false,
-        httpRunner: any DiagnosticHTTPRunning
+        httpRunner: any DiagnosticHTTPRunning,
+        keychainPresenceProvider: any KeychainPresenceProviding = ReadOnlySystemKeychainPresenceProvider()
     ) {
         self.desired = desired
         self.binaryPresent = binaryPresent
@@ -629,6 +689,7 @@ struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
         self.ownershipMarkerPresent = ownershipMarkerPresent
         self.target = target
         self.httpRunner = httpRunner
+        self.keychainPresenceProvider = keychainPresenceProvider
     }
 
     init(
@@ -638,7 +699,8 @@ struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
         target: String,
         ownershipMarkerPresent: Bool = false,
         httpRunner: any DiagnosticHTTPRunning,
-        fileManager: FileManager = .default
+        fileManager: FileManager = .default,
+        keychainPresenceProvider: any KeychainPresenceProviding = ReadOnlySystemKeychainPresenceProvider()
     ) {
         self.init(
             desired: desired,
@@ -646,7 +708,8 @@ struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
             configurationPresent: fileManager.fileExists(atPath: configurationURL.path),
             target: target,
             ownershipMarkerPresent: ownershipMarkerPresent,
-            httpRunner: httpRunner
+            httpRunner: httpRunner,
+            keychainPresenceProvider: keychainPresenceProvider
         )
     }
 
@@ -656,7 +719,8 @@ struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
         target: String,
         ownershipMarkerPresent: Bool = false,
         httpRunner: any DiagnosticHTTPRunning,
-        fileManager: FileManager = .default
+        fileManager: FileManager = .default,
+        keychainPresenceProvider: any KeychainPresenceProviding = ReadOnlySystemKeychainPresenceProvider()
     ) {
         self.init(
             desired: desired,
@@ -665,7 +729,8 @@ struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
             target: target,
             ownershipMarkerPresent: ownershipMarkerPresent,
             httpRunner: httpRunner,
-            fileManager: fileManager
+            fileManager: fileManager,
+            keychainPresenceProvider: keychainPresenceProvider
         )
     }
 
@@ -673,41 +738,51 @@ struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
         desired: Bool,
         target: String,
         httpRunner: any DiagnosticHTTPRunning,
-        fileManager: FileManager = .default
+        fileManager: FileManager = .default,
+        keychainPresenceProvider: any KeychainPresenceProviding = ReadOnlySystemKeychainPresenceProvider()
     ) {
         self.init(
             desired: desired,
             paths: .defaultPaths(fileManager: fileManager),
             target: target,
             httpRunner: httpRunner,
-            fileManager: fileManager
+            fileManager: fileManager,
+            keychainPresenceProvider: keychainPresenceProvider
         )
     }
 
     func inspect() throws -> RemoteConnectorFacts {
+        try inspectDetailed().facts
+    }
+
+    func inspectDetailed() throws -> RemoteConnectorInspection {
         guard desired else {
-            return RemoteConnectorFacts(desired: false)
+            return RemoteConnectorInspection(facts: RemoteConnectorFacts(desired: false), ngrokAuthtokenPresence: nil)
         }
+        let authPresence = (try? keychainPresenceProvider.inspect())?.presence(for: .ngrokAuthtoken) ?? .inaccessible
         let url = URL(string: "http://127.0.0.1:4040/api/endpoints")!
         guard let response = try? httpRunner.get(url), response.status == 200, response.url == url else {
-            return RemoteConnectorFacts(
+            return RemoteConnectorInspection(facts: RemoteConnectorFacts(
                 desired: true,
                 binaryPresent: binaryPresent,
                 configurationPresent: configurationPresent,
                 ownershipMarkerPresent: ownershipMarkerPresent
-            )
+            ), ngrokAuthtokenPresence: authPresence)
         }
         let endpointCount = (try? JSONSerialization.jsonObject(with: response.body) as? [String: Any])
             .flatMap { $0["endpoints"] as? [[String: Any]] }?.count ?? 0
         let endpointAvailable = endpointCount > 0
             && NgrokEndpointParser.publicURL(from: response.body, matching: target) != nil
-        return RemoteConnectorFacts(
-            desired: true,
-            binaryPresent: binaryPresent,
-            configurationPresent: configurationPresent,
-            endpointAvailable: endpointAvailable,
-            endpointCount: endpointCount,
-            ownershipMarkerPresent: ownershipMarkerPresent
+        return RemoteConnectorInspection(
+            facts: RemoteConnectorFacts(
+                desired: true,
+                binaryPresent: binaryPresent,
+                configurationPresent: configurationPresent,
+                endpointAvailable: endpointAvailable,
+                endpointCount: endpointCount,
+                ownershipMarkerPresent: ownershipMarkerPresent
+            ),
+            ngrokAuthtokenPresence: authPresence
         )
     }
 }

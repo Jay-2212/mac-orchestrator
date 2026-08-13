@@ -30,6 +30,37 @@ enum LocalActivationProbeError: Error, Equatable, LocalizedError, Sendable {
     }
 }
 
+enum LocalActivationProbePhase: String, Equatable, Sendable {
+    case health
+    case initialize
+    case initialized
+    case toolsList
+    case safeCall
+}
+
+struct LocalActivationProbeOutcome: Equatable, Sendable {
+    let phase: LocalActivationProbePhase
+    let details: LocalActivationProbeDetails?
+    let error: LocalActivationProbeError?
+
+    init(
+        phase: LocalActivationProbePhase,
+        details: LocalActivationProbeDetails? = nil,
+        error: LocalActivationProbeError? = nil
+    ) {
+        self.phase = phase
+        self.details = details
+        self.error = error
+    }
+
+    func get() throws -> LocalActivationProbeDetails {
+        if let details {
+            return details
+        }
+        throw error ?? LocalActivationProbeError.transport("activation failed")
+    }
+}
+
 struct LocalActivationProbe: Sendable {
     private static let expectedHealthBody = Data(#"{"status":"ok"}"#.utf8)
     private static let protocolVersion = "2025-06-18"
@@ -61,6 +92,20 @@ struct LocalActivationProbe: Sendable {
         capabilityToken: String,
         requiresInteractiveUI: Bool = false
     ) async throws -> LocalActivationProbeDetails {
+        try await runOutcome(
+            port: port,
+            capabilityToken: capabilityToken,
+            requiresInteractiveUI: requiresInteractiveUI
+        ).get()
+    }
+
+    func runOutcome(
+        port: Int,
+        capabilityToken: String,
+        requiresInteractiveUI: Bool = false
+    ) async -> LocalActivationProbeOutcome {
+        var phase: LocalActivationProbePhase = .health
+        do {
         let healthURL = URL(string: "http://127.0.0.1:\(port)/__mac_orchestrator_health")!
         var healthRequest = URLRequest(url: healthURL)
         healthRequest.httpMethod = "GET"
@@ -84,6 +129,7 @@ struct LocalActivationProbe: Sendable {
             )
         }
 
+        phase = .initialize
         guard let mcpURL = URL(string: "http://127.0.0.1:\(port)/\(capabilityToken)/mcp") else {
             throw LocalActivationProbeError.invalidCapabilityToken
         }
@@ -111,6 +157,7 @@ struct LocalActivationProbe: Sendable {
         try validateResult(initialize.body, method: "initialize", expectedID: 1)
         try validateInitialize(initialize.body)
 
+        phase = .initialized
         let initialized = try await request(
             url: mcpURL,
             method: "notifications/initialized",
@@ -125,6 +172,7 @@ struct LocalActivationProbe: Sendable {
             )
         }
 
+        phase = .toolsList
         let tools = try await request(
             url: mcpURL,
             method: "tools/list",
@@ -140,6 +188,7 @@ struct LocalActivationProbe: Sendable {
         }
         let exposedTools = try validateToolsList(tools.body, expectedID: 2)
 
+        phase = .safeCall
         let safeCall = try await request(
             url: mcpURL,
             method: "tools/call",
@@ -161,10 +210,18 @@ struct LocalActivationProbe: Sendable {
             expectedID: 3,
             requiresInteractiveUI: requiresInteractiveUI
         )
-        return LocalActivationProbeDetails(
-            exposedTools: exposedTools,
-            safeCallSucceeded: true
+        return LocalActivationProbeOutcome(
+            phase: .safeCall,
+            details: LocalActivationProbeDetails(
+                exposedTools: exposedTools,
+                safeCallSucceeded: true
+            )
         )
+        } catch let error as LocalActivationProbeError {
+            return LocalActivationProbeOutcome(phase: phase, error: error)
+        } catch {
+            return LocalActivationProbeOutcome(phase: phase, error: .transport("network failure"))
+        }
     }
 
     private func request(

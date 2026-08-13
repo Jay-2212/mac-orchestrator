@@ -270,6 +270,35 @@ final class LocalActivationProbeTests: XCTestCase {
         }
     }
 
+    func testProbeOutcomeRetainsPostHealthPhaseForRedirectedMCPResponse() async throws {
+        ActivationProbeURLProtocol.handler = { request in
+            switch request.url?.path {
+            case "/__mac_orchestrator_health":
+                return .init(status: 200, body: Data(#"{"status":"ok"}"#.utf8))
+            case "/connector-token/mcp":
+                return .init(
+                    status: 200,
+                    body: Self.rpcResult(["protocolVersion": "2025-06-18"], id: 1),
+                    headers: ["Mcp-Session-Id": "session-123"],
+                    responseURL: URL(string: "http://127.0.0.1:8001/redirected")
+                )
+            default:
+                XCTFail("Unexpected URL: \(request.url?.absoluteString ?? "nil")")
+                return .init(status: 404, body: Data())
+            }
+        }
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ActivationProbeURLProtocol.self]
+        let probe = LocalActivationProbe(session: URLSession(configuration: configuration))
+
+        let outcome = await probe.runOutcome(port: 8_000, capabilityToken: "connector-token")
+
+        XCTAssertEqual(outcome.phase, .initialize)
+        XCTAssertEqual(outcome.error, .transport("unexpected redirect"))
+        XCTAssertNil(outcome.details)
+    }
+
     func testProbeRejectsMismatchedJSONRPCResponseID() async throws {
         ActivationProbeURLProtocol.handler = { request in
             switch request.url?.path {

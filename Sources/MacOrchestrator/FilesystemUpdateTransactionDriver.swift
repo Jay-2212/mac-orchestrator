@@ -197,7 +197,9 @@ struct FilesystemUpdateTransactionDriver: UpdateTransactionDriver {
                 let present = fileManager.fileExists(atPath: url.path)
                 presence[name] = present
                 if present {
-                    guard !containsSymlink(url), isOwned(url) else { throw FilesystemUpdateError.unsafePath }
+                    guard isSafeOwnedItem(url, directory: url.hasDirectoryPath) else {
+                        throw FilesystemUpdateError.unsafePath
+                    }
                     try fileManager.copyItem(at: url, to: root.appendingPathComponent(name, isDirectory: url.hasDirectoryPath))
                 }
             }
@@ -320,14 +322,36 @@ struct FilesystemUpdateTransactionDriver: UpdateTransactionDriver {
 
     func rollback(transactionID: UUID) throws {
         let previous = transactionRoot(transactionID).appendingPathComponent("previous", isDirectory: true)
-        guard let data = try? Data(contentsOf: previous.appendingPathComponent("presence.json")),
-              let presence = try? JSONSerialization.jsonObject(with: data) as? [String: Bool] else {
+        guard isSafeOwnedItem(previous, directory: true),
+              let data = try? Data(contentsOf: previous.appendingPathComponent("presence.json")),
+              let presence = try? JSONSerialization.jsonObject(with: data) as? [String: Bool],
+              Set(presence.keys) == Set(activePaths.map(\.0) + ["receipt", "launchAgent"]) else {
             throw FilesystemUpdateError.backupFailed
+        }
+        for (name, _) in activePaths where presence[name] == true {
+            guard isSafeOwnedItem(
+                previous.appendingPathComponent(name, isDirectory: name != "config.json"),
+                directory: name != "config.json"
+            ) else {
+                throw FilesystemUpdateError.unsafePath
+            }
+        }
+        if presence["receipt"] == true {
+            guard isSafeOwnedItem(previous.appendingPathComponent("receipt.json"), directory: false) else {
+                throw FilesystemUpdateError.unsafePath
+            }
+        }
+        if presence["launchAgent"] == true {
+            guard isSafeOwnedItem(previous.appendingPathComponent("launch-agent.plist"), directory: false) else {
+                throw FilesystemUpdateError.unsafePath
+            }
         }
         do {
             for (name, active) in activePaths where name != "config.json" {
                 if fileManager.fileExists(atPath: active.path) {
-                    guard !containsSymlink(active), isOwned(active) else { throw FilesystemUpdateError.unsafePath }
+                    guard isSafeOwnedItem(active, directory: true) else {
+                        throw FilesystemUpdateError.unsafePath
+                    }
                     try fileManager.removeItem(at: active)
                 }
                 if presence[name] == true {
@@ -339,11 +363,16 @@ struct FilesystemUpdateTransactionDriver: UpdateTransactionDriver {
                 let saved = previous.appendingPathComponent("config.json", isDirectory: false)
                 try writeOwned(try Data(contentsOf: saved), to: configurationURL)
             } else if fileManager.fileExists(atPath: configurationURL.path) {
+                guard isSafeOwnedItem(configurationURL, directory: false) else {
+                    throw FilesystemUpdateError.unsafePath
+                }
                 try fileManager.removeItem(at: configurationURL)
             }
             let receiptURL = installDirectory.appendingPathComponent(InstallationReceiptStore.receiptFileName, isDirectory: false)
             if fileManager.fileExists(atPath: receiptURL.path) {
-                guard !containsSymlink(receiptURL), isOwned(receiptURL) else { throw FilesystemUpdateError.unsafePath }
+                guard isSafeOwnedItem(receiptURL, directory: false) else {
+                    throw FilesystemUpdateError.unsafePath
+                }
                 try fileManager.removeItem(at: receiptURL)
             }
             if presence["receipt"] == true {
@@ -352,13 +381,18 @@ struct FilesystemUpdateTransactionDriver: UpdateTransactionDriver {
                 try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: receiptURL.path)
             }
             if fileManager.fileExists(atPath: launchAgentURL.path) {
-                guard !containsSymlink(launchAgentURL), isOwned(launchAgentURL) else { throw FilesystemUpdateError.unsafePath }
+                guard isSafeOwnedItem(launchAgentURL, directory: false) else {
+                    throw FilesystemUpdateError.unsafePath
+                }
                 try fileManager.removeItem(at: launchAgentURL)
             }
             if presence["launchAgent"] == true {
                 let saved = previous.appendingPathComponent("launch-agent.plist", isDirectory: false)
                 guard !containsSymlink(launchAgentURL.deletingLastPathComponent()),
-                      isOwned(launchAgentURL.deletingLastPathComponent()) else { throw FilesystemUpdateError.unsafePath }
+                      isOwned(launchAgentURL.deletingLastPathComponent()),
+                      isSafeOwnedItem(saved, directory: false) else {
+                    throw FilesystemUpdateError.unsafePath
+                }
                 try fileManager.copyItem(at: saved, to: launchAgentURL)
                 try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: launchAgentURL.path)
             }
@@ -619,6 +653,11 @@ struct FilesystemUpdateTransactionDriver: UpdateTransactionDriver {
             stack.append(contentsOf: children)
         }
         return false
+    }
+
+    private func isSafeOwnedItem(_ url: URL, directory: Bool) -> Bool {
+        guard fileManager.fileExists(atPath: url.path), isOwned(url) else { return false }
+        return directory ? !containsSymlinkInTree(url) : !containsSymlink(url)
     }
 
     private func isOwned(_ url: URL) -> Bool {

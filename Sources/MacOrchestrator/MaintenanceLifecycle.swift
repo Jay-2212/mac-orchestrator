@@ -131,6 +131,7 @@ struct LaunchAgentMaintenanceController: MaintenanceServiceController {
     let launchctlURL: URL
     let launchAgentLabel: String
     let launchAgentURL: URL
+    let launchAgentContract: ManagedLaunchAgentContract
     let remoteStop: () throws -> Void
     let localStop: () throws -> Void
     let unloadService: () throws -> Void
@@ -141,6 +142,7 @@ struct LaunchAgentMaintenanceController: MaintenanceServiceController {
         launchctlURL: URL = URL(fileURLWithPath: "/bin/launchctl"),
         launchAgentLabel: String = "gui/\(getuid())/com.jay.mac-orchestrator",
         launchAgentURL: URL? = nil,
+        contract: ManagedLaunchAgentContract? = nil,
         remoteStop: (() throws -> Void)? = nil,
         localStop: (() throws -> Void)? = nil,
         restoreServices: (() throws -> Void)? = nil
@@ -148,9 +150,9 @@ struct LaunchAgentMaintenanceController: MaintenanceServiceController {
         self.runner = runner
         self.launchctlURL = launchctlURL
         self.launchAgentLabel = launchAgentLabel
-        let resolvedLaunchAgentURL = (launchAgentURL ?? FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/LaunchAgents", isDirectory: true)
-            .appendingPathComponent("com.jay.mac-orchestrator.plist", isDirectory: false)).standardizedFileURL
+        let resolvedContract = contract ?? ManagedLaunchAgentContract()
+        self.launchAgentContract = resolvedContract
+        let resolvedLaunchAgentURL = (launchAgentURL ?? resolvedContract.launchAgentURL).standardizedFileURL
         self.launchAgentURL = resolvedLaunchAgentURL
 
         let stopLoadedService: () throws -> Void = {
@@ -169,7 +171,10 @@ struct LaunchAgentMaintenanceController: MaintenanceServiceController {
         }
         let restoreLoadedService: () throws -> Void = {
             guard LaunchAgentMaintenanceController.isSafeLaunchAgentPath(resolvedLaunchAgentURL),
-                  FileManager.default.fileExists(atPath: resolvedLaunchAgentURL.path) else {
+                  LaunchAgentMaintenanceController.matchesCanonicalContract(
+                      resolvedLaunchAgentURL,
+                      contract: resolvedContract
+                  ) else {
                 throw MaintenanceLifecycleError.restoreFailed
             }
             let domain = launchAgentLabel.split(separator: "/").dropLast().joined(separator: "/")
@@ -190,7 +195,11 @@ struct LaunchAgentMaintenanceController: MaintenanceServiceController {
     }
 
     func verifyOwnership(ownerID: String) throws -> Bool {
-        guard ownerID == String(getuid()), Self.isSafeLaunchAgentPath(launchAgentURL) else { return false }
+        guard ownerID == String(getuid()),
+              launchAgentURL == launchAgentContract.launchAgentURL,
+              Self.matchesCanonicalContract(launchAgentURL, contract: launchAgentContract) else {
+            return false
+        }
         let result = try runner.run(executable: launchctlURL, arguments: ["print", launchAgentLabel])
         return result.status == 0 && result.output.contains("com.jay.mac-orchestrator")
     }
@@ -217,6 +226,18 @@ struct LaunchAgentMaintenanceController: MaintenanceServiceController {
               parentInfo.st_uid == getuid(),
               UInt32(parentInfo.st_mode) & 0o777 == 0o700 else { return false }
         return (try? fileManager.destinationOfSymbolicLink(atPath: url.path)) == nil
+    }
+
+    private static func matchesCanonicalContract(
+        _ url: URL,
+        contract: ManagedLaunchAgentContract
+    ) -> Bool {
+        guard isSafeLaunchAgentPath(url),
+              let data = try? Data(contentsOf: url),
+              let object = try? PropertyListSerialization.propertyList(from: data, format: nil) else {
+            return false
+        }
+        return contract.matches(object)
     }
 }
 

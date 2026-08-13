@@ -260,6 +260,40 @@ private struct TestUpdateLifecycle: MaintenanceLifecycleAdapter {
 }
 
 final class Phase3MaintenanceLifecycleIntegrationTests: XCTestCase {
+    func testLaunchAgentMaintenanceRequiresCanonicalContractBeforeOwnership() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phase3-maintenance-contract-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+
+        let home = root.appendingPathComponent("home", isDirectory: true)
+        let contract = ManagedLaunchAgentContract(homeDirectory: home)
+        let parent = contract.launchAgentURL.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: parent.path)
+
+        var malformed = contract.propertyList
+        malformed["RunAtLoad"] = false
+        let malformedData = try PropertyListSerialization.data(fromPropertyList: malformed, format: .xml, options: 0)
+        try malformedData.write(to: contract.launchAgentURL)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: contract.launchAgentURL.path)
+
+        let runner = StaticMaintenanceCommandRunner(
+            result: ProcessCommandResult(status: 0, output: "com.jay.mac-orchestrator")
+        )
+        let controller = LaunchAgentMaintenanceController(
+            runner: runner,
+            launchAgentURL: contract.launchAgentURL,
+            contract: contract
+        )
+
+        XCTAssertFalse(try controller.verifyOwnership(ownerID: String(getuid())))
+
+        try contract.propertyListData().write(to: contract.launchAgentURL, options: [.atomic])
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: contract.launchAgentURL.path)
+        XCTAssertTrue(try controller.verifyOwnership(ownerID: String(getuid())))
+    }
+
     func testQuiesceStopsRemoteIngressBeforeLocalServerAndRestoresBoth() throws {
         let controller = RecordingMaintenanceController()
         let adapter = ExternalMaintenanceLifecycleAdapter(ownerID: "test-owner", controller: controller)
@@ -318,6 +352,14 @@ private final class RecordingMaintenanceController: MaintenanceServiceController
 
     func restore() throws {
         events.append("restore")
+    }
+}
+
+private struct StaticMaintenanceCommandRunner: MaintenanceCommandRunner {
+    let result: ProcessCommandResult
+
+    func run(executable: URL, arguments: [String]) throws -> ProcessCommandResult {
+        result
     }
 }
 

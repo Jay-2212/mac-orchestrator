@@ -547,7 +547,6 @@ final class UninstallEngine {
     }
 
     private func safeRemovalPath(for kind: RemovalKind, url: URL) -> Bool {
-        if kind == .ownedProcesses { return true }
         if kind == .launchAgent {
             return pathValidator.safeKnownPath(url, expected: launchAgentURL, directory: false)
         }

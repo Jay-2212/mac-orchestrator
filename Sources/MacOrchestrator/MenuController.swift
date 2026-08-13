@@ -119,14 +119,14 @@ final class MenuController: NSObject {
     @objc private func enableConnector() { supervisor.enableConnectorRequested() }
     @objc private func disableConnector() { supervisor.disableConnectorRequested() }
     @objc private func restart() { supervisor.restartRequested() }
-    @objc private func runDoctor() { _ = TerminalCommand.run(arguments: ["doctor"]) }
+    @objc private func runDoctor() { runTerminalCommandInBackground(["doctor"]) }
     @objc private func repairPrimaryFailure() {
         let action = snapshot.server == .failed ? "retryMCPServer" : "retryRemoteConnector"
-        _ = TerminalCommand.run(arguments: ["doctor", "--repair", action])
+        runTerminalCommandInBackground(["doctor", "--repair", action])
     }
-    @objc private func previewSupportBundle() { _ = TerminalCommand.run(arguments: ["support-bundle", "--preview"]) }
-    @objc private func createSupportBundle() { _ = TerminalCommand.run(arguments: ["support-bundle", "--create"]) }
-    @objc private func checkForUpdates() { _ = TerminalCommand.run(arguments: ["update", "--check"]) }
+    @objc private func previewSupportBundle() { runTerminalCommandInBackground(["support-bundle", "--preview"]) }
+    @objc private func createSupportBundle() { runTerminalCommandInBackground(["support-bundle", "--create"]) }
+    @objc private func checkForUpdates() { runTerminalCommandInBackground(["update", "--check"]) }
     @objc private func applyUpdate() {
         let alert = NSAlert()
         alert.messageText = "Apply authenticated update?"
@@ -134,10 +134,16 @@ final class MenuController: NSObject {
         alert.addButton(withTitle: "Apply Update")
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
-        _ = TerminalCommand.run(arguments: ["update", "--apply"])
+        runTerminalCommandInBackground(["update", "--apply"])
     }
-    @objc private func planUninstall() { _ = TerminalCommand.run(arguments: ["uninstall", "--plan"]) }
+    @objc private func planUninstall() { runTerminalCommandInBackground(["uninstall", "--plan"]) }
     @objc private func openLogs() { supervisor.openLogs() }
     @objc private func openPrivacySettings() { supervisor.openPrivacySettings() }
     @objc private func quit() { NSApp.terminate(nil) }
+
+    private func runTerminalCommandInBackground(_ arguments: [String]) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            _ = TerminalCommand.run(arguments: arguments)
+        }
+    }
 }

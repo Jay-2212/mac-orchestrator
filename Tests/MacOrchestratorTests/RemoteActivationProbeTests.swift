@@ -66,7 +66,7 @@ final class RemoteActivationProbeTests: XCTestCase {
                         status: response.status,
                         body: response.body,
                         headers: response.headers,
-                        responseURL: URL(string: "https://redirected.example(self.credentialPath)")!
+                        responseURL: URL(string: "https://redirected.example\(self.credentialPath)")!
                     )
                 }
                 return response
@@ -74,9 +74,9 @@ final class RemoteActivationProbeTests: XCTestCase {
 
             let outcome = await makeProbe().runOutcome()
 
-            XCTAssertEqual(outcome.phase, testCase.phase, "redirect phase (testCase.method)")
-            XCTAssertEqual(outcome.error, .redirectedResponse, "redirect method (testCase.method)")
-            XCTAssertNil(outcome.details, "redirect method (testCase.method)")
+            XCTAssertEqual(outcome.phase, testCase.phase, "The redirect phase was unexpected.")
+            XCTAssertEqual(outcome.error, .redirectedResponse, "The redirect method was not rejected.")
+            XCTAssertNil(outcome.details, "A redirected probe must not return activation details.")
         }
     }
 
@@ -193,13 +193,13 @@ final class RemoteActivationProbeTests: XCTestCase {
 
     func testRemoteErrorsAndResultsNeverContainCredentialURLTokenOrPath() async throws {
         let credentialURL = URL(
-            string: "https://remote.example(credentialPath)?access_token=(connectorToken)"
+            string: "https://remote.example\(credentialPath)?access_token=\(connectorToken)"
         )!
         RemoteActivationURLProtocol.handler = { _ in
             .init(
                 status: 500,
                 body: Data(
-                    "server body (credentialURL.absoluteString) (connectorToken)".utf8
+                    "server body \(credentialURL.absoluteString) \(connectorToken)".utf8
                 )
             )
         }
@@ -219,9 +219,18 @@ final class RemoteActivationProbeTests: XCTestCase {
         ]
 
         for value in values {
-            XCTAssertFalse(value.contains(connectorToken), "secret leaked in: (value)")
-            XCTAssertFalse(value.contains(credentialURL.absoluteString), "URL leaked in: (value)")
-            XCTAssertFalse(value.contains(credentialPath), "path leaked in: (value)")
+            XCTAssertFalse(
+                value.contains(connectorToken),
+                "Remote probe output contained a synthetic connector token."
+            )
+            XCTAssertFalse(
+                value.contains(credentialURL.absoluteString),
+                "Remote probe output contained the credential URL."
+            )
+            XCTAssertFalse(
+                value.contains(credentialPath),
+                "Remote probe output contained the credential path."
+            )
         }
 
         RemoteActivationURLProtocol.handler = Self.successHandler()
@@ -235,7 +244,7 @@ final class RemoteActivationProbeTests: XCTestCase {
 
     private func makeProbe() -> RemoteActivationProbe {
         RemoteActivationProbe(
-            url: URL(string: "https://remote.example(credentialPath)?access_token=(connectorToken)")!,
+            url: URL(string: "https://remote.example\(credentialPath)?access_token=\(connectorToken)")!,
             expectedTools: ["get_session_state"],
             session: Self.makeSession()
         )

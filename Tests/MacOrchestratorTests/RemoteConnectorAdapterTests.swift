@@ -105,14 +105,17 @@ final class RemoteConnectorAdapterTests: XCTestCase {
             ]
         )
         XCTAssertEqual(specification.environment["PATH"], "/usr/bin")
-        XCTAssertEqual(specification.environment["NGROK_AUTHTOKEN"], "synthetic-ngrok-token")
+        XCTAssertTrue(
+            specification.environment["NGROK_AUTHTOKEN"] == "synthetic-ngrok-token",
+            "The launch environment did not retain the in-memory authentication token."
+        )
         XCTAssertFalse(String(describing: specification).contains("synthetic-ngrok-token"))
         XCTAssertFalse(String(reflecting: specification).contains("synthetic-ngrok-token"))
     }
 
     func testPrerequisiteValidationReportsMissingProviderInputs() throws {
         let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent("mac-orchestrator-ngrok-adapter-(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("mac-orchestrator-ngrok-adapter-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
 

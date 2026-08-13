@@ -33,6 +33,7 @@ final class ProcessSupervisor {
     private var ownerID = ""
     private var activationSucceeded = false
     private var activationInFlight = false
+    private var serverLaunchGeneration: UInt64 = 0
 
     private var serverDesired: Bool {
         lifecycle.desiredState(for: .mcpServer).isEnabled
@@ -101,7 +102,9 @@ final class ProcessSupervisor {
     }
 
     func reportStartupFailure(_ error: Error) {
-        fail("Configuration startup failed: \(error.localizedDescription)")
+        let message = "Configuration startup failed: \(error.localizedDescription)"
+        lifecycle.markStructuralFailure(for: .mcpServer, reason: message)
+        appLog.write("ERROR: \(message)")
     }
 
     func startServerRequested() {
@@ -187,8 +190,7 @@ final class ProcessSupervisor {
 
     func retry(component: ManagedComponentID) {
         if component == .mcpServer {
-            activationSucceeded = false
-            activationInFlight = false
+            invalidateServerActivation()
         } else {
             snapshot.connectorURL = nil
         }
@@ -272,6 +274,7 @@ final class ProcessSupervisor {
         requiresClientRefresh: Bool,
         resetFailureHistory: Bool = false
     ) {
+        invalidateServerActivation()
         activeContract = contract
         ownerID = contract.configuration.ownerID
         lifecycle.synchronizeDesiredStates(
@@ -315,8 +318,9 @@ final class ProcessSupervisor {
     }
 
     private func startServer() {
-        guard !quitting, serverDesired, serverProcess == nil,
+        guard !quitting, !lifecycle.isQuiescing, serverDesired, serverProcess == nil,
               let contract = activeContract else { return }
+        beginServerLaunch()
         lifecycle.markStarting(for: .mcpServer)
         let python = runtimeDirectory.appendingPathComponent(".venv/bin/python")
         let script = runtimeDirectory.appendingPathComponent("automac_mcp.py")
@@ -357,6 +361,7 @@ final class ProcessSupervisor {
                 guard let self,
                       let process = self.serverProcess,
                       ObjectIdentifier(process) == processID else { return }
+                self.invalidateServerActivation()
                 self.serverProcess = nil
                 self.persistState()
                 if !self.quitting && self.serverDesired {
@@ -385,7 +390,8 @@ final class ProcessSupervisor {
     }
 
     private func startTunnel() {
-        guard !quitting, tunnelDesired, lifecycle.snapshot.mcpServer.isReady, tunnelProcess == nil,
+        guard !quitting, !lifecycle.isQuiescing, tunnelDesired,
+              lifecycle.snapshot.mcpServer.isReady, tunnelProcess == nil,
               let contract = activeContract else { return }
         lifecycle.markStarting(for: .remoteConnector)
         guard FileManager.default.isExecutableFile(atPath: ngrokBinaryURL.path) else {
@@ -464,8 +470,7 @@ final class ProcessSupervisor {
     }
 
     private func stopServerProcess() {
-        activationSucceeded = false
-        activationInFlight = false
+        invalidateServerActivation()
         guard let process = serverProcess else {
             lifecycle.markStopped(for: .mcpServer)
             return
@@ -522,14 +527,16 @@ final class ProcessSupervisor {
             if self.activationSucceeded {
                 checkLightweightHealth(
                     processID: ObjectIdentifier(process),
-                    healthURL: contract.healthURL
+                    healthURL: contract.healthURL,
+                    launchGeneration: serverLaunchGeneration
                 )
             } else if !activationInFlight {
                 guard let connectorToken = contract.environment["MAC_ORCHESTRATOR_CONNECTOR_TOKEN"],
                       !connectorToken.isEmpty else {
                     lifecycle.markFailed(
                         for: .mcpServer,
-                        reason: "The managed connector token is unavailable; activation is blocked."
+                        reason: "The managed connector token is unavailable; activation is blocked.",
+                        liveness: .running
                     )
                     return
                 }
@@ -537,7 +544,8 @@ final class ProcessSupervisor {
                 runActivationProbe(
                     processID: ObjectIdentifier(process),
                     port: contract.port,
-                    capabilityToken: connectorToken
+                    capabilityToken: connectorToken,
+                    launchGeneration: serverLaunchGeneration
                 )
             }
         } else if serverDesired && !quitting {
@@ -549,14 +557,23 @@ final class ProcessSupervisor {
         }
     }
 
-    private func checkLightweightHealth(processID: ObjectIdentifier, healthURL: URL) {
+    private func checkLightweightHealth(
+        processID: ObjectIdentifier,
+        healthURL: URL,
+        launchGeneration: UInt64
+    ) {
         var request = URLRequest(url: healthURL)
         request.timeoutInterval = 1
         NoRedirectURLSession.make().dataTask(with: request) { [weak self, processID] data, response, _ in
             Task { @MainActor [weak self, processID] in
                 guard let self,
                       let current = self.serverProcess,
-                      ObjectIdentifier(current) == processID else { return }
+                      current.isRunning,
+                      ObjectIdentifier(current) == processID,
+                      self.serverLaunchGeneration == launchGeneration,
+                      self.serverDesired,
+                      !self.quitting,
+                      !self.lifecycle.isQuiescing else { return }
                 let expectedBody = Data(#"{"status":"ok"}"#.utf8)
                 let isHealthy = (response as? HTTPURLResponse)?.statusCode == 200 &&
                     (response as? HTTPURLResponse)?.url == healthURL &&
@@ -575,25 +592,36 @@ final class ProcessSupervisor {
     private func runActivationProbe(
         processID: ObjectIdentifier,
         port: Int,
-        capabilityToken: String
+        capabilityToken: String,
+        launchGeneration: UInt64
     ) {
-        Task { @MainActor [weak self, processID] in
+        Task { @MainActor [weak self, processID, launchGeneration] in
             guard let self else { return }
+            guard self.isCurrentServerActivation(
+                processID: processID,
+                launchGeneration: launchGeneration
+            ) else { return }
             do {
                 try await LocalActivationProbe().run(
                     port: port,
                     capabilityToken: capabilityToken,
                     requiresInteractiveUI: self.activeContract?.capabilitySnapshot.capabilities["mac.ui"]?.desired == true
                 )
-                guard let process = self.serverProcess,
-                      process.isRunning,
-                      ObjectIdentifier(process) == processID else {
-                    self.activationInFlight = false
-                    return
-                }
+                guard self.isCurrentServerActivation(
+                    processID: processID,
+                    launchGeneration: launchGeneration
+                ) else { return }
                 do {
+                    guard self.isCurrentServerActivation(
+                        processID: processID,
+                        launchGeneration: launchGeneration
+                    ) else { return }
                     try await self.runtimeCoordinator.markPhase2Completed()
                 } catch {
+                    guard self.isCurrentServerActivation(
+                        processID: processID,
+                        launchGeneration: launchGeneration
+                    ) else { return }
                     self.activationInFlight = false
                     self.lifecycle.markDegraded(
                         for: .mcpServer,
@@ -601,19 +629,52 @@ final class ProcessSupervisor {
                     )
                     return
                 }
+                guard self.isCurrentServerActivation(
+                    processID: processID,
+                    launchGeneration: launchGeneration
+                ) else { return }
                 self.activationInFlight = false
                 self.activationSucceeded = true
                 self.lifecycle.markReady(for: .mcpServer)
                 self.appLog.write("Server activation probe passed")
             } catch {
+                guard self.isCurrentServerActivation(
+                    processID: processID,
+                    launchGeneration: launchGeneration
+                ) else { return }
                 self.activationInFlight = false
-                guard let process = self.serverProcess,
-                      process.isRunning,
-                      ObjectIdentifier(process) == processID else { return }
-                self.lifecycle.markStarting(for: .mcpServer)
+                self.lifecycle.markStarting(for: .mcpServer, liveness: .running)
                 self.appLog.write("Server activation probe pending: \(error.localizedDescription)")
             }
         }
+    }
+
+    private func isCurrentServerActivation(
+        processID: ObjectIdentifier,
+        launchGeneration: UInt64
+    ) -> Bool {
+        guard !quitting,
+              !lifecycle.isQuiescing,
+              serverDesired,
+              serverLaunchGeneration == launchGeneration,
+              let process = serverProcess,
+              process.isRunning,
+              ObjectIdentifier(process) == processID else { return false }
+        return true
+    }
+
+    @discardableResult
+    private func beginServerLaunch() -> UInt64 {
+        serverLaunchGeneration &+= 1
+        activationSucceeded = false
+        activationInFlight = false
+        return serverLaunchGeneration
+    }
+
+    private func invalidateServerActivation() {
+        serverLaunchGeneration &+= 1
+        activationSucceeded = false
+        activationInFlight = false
     }
 
     private func queryTunnelURL() {
@@ -744,12 +805,14 @@ final class ProcessSupervisor {
         component: SupervisorComponent,
         label: String
     ) {
-        guard kill(pid, 0) == 0,
-              ProcessOwnership.matches(
-                  commandLine: commandLine(for: pid),
-                  component: component,
-                  ownerID: ownerID
-              ) else { return }
+        let pidExists = kill(pid, 0) == 0
+        let observedCommandLine = pidExists ? commandLine(for: pid) : ""
+        guard ProcessOwnership.authorizesTermination(
+            pidExists: pidExists,
+            commandLine: observedCommandLine,
+            component: component,
+            ownerID: ownerID
+        ) else { return }
         appLog.write("Cleaning \(label) pid=\(pid)")
         _ = kill(-pid, SIGTERM)
         let deadline = Date().addingTimeInterval(3)

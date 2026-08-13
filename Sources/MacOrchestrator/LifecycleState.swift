@@ -73,7 +73,10 @@ struct ComponentLifecycleSnapshot: Codable, Equatable, Sendable {
     let circuit: ComponentCircuitState
 
     var isReady: Bool {
-        desired == .enabled && lifecycle == .ready && readiness == .ready
+        desired == .enabled &&
+            lifecycle == .ready &&
+            liveness == .running &&
+            readiness == .ready
     }
 
     var retryDeadline: Date? {
@@ -185,7 +188,10 @@ final class LifecycleStateMachine {
         var generation: UInt64 = 0
 
         var isReady: Bool {
-            desired == .enabled && lifecycle == .ready && readiness == .ready
+            desired == .enabled &&
+                lifecycle == .ready &&
+                liveness == .running &&
+                readiness == .ready
         }
     }
 
@@ -249,6 +255,9 @@ final class LifecycleStateMachine {
             record.readiness = .notReady
             records[component] = record
             publish()
+            if component == .mcpServer {
+                blockRemoteForPrerequisite(cancelRemoteRetry: false)
+            }
             if shouldStop && reconcile {
                 requestStop(component)
                 if onEffect == nil {
@@ -261,6 +270,12 @@ final class LifecycleStateMachine {
         if changed && record.circuit == .open {
             record.circuit = .closed
             record.failureDates.removeAll()
+        }
+        if desired == .enabled && record.lifecycle == .failed {
+            record.lifecycle = .stopped
+            record.liveness = .stopped
+            record.readiness = .notReady
+            record.reason = nil
         }
         records[component] = record
         guard reconcile, !isQuiescing else {
@@ -297,6 +312,7 @@ final class LifecycleStateMachine {
             (ManagedComponentID.remoteConnector, remoteConnector),
         ] {
             guard var record = records[component] else { continue }
+            let previousDesired = record.desired
             record.desired = ComponentDesiredState(desired)
             if resetFailureHistory {
                 cancelRetry(&record, advanceGeneration: true)
@@ -313,21 +329,37 @@ final class LifecycleStateMachine {
                 record.nextRetryAt = nil
                 record.circuit = .closed
             }
+            if desired && previousDesired == .disabled &&
+                record.lifecycle == .failed {
+                record.lifecycle = .stopped
+                record.liveness = .stopped
+                record.readiness = .notReady
+                record.reason = nil
+            }
             records[component] = record
+        }
+        if records[.mcpServer]?.isReady != true {
+            blockRemoteForPrerequisite(cancelRemoteRetry: false)
         }
         publish()
     }
 
-    func markStarting(for component: ManagedComponentID) {
+    func markStarting(
+        for component: ManagedComponentID,
+        liveness: ComponentLiveness = .starting
+    ) {
         guard var record = records[component],
               record.desired == .enabled,
               record.circuit == .closed else { return }
         record.lifecycle = .starting
-        record.liveness = .starting
+        record.liveness = liveness
         record.readiness = .notReady
         record.reason = nil
         records[component] = record
         publish()
+        if component == .mcpServer {
+            blockRemoteForPrerequisite(cancelRemoteRetry: false)
+        }
     }
 
     func markProcessRunning(for component: ManagedComponentID) {
@@ -339,6 +371,9 @@ final class LifecycleStateMachine {
         record.readiness = .notReady
         records[component] = record
         publish()
+        if component == .mcpServer {
+            blockRemoteForPrerequisite(cancelRemoteRetry: false)
+        }
     }
 
     func markRunning(for component: ManagedComponentID) {
@@ -348,10 +383,15 @@ final class LifecycleStateMachine {
     func markReady(for component: ManagedComponentID) {
         guard var record = records[component],
               record.desired == .enabled,
-              record.circuit == .closed else { return }
+              record.circuit == .closed,
+              record.liveness == .running else { return }
         if component == .remoteConnector && (!networkAvailable || !mcpIsReady) {
             records[component] = record
-            transitionToWaitingForPrerequisites(component, reason: prerequisiteReason)
+            transitionToWaitingForPrerequisites(
+                component,
+                reason: prerequisiteReason,
+                cancelPendingRetry: false
+            )
             return
         }
         cancelRetry(&record, advanceGeneration: true)
@@ -376,7 +416,11 @@ final class LifecycleStateMachine {
               record.desired == .enabled else { return }
         if component == .remoteConnector && !mcpIsReady {
             records[component] = record
-            transitionToWaitingForPrerequisites(component, reason: prerequisiteReason)
+            transitionToWaitingForPrerequisites(
+                component,
+                reason: prerequisiteReason,
+                cancelPendingRetry: false
+            )
             return
         }
         record.lifecycle = .degraded
@@ -390,13 +434,37 @@ final class LifecycleStateMachine {
         }
     }
 
-    func markFailed(for component: ManagedComponentID, reason: String) {
+    func markFailed(
+        for component: ManagedComponentID,
+        reason: String,
+        liveness: ComponentLiveness = .stopped
+    ) {
         guard var record = records[component],
               record.desired == .enabled else { return }
         cancelRetry(&record, advanceGeneration: true)
         record.lifecycle = .failed
-        record.liveness = .stopped
+        record.liveness = liveness
         record.readiness = .notReady
+        record.reason = reason
+        records[component] = record
+        publish()
+        if component == .mcpServer {
+            blockRemoteForPrerequisite(cancelRemoteRetry: false)
+        }
+    }
+
+    func markStructuralFailure(
+        for component: ManagedComponentID,
+        reason: String,
+        liveness: ComponentLiveness = .stopped
+    ) {
+        guard var record = records[component] else { return }
+        cancelRetry(&record, advanceGeneration: true)
+        record.circuit = .closed
+        record.lifecycle = .failed
+        record.liveness = liveness
+        record.readiness = .notReady
+        record.nextRetryAt = nil
         record.reason = reason
         records[component] = record
         publish()
@@ -407,7 +475,8 @@ final class LifecycleStateMachine {
 
     func markStopped(for component: ManagedComponentID, reason: String? = nil) {
         guard var record = records[component] else { return }
-        if record.desired == .enabled &&
+        if component == .remoteConnector &&
+            record.desired == .enabled &&
             (record.lifecycle == .waitingForPrerequisites || record.lifecycle == .degraded) {
             return
         }
@@ -419,6 +488,9 @@ final class LifecycleStateMachine {
         record.reason = reason
         records[component] = record
         publish()
+        if component == .mcpServer {
+            blockRemoteForPrerequisite(cancelRemoteRetry: false)
+        }
     }
 
     func stop(component: ManagedComponentID, reason: String? = nil) {
@@ -431,6 +503,9 @@ final class LifecycleStateMachine {
         record.reason = reason
         records[component] = record
         publish()
+        if component == .mcpServer {
+            blockRemoteForPrerequisite(cancelRemoteRetry: false)
+        }
         if shouldStop {
             requestStop(component)
         }
@@ -445,7 +520,11 @@ final class LifecycleStateMachine {
               record.desired == .enabled else { return }
         if component == .remoteConnector && (!networkAvailable || !mcpIsReady) {
             records[component] = record
-            transitionToWaitingForPrerequisites(component, reason: prerequisiteReason)
+            transitionToWaitingForPrerequisites(
+                component,
+                reason: prerequisiteReason,
+                cancelPendingRetry: false
+            )
             return
         }
 
@@ -467,6 +546,9 @@ final class LifecycleStateMachine {
             records[component] = record
             scheduleRetry(for: component, at: now.addingTimeInterval(delay))
             publish()
+            if component == .mcpServer {
+                blockRemoteForPrerequisite(cancelRemoteRetry: false)
+            }
         case let .circuitOpen(failures):
             cancelRetry(&record, advanceGeneration: true)
             record.failureDates = failures
@@ -479,7 +561,7 @@ final class LifecycleStateMachine {
             records[component] = record
             publish()
             if component == .mcpServer {
-                blockRemoteForPrerequisite(cancelRemoteRetry: true)
+                blockRemoteForPrerequisite(cancelRemoteRetry: false)
             }
         }
     }
@@ -504,6 +586,9 @@ final class LifecycleStateMachine {
         record.reason = nil
         records[component] = record
         publish()
+        if component == .mcpServer {
+            blockRemoteForPrerequisite(cancelRemoteRetry: false)
+        }
         guard record.desired == .enabled, !isQuiescing else { return }
         reconcileStart(for: component)
     }
@@ -530,7 +615,11 @@ final class LifecycleStateMachine {
               record.desired == .enabled else { return }
 
         if !available {
-            guard record.lifecycle != .stopped else { return }
+            guard record.lifecycle != .stopped,
+                  record.lifecycle != .failed,
+                  record.lifecycle != .circuitOpen,
+                  record.lifecycle != .stopping,
+                  record.lifecycle != .waitingForPrerequisites else { return }
             var updated = record
             cancelRetry(&updated, advanceGeneration: true)
             updated.lifecycle = .degraded
@@ -544,10 +633,14 @@ final class LifecycleStateMachine {
             return
         }
 
+        guard record.lifecycle != .failed,
+              record.lifecycle != .circuitOpen,
+              record.lifecycle != .stopping else { return }
         guard mcpIsReady, updatedRemoteCanRun else {
             transitionToWaitingForPrerequisites(
                 .remoteConnector,
-                reason: prerequisiteReason
+                reason: prerequisiteReason,
+                cancelPendingRetry: false
             )
             return
         }
@@ -566,7 +659,11 @@ final class LifecycleStateMachine {
            records[.mcpServer]?.circuit == .closed {
             reconcileStart(for: .mcpServer)
         }
-        guard records[.remoteConnector]?.desired == .enabled,
+        guard let remote = records[.remoteConnector],
+              remote.desired == .enabled,
+              remote.lifecycle != .failed,
+              remote.lifecycle != .circuitOpen,
+              remote.lifecycle != .stopping,
               mcpIsReady,
               updatedRemoteCanRun else { return }
         if records[.remoteConnector]?.lifecycle == .ready {
@@ -636,7 +733,11 @@ final class LifecycleStateMachine {
 
         if component == .remoteConnector && (!networkAvailable || !mcpIsReady) {
             records[component] = record
-            transitionToWaitingForPrerequisites(component, reason: prerequisiteReason)
+            transitionToWaitingForPrerequisites(
+                component,
+                reason: prerequisiteReason,
+                cancelPendingRetry: false
+            )
             return
         }
         guard record.lifecycle != .starting,
@@ -650,6 +751,9 @@ final class LifecycleStateMachine {
         record.reason = nil
         records[component] = record
         publish()
+        if component == .mcpServer {
+            blockRemoteForPrerequisite(cancelRemoteRetry: false)
+        }
         emit(.start(component))
     }
 
@@ -673,7 +777,8 @@ final class LifecycleStateMachine {
     }
 
     private func blockRemoteForPrerequisite(cancelRemoteRetry: Bool) {
-        guard let remote = records[.remoteConnector],
+        guard !isQuiescing,
+              let remote = records[.remoteConnector],
               remote.desired == .enabled,
               remote.circuit == .closed else { return }
         let wasActive = remote.lifecycle == .ready ||
@@ -692,6 +797,8 @@ final class LifecycleStateMachine {
               record.desired == .enabled,
               record.circuit == .closed,
               record.retryHandle == nil,
+              record.lifecycle != .failed,
+              record.lifecycle != .stopping,
               !isQuiescing else { return }
         let failureCount = record.failureDates.filter {
             scheduler.now.timeIntervalSince($0) < SupervisorRetryPolicy.failureWindow

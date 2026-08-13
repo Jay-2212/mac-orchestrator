@@ -51,6 +51,25 @@ enum ProcessOwnership {
     ) -> Bool {
         commandLine.contains(marker(for: component, ownerID: ownerID))
     }
+
+    /// Pure authorization policy for cleanup of a recorded process ID.
+    ///
+    /// The PID liveness check and the component-specific owner marker are both
+    /// required before a caller may terminate a recorded process. Keeping the
+    /// policy free of process inspection makes PID reuse and cross-component
+    /// cases deterministic to test.
+    static func authorizesTermination(
+        pidExists: Bool,
+        commandLine: String,
+        component: SupervisorComponent,
+        ownerID: String
+    ) -> Bool {
+        pidExists && matches(
+            commandLine: commandLine,
+            component: component,
+            ownerID: ownerID
+        )
+    }
 }
 
 enum PortOccupancyDecision: Equatable, Sendable {

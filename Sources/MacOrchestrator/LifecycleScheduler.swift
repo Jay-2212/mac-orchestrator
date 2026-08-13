@@ -107,6 +107,7 @@ final class TestLifecycleScheduler: LifecycleSchedulerProtocol {
 
     private(set) var now: Date
     private var entries: [UUID: Entry] = [:]
+    private var retiredOperations: [UUID: @MainActor () -> Void] = [:]
 
     init(start: Date = Date(timeIntervalSince1970: 0)) {
         now = start
@@ -129,7 +130,9 @@ final class TestLifecycleScheduler: LifecycleSchedulerProtocol {
 
     func cancel(_ handle: LifecycleScheduledHandle) {
         handle.cancel()
-        entries.removeValue(forKey: handle.id)
+        if let entry = entries.removeValue(forKey: handle.id) {
+            retiredOperations[handle.id] = entry.operation
+        }
     }
 
     var pending: [PendingWork] {
@@ -169,11 +172,12 @@ final class TestLifecycleScheduler: LifecycleSchedulerProtocol {
             now = date
             return
         }
-        now = date
-        while let next = pending.first, next.date <= now {
+        while let next = pending.first, next.date <= date {
+            now = next.date
             guard let entry = entries[next.id] else { continue }
             fire(entry.handle)
         }
+        now = date
     }
 
     func fire(_ handle: LifecycleScheduledHandle) {
@@ -182,6 +186,17 @@ final class TestLifecycleScheduler: LifecycleSchedulerProtocol {
               !handle.hasFired else { return }
         handle.markFired()
         entry.operation()
+    }
+
+    /// Test-only escape hatch for simulating a callback that was already
+    /// queued when its handle was retired. The callback still has to reject
+    /// itself using lifecycle generation/desired-state/quiesce fences.
+    func fireIgnoringCancellation(_ handle: LifecycleScheduledHandle) {
+        guard handle.isCancelled, !handle.hasFired else { return }
+        let operation: (@MainActor () -> Void)? =
+            entries.removeValue(forKey: handle.id)?.operation
+            ?? retiredOperations.removeValue(forKey: handle.id)
+        operation?()
     }
 
     func firePending(for component: ManagedComponentID) {

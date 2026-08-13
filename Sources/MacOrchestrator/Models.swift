@@ -52,7 +52,7 @@ struct ServiceSnapshot {
         case .starting:
             return .starting
         case .ready:
-            return .running
+            return component.isReady ? .running : .starting
         case .degraded:
             return component.id == .mcpServer ? .starting : .reconnecting
         case .retrying:

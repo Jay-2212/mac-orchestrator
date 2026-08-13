@@ -45,19 +45,20 @@ final class RotatingLog: @unchecked Sendable {
     func redact(_ secrets: [String]) {
         let values = secrets.filter { !$0.isEmpty }
         guard !values.isEmpty else { return }
+        let redactor = SensitiveDataRedactor(
+            exactSecrets: values,
+            homeDirectory: FileManager.default.homeDirectoryForCurrentUser.path
+        )
         lock.lock()
         defer { lock.unlock() }
         for index in 0...backups {
             let filename = index == 0 ? name : "\(name).\(index)"
             let url = directory.appendingPathComponent(filename)
-            guard var contents = try? String(contentsOf: url, encoding: .utf8) else { continue }
-            var changed = false
-            for secret in values where contents.contains(secret) {
-                contents = contents.replacingOccurrences(of: secret, with: "<redacted>")
-                changed = true
-            }
+            guard let contents = try? String(contentsOf: url, encoding: .utf8) else { continue }
+            let redacted = redactor.redact(contents)
+            let changed = redacted != contents
             if changed {
-                try? Data(contents.utf8).write(to: url, options: .atomic)
+                try? Data(redacted.utf8).write(to: url, options: .atomic)
                 try? FileManager.default.setAttributes(
                     [.posixPermissions: 0o600],
                     ofItemAtPath: url.path

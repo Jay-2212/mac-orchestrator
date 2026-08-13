@@ -27,4 +27,20 @@ final class StreamingLogRedactorTests: XCTestCase {
             ["prefix <redacted>"]
         )
     }
+
+    func testRedactionRemainsSafeAcrossSecretAndURLChunkBoundaries() {
+        var redactor = StreamingLogRedactor(
+            secrets: ["connector-token", "ngrok_2sPlausibleToken_1234567890"]
+        )
+        _ = redactor.append("prefix https://demo.ngrok.app/connect", flush: false)
+        let lines = redactor.append(
+            "or-token/mcp and ngrok_2sPlausibleToken_1234567890\n",
+            flush: false
+        )
+
+        XCTAssertEqual(lines.count, 1)
+        XCTAssertFalse(lines[0].contains("connector-token"))
+        XCTAssertFalse(lines[0].contains("ngrok_2sPlausibleToken_1234567890"))
+        XCTAssertFalse(lines[0].contains("https://demo.ngrok.app/"))
+    }
 }

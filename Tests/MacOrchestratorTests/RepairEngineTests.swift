@@ -1,0 +1,931 @@
+import Foundation
+import XCTest
+@testable import MacOrchestrator
+
+final class RepairEngineTests: XCTestCase {
+    func testRepairOutcomeStatusesUseStableWireValues() throws {
+        XCTAssertEqual(RepairOutcomeStatus.repaired.rawValue, "repaired")
+        XCTAssertEqual(RepairOutcomeStatus.notNeeded.rawValue, "notNeeded")
+        XCTAssertEqual(RepairOutcomeStatus.refused.rawValue, "refused")
+        XCTAssertEqual(RepairOutcomeStatus.failed.rawValue, "failed")
+        XCTAssertEqual(RepairOutcomeStatus.requiresUserAction.rawValue, "requiresUserAction")
+
+        let outcome = RepairOutcome(
+            action: .retryMCPServer,
+            status: .repaired,
+            reason: "The requested repair completed."
+        )
+        let encoded = try JSONEncoder().encode(outcome)
+        let decoded = try JSONDecoder().decode(RepairOutcome.self, from: encoded)
+        XCTAssertEqual(decoded, outcome)
+    }
+
+    func testLifecycleAdapterCanReturnEveryOutcomeStatus() async {
+        for status in RepairOutcomeStatus.allCases {
+            let adapter = RecordingRepairAdapters(result: RepairAdapterResult(status: status))
+            let outcome = await RepairEngine(dependencies: RepairDependencies(
+                lifecycleRetrying: adapter
+            )).execute(.retryMCPServer)
+
+            XCTAssertEqual(outcome.status, status)
+        }
+    }
+
+    func testEachActionRoutesOnlyToItsMatchingAdapter() async {
+        let recorder = RecordingRepairAdapters()
+        let engine = RepairEngine(dependencies: RepairDependencies(
+            lifecycleRetrying: recorder,
+            permissionSettingsOpening: recorder,
+            configurationBackupRestoring: recorder,
+            localPortReassigning: recorder,
+            launchAgentRepairing: recorder,
+            verifiedBootstrapHandingOff: recorder
+        ))
+
+        for action in RepairActionID.allCases {
+            _ = await engine.execute(action)
+        }
+
+        let counts = await recorder.counts()
+        XCTAssertEqual(counts.lifecycle, 2)
+        XCTAssertEqual(counts.permission, 3)
+        XCTAssertEqual(counts.backup, 1)
+        XCTAssertEqual(counts.port, 1)
+        XCTAssertEqual(counts.launchAgent, 1)
+        XCTAssertEqual(counts.bootstrap, 1)
+    }
+
+    func testMissingAdapterReturnsRefusedWithoutFanout() async {
+        let recorder = RecordingRepairAdapters()
+        let engine = RepairEngine(dependencies: RepairDependencies(lifecycleRetrying: recorder))
+
+        let outcome = await engine.execute(.repairLaunchAgent)
+
+        XCTAssertEqual(outcome.status, .refused)
+        let counts = await recorder.counts()
+        XCTAssertEqual(counts.total, 0)
+    }
+
+    func testDoctorDoesNotOwnOrInvokeRepairEngine() {
+        let sourceURL = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Sources/MacOrchestrator/DoctorEngine.swift")
+        let source = try? String(contentsOf: sourceURL, encoding: .utf8)
+
+        XCTAssertNotNil(source)
+        XCTAssertFalse(source?.contains("RepairEngine") == true)
+        XCTAssertFalse(source?.contains("RepairDependencies") == true)
+    }
+
+    func testPermissionRepairRequiresUserActionUntilLaterRecheck() async {
+        let recorder = RecordingRepairAdapters()
+        let engine = RepairEngine(dependencies: RepairDependencies(permissionSettingsOpening: recorder))
+
+        let outcome = await engine.execute(.openAccessibilitySettings)
+
+        XCTAssertEqual(outcome.status, .requiresUserAction)
+        XCTAssertTrue(outcome.reason.contains("System Settings"))
+        let counts = await recorder.counts()
+        XCTAssertEqual(counts.permission, 1)
+    }
+
+    func testConcreteSystemSettingsOpenerUsesExactURLsAndRequiresUserAction() async {
+        let opener = RecordingSettingsURLOpener(result: true)
+        let adapter = SystemSettingsPermissionOpener(urlOpening: opener)
+
+        let expected: [(PermissionSettingsPane, URL, RepairActionID)] = [
+            (.accessibility, SystemSettingsPaneURLs.accessibility, .openAccessibilitySettings),
+            (.screenRecording, SystemSettingsPaneURLs.screenRecording, .openScreenRecordingSettings),
+            (.automation, SystemSettingsPaneURLs.automation, .openAutomationSettings),
+        ]
+
+        for (pane, url, action) in expected {
+            let result = await adapter.open(pane)
+            XCTAssertEqual(result.status, .requiresUserAction)
+            let lastOpenedURL = await opener.openedURLs.last
+            XCTAssertEqual(lastOpenedURL, url)
+
+            let outcome = await RepairEngine(dependencies: RepairDependencies(
+                permissionSettingsOpening: adapter
+            )).execute(action)
+            XCTAssertEqual(outcome.status, .requiresUserAction)
+        }
+    }
+
+    func testSystemSettingsOpenFailureIsFailedWithoutTCCMutation() async {
+        let opener = RecordingSettingsURLOpener(result: false)
+        let result = await SystemSettingsPermissionOpener(urlOpening: opener).open(.automation)
+
+        XCTAssertEqual(result.status, .failed)
+        let openedURLs = await opener.openedURLs
+        XCTAssertEqual(openedURLs, [SystemSettingsPaneURLs.automation])
+    }
+
+    func testDefaultDependenciesWireOnlyBoundedSettingsAdapter() {
+        XCTAssertNotNil(RepairDependencies().permissionSettingsOpening)
+        XCTAssertNil(RepairDependencies().lifecycleRetrying)
+        XCTAssertNil(RepairDependencies().configurationBackupRestoring)
+        XCTAssertNil(RepairDependencies().localPortReassigning)
+        XCTAssertNil(RepairDependencies().launchAgentRepairing)
+        XCTAssertNil(RepairDependencies().verifiedBootstrapHandingOff)
+    }
+
+    func testInvalidBackupIsRefusedAndPrimaryIsPreserved() async throws {
+        let root = try makeTemporaryDirectory()
+        let store = ConfigurationStore(directoryURL: root, ownerIDProvider: { "owner-test" })
+        _ = try store.loadOrCreate()
+        try Data("{not-json".utf8).write(to: store.configurationURL)
+        try Data("{also-not-json".utf8).write(to: store.backupURL)
+
+        let restorer = ConfigurationStoreBackupRestorer(store: store, expectedOwnerID: "owner-test")
+        let outcome = await RepairEngine(dependencies: RepairDependencies(
+            configurationBackupRestoring: restorer
+        )).execute(.restoreConfigurationBackup)
+
+        XCTAssertEqual(outcome.status, .refused)
+        XCTAssertEqual(try Data(contentsOf: store.configurationURL), Data("{not-json".utf8))
+    }
+
+    func testSymlinkBackupIsRefusedWithoutPromotionOrPrimaryMutation() async throws {
+        let root = try makeTemporaryDirectory()
+        let store = ConfigurationStore(directoryURL: root, ownerIDProvider: { "owner-test" })
+        _ = try store.loadOrCreate()
+
+        let malformedPrimary = Data("{malformed-primary".utf8)
+        try malformedPrimary.write(to: store.configurationURL)
+
+        var validBackup = AppConfiguration.fresh(ownerID: "owner-test")
+        validBackup.localMCPPort = 8123
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let validBackupURL = root.appendingPathComponent("valid-backup.json")
+        try encoder.encode(validBackup).write(to: validBackupURL)
+        try? FileManager.default.removeItem(at: store.backupURL)
+        try FileManager.default.createSymbolicLink(
+            at: store.backupURL,
+            withDestinationURL: validBackupURL
+        )
+
+        let restorer = ConfigurationStoreBackupRestorer(store: store, expectedOwnerID: "owner-test")
+        let outcome = await RepairEngine(dependencies: RepairDependencies(
+            configurationBackupRestoring: restorer
+        )).execute(.restoreConfigurationBackup)
+
+        XCTAssertEqual(outcome.status, .refused)
+        XCTAssertEqual(try Data(contentsOf: store.configurationURL), malformedPrimary)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: validBackupURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: store.configurationURL.path + ".corrupt"))
+    }
+
+    func testSymlinkedConfigurationAncestorIsRefusedWithoutForeignReadOrPromotion() async throws {
+        let root = try makeTemporaryDirectory()
+        let foreignDirectory = root.appendingPathComponent("foreign-config", isDirectory: true)
+        try FileManager.default.createDirectory(at: foreignDirectory, withIntermediateDirectories: true)
+
+        let foreignStore = ConfigurationStore(directoryURL: foreignDirectory, ownerIDProvider: { "owner-test" })
+        _ = try foreignStore.loadOrCreate()
+        let malformedPrimary = Data("{malformed-primary".utf8)
+        try malformedPrimary.write(to: foreignStore.configurationURL)
+
+        var validBackup = AppConfiguration.fresh(ownerID: "owner-test")
+        validBackup.localMCPPort = 8123
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode(validBackup).write(to: foreignStore.backupURL)
+        let foreignPrimaryBefore = try Data(contentsOf: foreignStore.configurationURL)
+        let foreignBackupBefore = try Data(contentsOf: foreignStore.backupURL)
+
+        let redirectedDirectory = root.appendingPathComponent("redirected-config", isDirectory: true)
+        try FileManager.default.createSymbolicLink(
+            at: redirectedDirectory,
+            withDestinationURL: foreignDirectory
+        )
+        let unsafeStore = ConfigurationStore(directoryURL: redirectedDirectory, ownerIDProvider: { "owner-test" })
+        let restorer = ConfigurationStoreBackupRestorer(store: unsafeStore, expectedOwnerID: "owner-test")
+
+        let outcome = await RepairEngine(dependencies: RepairDependencies(
+            configurationBackupRestoring: restorer
+        )).execute(.restoreConfigurationBackup)
+
+        XCTAssertEqual(outcome.status, .refused)
+        XCTAssertEqual(try Data(contentsOf: foreignStore.configurationURL), foreignPrimaryBefore)
+        XCTAssertEqual(try Data(contentsOf: foreignStore.backupURL), foreignBackupBefore)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: foreignStore.configurationURL.path + ".corrupt"))
+    }
+
+    func testValidBackupRestoresAndPreservesBadPrimary() async throws {
+        let root = try makeTemporaryDirectory()
+        let store = ConfigurationStore(directoryURL: root, ownerIDProvider: { "owner-test" })
+        var configuration = try store.loadOrCreate()
+        configuration.localMCPPort = 8123
+        _ = try store.save(configuration)
+        configuration.localMCPPort = 9123
+        _ = try store.save(configuration)
+        let knownGoodBackup = try Data(contentsOf: store.backupURL)
+        try Data("{not-json".utf8).write(to: store.configurationURL)
+
+        let restorer = ConfigurationStoreBackupRestorer(store: store, expectedOwnerID: "owner-test")
+        let outcome = await RepairEngine(dependencies: RepairDependencies(
+            configurationBackupRestoring: restorer
+        )).execute(.restoreConfigurationBackup)
+
+        XCTAssertEqual(outcome.status, .repaired)
+        XCTAssertEqual(try store.load().localMCPPort, 8123)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: store.configurationURL.path + ".corrupt"))
+        XCTAssertEqual(try Data(contentsOf: store.backupURL), knownGoodBackup)
+    }
+
+    func testValidBackupInTemporaryDirectoryRestoresThroughVerifiedMacOSTemporaryAlias() async throws {
+        let root = try makeTemporaryDirectory()
+        let store = ConfigurationStore(directoryURL: root, ownerIDProvider: { "owner-test" })
+        var configuration = try store.loadOrCreate()
+        configuration.localMCPPort = 8123
+        _ = try store.save(configuration)
+        configuration.localMCPPort = 9123
+        _ = try store.save(configuration)
+        try Data("{not-json".utf8).write(to: store.configurationURL)
+
+        let outcome = await RepairEngine(dependencies: RepairDependencies(
+            configurationBackupRestoring: ConfigurationStoreBackupRestorer(
+                store: store,
+                expectedOwnerID: "owner-test"
+            )
+        )).execute(.restoreConfigurationBackup)
+
+        XCTAssertEqual(outcome.status, .repaired)
+        XCTAssertEqual(try store.load().localMCPPort, 8123)
+    }
+
+    func testSchemaZeroBackupUsesExistingMigrationSemanticsBeforePromotion() async throws {
+        let root = try makeTemporaryDirectory()
+        let store = ConfigurationStore(directoryURL: root, ownerIDProvider: { "owner-test" })
+        try Data("{malformed-primary".utf8).write(to: store.configurationURL)
+        var legacy = AppConfiguration.fresh(ownerID: "owner-test")
+        legacy.schemaVersion = 0
+        legacy.generation = 0
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode(legacy).write(to: store.backupURL)
+
+        let outcome = await RepairEngine(dependencies: RepairDependencies(
+            configurationBackupRestoring: ConfigurationStoreBackupRestorer(
+                store: store,
+                expectedOwnerID: "owner-test"
+            )
+        )).execute(.restoreConfigurationBackup)
+
+        XCTAssertEqual(outcome.status, .repaired)
+        XCTAssertEqual(try store.load().schemaVersion, AppConfiguration.currentSchemaVersion)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: store.configurationURL.path + ".corrupt"))
+    }
+
+    func testBackupOwnerMismatchRefusesAndPreservesMalformedPrimary() async throws {
+        let root = try makeTemporaryDirectory()
+        let store = ConfigurationStore(directoryURL: root, ownerIDProvider: { "owner-test" })
+        _ = try store.loadOrCreate()
+        var foreign = AppConfiguration.fresh(ownerID: "foreign-owner")
+        foreign.generation = 2
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode(foreign).write(to: store.backupURL)
+        let malformedPrimary = Data("{malformed-primary".utf8)
+        try malformedPrimary.write(to: store.configurationURL)
+
+        let restorer = ConfigurationStoreBackupRestorer(store: store, expectedOwnerID: "owner-test")
+        let outcome = await RepairEngine(dependencies: RepairDependencies(
+            configurationBackupRestoring: restorer
+        )).execute(.restoreConfigurationBackup)
+
+        XCTAssertEqual(outcome.status, .refused)
+        XCTAssertEqual(try Data(contentsOf: store.configurationURL), malformedPrimary)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: store.configurationURL.path + ".corrupt"))
+    }
+
+    func testPortReassignmentRequiresFreeCandidateAndReportsClientGuidanceWithoutTermination() async {
+        let occupancy = SequencedPortOccupancy(results: [
+            .occupiedOwned(ownerID: "owner-1"),
+            .free,
+            .free,
+        ])
+        let updater = RecordingPortUpdater()
+        let reassigner = SafeLocalPortReassigner(
+            request: LocalPortReassignmentRequest(
+                currentPort: 8000,
+                candidatePort: 8123,
+                expectedOwnerID: "owner-1"
+            ),
+            occupancy: occupancy,
+            configuration: updater
+        )
+
+        let outcome = await RepairEngine(dependencies: RepairDependencies(
+            localPortReassigning: reassigner
+        )).execute(.reassignLocalPort)
+
+        XCTAssertEqual(outcome.status, .repaired)
+        XCTAssertTrue(outcome.reason.contains("configured clients"))
+        let observedPorts = await occupancy.ports
+        let updatedPorts = await updater.updatedPorts
+        let terminatedListeners = await updater.terminatedListeners
+        XCTAssertEqual(observedPorts, [8000, 8123, 8123])
+        XCTAssertEqual(updatedPorts, [8123])
+        XCTAssertEqual(terminatedListeners, 0)
+    }
+
+    func testPortReassignmentAllowsExplicitUnrelatedCurrentListenerWithoutTermination() async {
+        let occupancy = SequencedPortOccupancy(results: [
+            .occupiedUnrelated,
+            .free,
+            .free,
+        ])
+        let updater = RecordingPortUpdater()
+        let reassigner = SafeLocalPortReassigner(
+            request: LocalPortReassignmentRequest(
+                currentPort: 8000,
+                candidatePort: 8123,
+                expectedOwnerID: "owner-1"
+            ),
+            occupancy: occupancy,
+            configuration: updater
+        )
+
+        let outcome = await RepairEngine(dependencies: RepairDependencies(localPortReassigning: reassigner))
+            .execute(.reassignLocalPort)
+        let updatedPorts = await updater.updatedPorts
+        let terminatedListeners = await updater.terminatedListeners
+        XCTAssertEqual(outcome.status, .repaired)
+        XCTAssertEqual(updatedPorts, [8123])
+        XCTAssertEqual(terminatedListeners, 0)
+    }
+
+    func testPortReassignmentRefusesOccupiedCandidateAndOwnershipMismatch() async {
+        let occupied = SafeLocalPortReassigner(
+            request: LocalPortReassignmentRequest(
+                currentPort: 8000,
+                candidatePort: 8123,
+                expectedOwnerID: "owner-1"
+            ),
+            occupancy: SequencedPortOccupancy(results: [
+                .occupiedOwned(ownerID: "owner-1"),
+                .occupiedUnrelated,
+            ]),
+            configuration: RecordingPortUpdater()
+        )
+        let mismatch = SafeLocalPortReassigner(
+            request: LocalPortReassignmentRequest(
+                currentPort: 8000,
+                candidatePort: 8124,
+                expectedOwnerID: "owner-1"
+            ),
+            occupancy: SequencedPortOccupancy(results: [
+                .occupiedOwned(ownerID: "owner-2"),
+            ]),
+            configuration: RecordingPortUpdater()
+        )
+
+        let occupiedOutcome = await RepairEngine(dependencies: RepairDependencies(localPortReassigning: occupied))
+            .execute(.reassignLocalPort)
+        let mismatchOutcome = await RepairEngine(dependencies: RepairDependencies(localPortReassigning: mismatch))
+            .execute(.reassignLocalPort)
+        XCTAssertEqual(occupiedOutcome.status, .refused)
+        XCTAssertEqual(mismatchOutcome.status, .refused)
+    }
+
+    func testPortReassignmentRefusesCandidateRaceAndUnknownOccupancy() async {
+        let raced = SafeLocalPortReassigner(
+            request: LocalPortReassignmentRequest(
+                currentPort: 8000,
+                candidatePort: 8123,
+                expectedOwnerID: "owner-1"
+            ),
+            occupancy: SequencedPortOccupancy(results: [
+                .occupiedOwned(ownerID: "owner-1"),
+                .free,
+                .occupiedUnrelated,
+            ]),
+            configuration: RecordingPortUpdater()
+        )
+        let unknownCurrent = SafeLocalPortReassigner(
+            request: LocalPortReassignmentRequest(
+                currentPort: 8000,
+                candidatePort: 8123,
+                expectedOwnerID: "owner-1"
+            ),
+            occupancy: SequencedPortOccupancy(results: [.unknown]),
+            configuration: RecordingPortUpdater()
+        )
+
+        let racedOutcome = await RepairEngine(dependencies: RepairDependencies(localPortReassigning: raced))
+            .execute(.reassignLocalPort)
+        let unknownCurrentOutcome = await RepairEngine(
+            dependencies: RepairDependencies(localPortReassigning: unknownCurrent)
+        ).execute(.reassignLocalPort)
+        XCTAssertEqual(racedOutcome.status, .refused)
+        XCTAssertEqual(unknownCurrentOutcome.status, .refused)
+    }
+
+    func testConcretePortUpdaterRefusesMissingConfigurationWithoutCreatingSupportState() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("MacOrchestratorPortRepairMissing-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = ConfigurationStore(directoryURL: root, ownerIDProvider: { "owner-test" })
+        let reassigner = SafeLocalPortReassigner(
+            request: LocalPortReassignmentRequest(
+                currentPort: 8000,
+                candidatePort: 8123,
+                expectedOwnerID: "owner-test"
+            ),
+            occupancy: SequencedPortOccupancy(results: [.occupiedUnrelated, .free, .free]),
+            configuration: ConfigurationStorePortUpdater(store: store)
+        )
+
+        let outcome = await reassigner.reassignLocalPort()
+
+        XCTAssertEqual(outcome.status, .refused)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.path))
+    }
+
+    func testConcretePortUpdaterRefusesMalformedConfigurationWithoutChangingBytes() async throws {
+        let root = try makeTemporaryDirectory()
+        let store = ConfigurationStore(directoryURL: root, ownerIDProvider: { "owner-test" })
+        let malformed = Data("{malformed-primary".utf8)
+        try malformed.write(to: store.configurationURL)
+        let reassigner = SafeLocalPortReassigner(
+            request: LocalPortReassignmentRequest(
+                currentPort: 8000,
+                candidatePort: 8123,
+                expectedOwnerID: "owner-test"
+            ),
+            occupancy: SequencedPortOccupancy(results: [.occupiedUnrelated, .free, .free]),
+            configuration: ConfigurationStorePortUpdater(store: store)
+        )
+
+        let outcome = await reassigner.reassignLocalPort()
+
+        XCTAssertEqual(outcome.status, .refused)
+        XCTAssertEqual(try Data(contentsOf: store.configurationURL), malformed)
+    }
+
+    func testLaunchAgentRepairRequiresExactOwnershipLabelPathAndContract() async {
+        let writer = RecordingLaunchAgentWriter()
+        let contract = ManagedLaunchAgentContract(homeDirectory: makeTemporaryHome())
+        let repairer = ManagedLaunchAgentRepairer(
+            contract: contract,
+            ownership: StaticLaunchAgentOwnershipFacts(
+                exactLabel: false,
+                exactPath: true,
+                exactContract: true
+            ),
+            writer: writer
+        )
+
+        let outcome = await RepairEngine(dependencies: RepairDependencies(
+            launchAgentRepairing: repairer
+        )).execute(.repairLaunchAgent)
+
+        XCTAssertEqual(outcome.status, .refused)
+        let writeCount = await writer.writeCount
+        XCTAssertEqual(writeCount, 0)
+    }
+
+    func testExactLaunchAgentContractInspectorAndWriterRejectGuardsAndAcceptExactTarget() async throws {
+        let home = makeTemporaryHome()
+        let contract = ManagedLaunchAgentContract(homeDirectory: home)
+        try FileManager.default.createDirectory(
+            at: contract.launchAgentURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let inspector = FileSystemLaunchAgentOwnershipInspector()
+        let reloader = RecordingLaunchAgentReloader(result: .repaired)
+        let writer = FileSystemManagedLaunchAgentWriter(reloader: reloader)
+
+        XCTAssertFalse(inspector.inspect(contract).ownedByMacOrchestrator)
+        let writeOutcome = await writer.writeExactManagedContract(contract)
+        let reloadedContracts = await reloader.reloadedContracts
+        XCTAssertEqual(writeOutcome, .repaired)
+        XCTAssertEqual(reloadedContracts, [contract])
+        let owned = inspector.inspect(contract)
+        XCTAssertTrue(owned.exactLabel)
+        XCTAssertTrue(owned.exactPath)
+        XCTAssertTrue(owned.exactContract)
+        XCTAssertTrue(owned.ownedByMacOrchestrator)
+
+        var wrongLabel = contract.propertyList
+        wrongLabel["Label"] = "com.example.unrelated"
+        try PropertyListSerialization.data(fromPropertyList: wrongLabel, format: .xml, options: 0)
+            .write(to: contract.launchAgentURL, options: [.atomic])
+        let labelMismatch = inspector.inspect(contract)
+        XCTAssertFalse(labelMismatch.exactLabel)
+        XCTAssertFalse(labelMismatch.ownedByMacOrchestrator)
+
+        var wrongPath = contract.propertyList
+        wrongPath["ProgramArguments"] = ["/Applications/Other.app/Contents/MacOS/Other"]
+        try PropertyListSerialization.data(fromPropertyList: wrongPath, format: .xml, options: 0)
+            .write(to: contract.launchAgentURL, options: [.atomic])
+        XCTAssertFalse(inspector.inspect(contract).exactPath)
+        XCTAssertFalse(inspector.inspect(contract).exactContract)
+
+        var extraKeys = contract.propertyList
+        extraKeys["Unexpected"] = true
+        try PropertyListSerialization.data(fromPropertyList: extraKeys, format: .xml, options: 0)
+            .write(to: contract.launchAgentURL, options: [.atomic])
+        XCTAssertFalse(inspector.inspect(contract).ownedByMacOrchestrator)
+
+        try FileManager.default.removeItem(at: contract.launchAgentURL)
+        let unrelated = home.appendingPathComponent("unrelated.plist")
+        try Data("unrelated".utf8).write(to: unrelated)
+        try FileManager.default.createSymbolicLink(
+            at: contract.launchAgentURL,
+            withDestinationURL: unrelated
+        )
+        let symlinkWriteOutcome = await writer.writeExactManagedContract(contract)
+        XCTAssertEqual(symlinkWriteOutcome, .refused)
+        XCTAssertFalse(inspector.inspect(contract).exactPath)
+    }
+
+    func testLaunchAgentPathsRejectSymlinkedAncestorWithoutForeignReadOrWrite() async throws {
+        let root = try makeTemporaryDirectory()
+        let home = root.appendingPathComponent("home", isDirectory: true)
+        let foreignLibrary = root.appendingPathComponent("foreign-library", isDirectory: true)
+        let foreignLaunchAgents = foreignLibrary.appendingPathComponent("LaunchAgents", isDirectory: true)
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: foreignLaunchAgents, withIntermediateDirectories: true)
+
+        let library = home.appendingPathComponent("Library", isDirectory: true)
+        try FileManager.default.createSymbolicLink(at: library, withDestinationURL: foreignLibrary)
+
+        let contract = ManagedLaunchAgentContract(homeDirectory: home)
+        let foreignLaunchAgent = foreignLaunchAgents.appendingPathComponent(
+            ManagedLaunchAgentContract.label + ".plist",
+            isDirectory: false
+        )
+        let foreignData = try contract.propertyListData()
+        try foreignData.write(to: foreignLaunchAgent)
+
+        let inspector = FileSystemLaunchAgentOwnershipInspector()
+        XCTAssertFalse(inspector.inspect(contract).ownedByMacOrchestrator)
+
+        let reloader = RecordingLaunchAgentReloader(result: .repaired)
+        let writer = FileSystemManagedLaunchAgentWriter(reloader: reloader)
+        let writeOutcome = await writer.writeExactManagedContract(contract)
+        let reloadedContracts = await reloader.reloadedContracts
+        XCTAssertEqual(writeOutcome, .refused)
+        XCTAssertEqual(reloadedContracts, [])
+        XCTAssertEqual(try Data(contentsOf: foreignLaunchAgent), foreignData)
+    }
+
+    func testLaunchAgentWriterRequiresSuccessfulReload() async throws {
+        let home = makeTemporaryHome()
+        let contract = ManagedLaunchAgentContract(homeDirectory: home)
+        try FileManager.default.createDirectory(
+            at: contract.launchAgentURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+
+        let failedReloader = RecordingLaunchAgentReloader(result: .failed)
+        let failedWriter = FileSystemManagedLaunchAgentWriter(reloader: failedReloader)
+        let failedWriteOutcome = await failedWriter.writeExactManagedContract(contract)
+        let failedReloadedContracts = await failedReloader.reloadedContracts
+        XCTAssertEqual(failedWriteOutcome, .failed)
+        XCTAssertEqual(failedReloadedContracts, [contract])
+
+        let userActionReloader = RecordingLaunchAgentReloader(result: .requiresUserAction)
+        let userActionWriter = FileSystemManagedLaunchAgentWriter(reloader: userActionReloader)
+        let userActionOutcome = await userActionWriter.writeExactManagedContract(contract)
+        XCTAssertEqual(userActionOutcome, .requiresUserAction)
+
+        let notNeededReloader = RecordingLaunchAgentReloader(result: .notNeeded)
+        let notNeededWriter = FileSystemManagedLaunchAgentWriter(reloader: notNeededReloader)
+        let notNeededOutcome = await notNeededWriter.writeExactManagedContract(contract)
+        XCTAssertEqual(notNeededOutcome, .notNeeded)
+    }
+
+    func testLaunchAgentRepairPassesExactContractOnlyAfterOwnershipGuard() async {
+        let contract = ManagedLaunchAgentContract(homeDirectory: makeTemporaryHome())
+        let writer = RecordingLaunchAgentWriter()
+        let repairer = ManagedLaunchAgentRepairer(
+            contract: contract,
+            ownership: StaticLaunchAgentOwnershipFacts(
+                exactLabel: true,
+                exactPath: true,
+                exactContract: true,
+                ownedByMacOrchestrator: true
+            ),
+            writer: writer
+        )
+
+        let repairOutcome = await repairer.repairManagedLaunchAgent()
+        let writtenContracts = await writer.writtenContracts
+        XCTAssertEqual(repairOutcome, .repaired)
+        XCTAssertEqual(writtenContracts, [contract])
+    }
+
+    func testLaunchAgentRepairAllowsMissingSafeTargetAndMalformedOwnedContract() async {
+        let contract = ManagedLaunchAgentContract(homeDirectory: makeTemporaryHome())
+        for facts in [
+            LaunchAgentOwnershipFacts(
+                exactLabel: false,
+                exactPath: false,
+                exactContract: false,
+                targetSafe: true,
+                targetExists: false
+            ),
+            LaunchAgentOwnershipFacts(
+                exactLabel: true,
+                exactPath: true,
+                exactContract: false,
+                targetSafe: true,
+                targetExists: true
+            ),
+        ] {
+            let writer = RecordingLaunchAgentWriter()
+            let repairer = ManagedLaunchAgentRepairer(
+                contract: contract,
+                ownership: StaticLaunchAgentOwnershipFacts(facts: facts),
+                writer: writer
+            )
+            let repairOutcome = await repairer.repairManagedLaunchAgent()
+            let writeCount = await writer.writeCount
+            XCTAssertEqual(repairOutcome, .repaired)
+            XCTAssertEqual(writeCount, 1)
+        }
+
+        let foreignWriter = RecordingLaunchAgentWriter()
+        let foreignRepairer = ManagedLaunchAgentRepairer(
+            contract: contract,
+            ownership: StaticLaunchAgentOwnershipFacts(facts: LaunchAgentOwnershipFacts(
+                exactLabel: false,
+                exactPath: true,
+                exactContract: false,
+                targetSafe: true,
+                targetExists: true
+            )),
+            writer: foreignWriter
+        )
+        let foreignOutcome = await foreignRepairer.repairManagedLaunchAgent()
+        let foreignWriteCount = await foreignWriter.writeCount
+        XCTAssertEqual(foreignOutcome, .refused)
+        XCTAssertEqual(foreignWriteCount, 0)
+    }
+
+    func testOwnershipFactsDefaultToFalse() {
+        let facts = LaunchAgentOwnershipFacts(exactLabel: true, exactPath: true, exactContract: true)
+        XCTAssertFalse(facts.ownedByMacOrchestrator)
+    }
+
+    func testConcreteLifecycleHandoffIsOwnershipGuarded() async {
+        let refused = OwnershipGuardedLifecycleHandoff(
+            ownership: LifecycleOwnershipFacts(mcpServerOwned: false, remoteConnectorOwned: true)
+        )
+        let allowed = OwnershipGuardedLifecycleHandoff(
+            ownership: LifecycleOwnershipFacts(mcpServerOwned: true, remoteConnectorOwned: true)
+        )
+
+        let refusedServer = await refused.retry(.mcpServer)
+        let refusedRemote = await refused.retry(.remoteConnector)
+        let allowedServer = await allowed.retry(.mcpServer)
+        XCTAssertEqual(refusedServer.status, .refused)
+        XCTAssertEqual(refusedRemote.status, .requiresUserAction)
+        XCTAssertEqual(allowedServer.status, .requiresUserAction)
+    }
+
+    func testVerifiedBootstrapOnlyHandsOffPinnedVerifiedContext() async {
+        let unverified = PinnedVerifiedBootstrapHandoff(
+            context: VerifiedBootstrapContext(releasePinned: false, artifactVerified: true, helperOwned: true)
+        )
+        let verified = PinnedVerifiedBootstrapHandoff(
+            context: VerifiedBootstrapContext(releasePinned: true, artifactVerified: true, helperOwned: true)
+        )
+
+        let unverifiedOutcome = await RepairEngine(
+            dependencies: RepairDependencies(verifiedBootstrapHandingOff: unverified)
+        ).execute(.rerunVerifiedBootstrap)
+        XCTAssertEqual(unverifiedOutcome.status, .refused)
+        let outcome = await RepairEngine(dependencies: RepairDependencies(
+            verifiedBootstrapHandingOff: verified
+        )).execute(.rerunVerifiedBootstrap)
+        XCTAssertEqual(outcome.status, .requiresUserAction)
+        XCTAssertTrue(outcome.reason.localizedCaseInsensitiveContains("verified"))
+        XCTAssertFalse(outcome.reason.contains("http"))
+    }
+
+    func testOutcomesNeverExposeProviderErrorsSecretsURLsOrHomePaths() async {
+        let engine = RepairEngine(dependencies: RepairDependencies(
+            lifecycleRetrying: RecordingRepairAdapters(result: .failed),
+            permissionSettingsOpening: RecordingRepairAdapters(result: .failed),
+            configurationBackupRestoring: RecordingRepairAdapters(result: .failed),
+            localPortReassigning: RecordingRepairAdapters(result: .failed),
+            launchAgentRepairing: RecordingRepairAdapters(result: .failed),
+            verifiedBootstrapHandingOff: RecordingRepairAdapters(result: .failed)
+        ))
+
+        for action in RepairActionID.allCases {
+            let outcome = await engine.execute(action)
+            XCTAssertFalse(outcome.reason.contains("secret-value"))
+            XCTAssertFalse(outcome.reason.contains("https://"))
+            XCTAssertFalse(outcome.reason.contains("/Users/"))
+            XCTAssertFalse(outcome.reason.contains("provider exploded"))
+        }
+    }
+
+    func testUnknownRepairReasonsMapToBoundedFixedText() {
+        let outcome = RepairOutcome(
+            action: .retryMCPServer,
+            status: .failed,
+            reason: String(repeating: "provider exploded https://secret.example/token /Users/jay", count: 100)
+        )
+
+        XCTAssertEqual(outcome.reason, "The requested repair failed safely; review Doctor diagnostics.")
+        XCTAssertLessThanOrEqual(outcome.reason.count, 160)
+        XCTAssertFalse(outcome.reason.contains("https://"))
+        XCTAssertFalse(outcome.reason.contains("/Users/"))
+        XCTAssertFalse(outcome.reason.contains("token"))
+    }
+
+    func testEveryActionAndStatusHasOnlyFixedBoundedReason() {
+        for action in RepairActionID.allCases {
+            for status in RepairOutcomeStatus.allCases {
+                let outcome = RepairOutcome(action: action, status: status, reason: "untrusted provider detail")
+                XCTAssertLessThanOrEqual(outcome.reason.count, 160)
+                XCTAssertFalse(outcome.reason.contains("untrusted provider detail"))
+                XCTAssertFalse(outcome.reason.contains("http"))
+                XCTAssertFalse(outcome.reason.contains("/Users/"))
+            }
+        }
+    }
+
+    func testRepairEngineContainsNoGenericCommandOrRawReasonLeakage() throws {
+        let sourceURL = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Sources/MacOrchestrator/RepairEngine.swift")
+        let source = try String(contentsOf: sourceURL, encoding: .utf8)
+        XCTAssertFalse(source.contains("Process("))
+        XCTAssertFalse(source.contains("curl|sh"))
+        XCTAssertFalse(source.contains("/bin/sh"))
+        XCTAssertFalse(source.contains("provider exploded"))
+    }
+
+    private func makeTemporaryDirectory() throws -> URL {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("MacOrchestratorRepairTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        return directory
+    }
+
+    private func makeTemporaryHome() -> URL {
+        let home = FileManager.default.temporaryDirectory
+            .appendingPathComponent("MacOrchestratorRepairHome-\(UUID().uuidString)", isDirectory: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: home) }
+        return home
+    }
+}
+
+private actor RecordingRepairAdapters:
+    LifecycleRetrying,
+    PermissionSettingsOpening,
+    ConfigurationBackupRestoring,
+    LocalPortReassigning,
+    LaunchAgentRepairing,
+    VerifiedBootstrapHandingOff {
+    private let result: RepairAdapterResult
+    private var lifecycleCount = 0
+    private var permissionCount = 0
+    private var backupCount = 0
+    private var portCount = 0
+    private var launchAgentCount = 0
+    private var bootstrapCount = 0
+
+    init(result: RepairAdapterResult = .repaired) {
+        self.result = result
+    }
+
+    func retry(_ target: LifecycleRepairTarget) async -> RepairAdapterResult {
+        lifecycleCount += 1
+        return result
+    }
+
+    func open(_ pane: PermissionSettingsPane) async -> RepairAdapterResult {
+        permissionCount += 1
+        return result
+    }
+
+    func restoreValidatedBackup() async -> RepairAdapterResult {
+        backupCount += 1
+        return result
+    }
+
+    func reassignLocalPort() async -> RepairAdapterResult {
+        portCount += 1
+        return result
+    }
+
+    func repairManagedLaunchAgent() async -> RepairAdapterResult {
+        launchAgentCount += 1
+        return result
+    }
+
+    func handoffVerifiedBootstrap() async -> RepairAdapterResult {
+        bootstrapCount += 1
+        return result
+    }
+
+    func counts() -> (lifecycle: Int, permission: Int, backup: Int, port: Int, launchAgent: Int, bootstrap: Int, total: Int) {
+        let values = [lifecycleCount, permissionCount, backupCount, portCount, launchAgentCount, bootstrapCount]
+        return (lifecycleCount, permissionCount, backupCount, portCount, launchAgentCount, bootstrapCount, values.reduce(0, +))
+    }
+}
+
+private actor RecordingSettingsURLOpener: SystemSettingsURLOpening {
+    let result: Bool
+    private(set) var openedURLs: [URL] = []
+
+    init(result: Bool) {
+        self.result = result
+    }
+
+    func open(_ url: URL) async -> Bool {
+        openedURLs.append(url)
+        return result
+    }
+}
+
+private actor SequencedPortOccupancy: LocalPortOccupancyChecking {
+    private var results: [LocalPortOccupancy]
+    private(set) var ports: [Int] = []
+
+    init(results: [LocalPortOccupancy]) {
+        self.results = results
+    }
+
+    func inspect(port: Int) async -> LocalPortOccupancy {
+        ports.append(port)
+        return results.isEmpty ? .unknown : results.removeFirst()
+    }
+}
+
+private actor RecordingPortUpdater: CanonicalLocalPortUpdating {
+    private(set) var updatedPorts: [Int] = []
+    private(set) var terminatedListeners = 0
+
+    func updateLocalMCPPort(_ port: Int) async throws {
+        updatedPorts.append(port)
+    }
+}
+
+private actor RecordingLaunchAgentWriter: ExactLaunchAgentContractWriting {
+    private(set) var writeCount = 0
+    private(set) var writtenContracts: [ManagedLaunchAgentContract] = []
+
+    func writeExactManagedContract(_ contract: ManagedLaunchAgentContract) async -> RepairAdapterResult {
+        writeCount += 1
+        writtenContracts.append(contract)
+        return .repaired
+    }
+}
+
+private actor RecordingLaunchAgentReloader: ManagedLaunchAgentReloading {
+    let result: RepairAdapterResult
+    private(set) var reloadedContracts: [ManagedLaunchAgentContract] = []
+
+    init(result: RepairAdapterResult) {
+        self.result = result
+    }
+
+    func reloadManagedLaunchAgent(_ contract: ManagedLaunchAgentContract) async -> RepairAdapterResult {
+        reloadedContracts.append(contract)
+        return result
+    }
+}
+
+private struct StaticLaunchAgentOwnershipFacts: LaunchAgentOwnershipInspecting {
+    let facts: LaunchAgentOwnershipFacts
+
+    init(
+        exactLabel: Bool,
+        exactPath: Bool,
+        exactContract: Bool,
+        ownedByMacOrchestrator: Bool = false,
+        targetSafe: Bool = false,
+        targetExists: Bool = false
+    ) {
+        self.facts = LaunchAgentOwnershipFacts(
+            exactLabel: exactLabel,
+            exactPath: exactPath,
+            exactContract: exactContract,
+            ownedByMacOrchestrator: ownedByMacOrchestrator,
+            targetSafe: targetSafe,
+            targetExists: targetExists
+        )
+    }
+
+    init(facts: LaunchAgentOwnershipFacts) {
+        self.facts = facts
+    }
+
+    func inspect(_ contract: ManagedLaunchAgentContract) -> LaunchAgentOwnershipFacts { facts }
+}

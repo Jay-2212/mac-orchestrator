@@ -94,7 +94,22 @@ select_test_plutil() {
     '    print(args[1] + ": OK")' \
     '    raise SystemExit(0)' \
     'if args and args[0] == "-convert":' \
-    '    load(args[-1])' \
+    '    document = load(args[-1])' \
+    '    if "-o" in args:' \
+    '        save(args[args.index("-o") + 1], document)' \
+    '    raise SystemExit(0)' \
+    'if args and args[0] == "-create":' \
+    '    save(args[-1], {})' \
+    '    raise SystemExit(0)' \
+    'if args and args[0] == "-insert":' \
+    '    document = load(args[-1])' \
+    '    key = args[1]' \
+    '    kind = args[2]' \
+    '    value = args[3]' \
+    '    if kind == "-integer": value = int(value)' \
+    '    elif kind == "-bool": value = value == "true"' \
+    '    document[key] = value' \
+    '    save(args[-1], document)' \
     '    raise SystemExit(0)' \
     'if args and args[0] == "-extract":' \
     '    value = walk(load(args[-1]), args[1])' \
@@ -859,6 +874,72 @@ test_release_publication_consumes_generated_body() {
   assert_contains "$release_contents" "--generate-notes" || return 1
 }
 
+test_manifest_signature_uses_external_key_and_raw_bytes() {
+  manifest="$TEST_ROOT/signature-manifest.json"
+  key="$TEST_ROOT/fixture-signing-key.pem"
+  signature="$TEST_ROOT/manifest.sig"
+  printf '%s\n' '{"raw":"manifest"}' > "$manifest"
+  openssl genpkey -algorithm ED25519 -out "$key" >/dev/null 2>&1 || return 1
+  output="$(bash "$PROJECT_DIR/script/sign_release_manifest.sh" \
+    --manifest "$manifest" \
+    --private-key "$key" \
+    --key-id fixture-v1 \
+    --output "$signature" 2>&1)" || { echo "$output" >&2; return 1; }
+  python3 - "$signature" "$TEST_ROOT/signature.bin" <<'PY'
+import base64
+import json
+import pathlib
+import sys
+
+envelope = json.loads(pathlib.Path(sys.argv[1]).read_text())
+assert envelope["schemaVersion"] == 1
+assert envelope["algorithm"] == "ed25519"
+assert envelope["keyID"] == "fixture-v1"
+pathlib.Path(sys.argv[2]).write_bytes(base64.b64decode(envelope["signature"], validate=True))
+PY
+  if ! openssl pkey -in "$key" -pubout -out "$TEST_ROOT/fixture-signing-key.pub" >/dev/null 2>&1; then
+    python3 - "$key" "$TEST_ROOT/private.der" <<'PY' || return 1
+import base64
+import pathlib
+import sys
+
+source, destination = sys.argv[1:]
+text = pathlib.Path(source).read_text(encoding="utf-8")
+body = text.split("-----BEGIN " + "PRIVATE KEY-----", 1)[1].split("-----END " + "PRIVATE KEY-----", 1)[0]
+pathlib.Path(destination).write_bytes(base64.b64decode("".join(body.split()), validate=True))
+PY
+    swift - "$TEST_ROOT/private.der" "$TEST_ROOT/fixture-signing-key.pub" <<'SWIFT' || return 1
+import CryptoKit
+import Foundation
+
+let arguments = CommandLine.arguments
+guard arguments.count == 3 else { exit(2) }
+let der = try Data(contentsOf: URL(fileURLWithPath: arguments[1]))
+let prefix = Data([0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20])
+guard der.count == 48, der.prefix(prefix.count) == prefix else { exit(3) }
+let privateKey = try Curve25519.Signing.PrivateKey(rawRepresentation: Data(der.suffix(32)))
+let publicPrefix = Data([0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00])
+let publicDER = publicPrefix + privateKey.publicKey.rawRepresentation
+let raw = publicDER.base64EncodedString(options: [.lineLength64Characters, .endLineWithLineFeed])
+let pem = "-----BEGIN PUBLIC KEY-----\n\(raw)-----END PUBLIC KEY-----\n"
+try pem.write(to: URL(fileURLWithPath: arguments[2]), atomically: true, encoding: .utf8)
+SWIFT
+  fi
+  bash "$PROJECT_DIR/script/verify_release_manifest.sh" \
+    --manifest "$manifest" \
+    --signature "$signature" \
+    --public-key "$TEST_ROOT/fixture-signing-key.pub" \
+    --key-id fixture-v1 >/dev/null 2>&1 || return 1
+  output="$(bash "$PROJECT_DIR/script/sign_release_manifest.sh" \
+    --manifest "$manifest" \
+    --private-key "$PROJECT_DIR/script/bootstrap.sh" \
+    --key-id fixture-v1 \
+    --output "$TEST_ROOT/rejected.sig" 2>&1)"
+  rc=$?
+  [ "$rc" -ne 0 ] || return 1
+  assert_contains "$output" "outside the repository" || return 1
+}
+
 test_package_app_helper_contract() {
   package_contents="$(/bin/cat "$PROJECT_DIR/script/package_app.sh")" || return 1
   assert_contains "$package_contents" "arm64" || return 1
@@ -952,6 +1033,7 @@ run_test "generated release body contains pinned install command" test_generated
 run_test "generated release body changes with manifest digest" test_generated_release_body_changes_with_manifest_digest
 run_test "release body rejects untrusted inputs" test_release_body_rejects_untrusted_inputs
 run_test "release publication consumes generated body" test_release_publication_consumes_generated_body
+run_test "manifest signature uses external key and raw bytes" test_manifest_signature_uses_external_key_and_raw_bytes
 run_test "package helper contract" test_package_app_helper_contract
 run_test "release output does not redistribute ngrok" test_release_output_does_not_redistribute_ngrok
 run_test "bootstrap completion waits for activation" test_bootstrap_completion_is_activation_gated

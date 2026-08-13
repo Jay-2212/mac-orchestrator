@@ -88,6 +88,16 @@ final class SupervisorPolicyTests: XCTestCase {
             component: .server,
             ownerID: "owner-123"
         ))
+        XCTAssertFalse(ProcessOwnership.matches(
+            commandLine: "python automac_mcp.py --managed-owner owner-1234",
+            component: .server,
+            ownerID: "owner-123"
+        ))
+        XCTAssertFalse(ProcessOwnership.matches(
+            commandLine: "ngrok http --metadata mac-orchestrator-owner=owner-1234",
+            component: .tunnel,
+            ownerID: "owner-123"
+        ))
     }
 
     func testConnectorURLUsesOnlyHTTPSAndAppendsCapabilityPath() {

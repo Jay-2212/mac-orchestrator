@@ -160,7 +160,8 @@ struct ManagedRuntimeTransition: Equatable, Sendable {
         let runtimeEnvironmentChanged = runtimeEnvironmentNames.contains { name in
             current.environment[name] != replacement.environment[name]
         }
-        let requiresRestart = snapshotChanged || endpointChanged || runtimeEnvironmentChanged
+        let ngrokCredentialChanged = current.ngrokAuthtoken != replacement.ngrokAuthtoken
+        let requiresRestart = snapshotChanged || endpointChanged || runtimeEnvironmentChanged || ngrokCredentialChanged
         return ManagedRuntimeTransition(
             requiresRestart: requiresRestart,
             requiresClientRefresh: requiresRestart

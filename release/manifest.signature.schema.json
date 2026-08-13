@@ -1,0 +1,21 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "mac-orchestrator-release-manifest-signature-v1",
+  "title": "Mac Orchestrator detached manifest signature envelope",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "algorithm", "keyID", "signature"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "algorithm": { "const": "ed25519" },
+    "keyID": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._-]+$",
+      "minLength": 1
+    },
+    "signature": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9+/]{86}==$"
+    }
+  }
+}

@@ -1,13 +1,11 @@
 import Foundation
 
 struct StreamingLogRedactor: Sendable {
-    private let secrets: [String]
+    private let redactor: SensitiveDataRedactor
     private var pending = ""
 
     init(secrets: [String]) {
-        self.secrets = secrets
-            .filter { !$0.isEmpty }
-            .sorted { $0.count > $1.count }
+        self.redactor = SensitiveDataRedactor(exactSecrets: secrets, homeDirectory: nil)
     }
 
     mutating func append(_ chunk: String, flush: Bool) -> [String] {
@@ -26,9 +24,7 @@ struct StreamingLogRedactor: Sendable {
     }
 
     private func redact(_ line: String) -> String {
-        secrets.reduce(line) { value, secret in
-            value.replacingOccurrences(of: secret, with: "<redacted>")
-        }
+        redactor.redact(line)
     }
 }
 

@@ -1,6 +1,27 @@
 import Foundation
 import Security
 
+protocol SecureRandomByteGenerating: Sendable {
+    func randomBytes(count: Int) throws -> [UInt8]
+}
+
+struct SystemSecureRandomByteGenerator: SecureRandomByteGenerating {
+    func randomBytes(count: Int) throws -> [UInt8] {
+        guard count >= 0 else { throw KeychainStoreError.randomGenerationFailed }
+        var bytes = [UInt8](repeating: 0, count: count)
+        let status: OSStatus = count == 0
+            ? errSecSuccess
+            : bytes.withUnsafeMutableBytes { buffer in
+                guard let baseAddress = buffer.baseAddress else { return errSecParam }
+                return SecRandomCopyBytes(kSecRandomDefault, count, baseAddress)
+            }
+        guard status == errSecSuccess else {
+            throw KeychainStoreError.randomGenerationFailed
+        }
+        return bytes
+    }
+}
+
 protocol KeychainClient {
     func read(service: String, account: String) throws -> String?
     func create(value: String, service: String, account: String) throws
@@ -19,6 +40,9 @@ extension KeychainClient {
 enum KeychainStoreError: Error, Equatable, LocalizedError, Sendable {
     case itemNotFound
     case invalidValue
+    case invalidConnectorToken
+    case concurrentModification
+    case readBackMismatch
     case operationFailed(Int)
     case randomGenerationFailed
 
@@ -28,6 +52,12 @@ enum KeychainStoreError: Error, Equatable, LocalizedError, Sendable {
             return "The requested Keychain item was not found."
         case .invalidValue:
             return "The requested Keychain item contains invalid data."
+        case .invalidConnectorToken:
+            return "The connector identity has an invalid format."
+        case .concurrentModification:
+            return "The Keychain item changed before it could be replaced."
+        case .readBackMismatch:
+            return "The Keychain item could not be verified after replacement."
         case let .operationFailed(status):
             return "The Keychain operation failed with status " + String(status) + "."
         case .randomGenerationFailed:
@@ -166,13 +196,16 @@ enum KeychainItem: Codable, Equatable, Hashable, Sendable {
 struct KeychainStore {
     private let client: KeychainClient
     private let meridianAccount: String
+    private let random: any SecureRandomByteGenerating
 
     init(
         client: KeychainClient = SystemKeychainClient(),
-        meridianAccount: String = NSUserName()
+        meridianAccount: String = NSUserName(),
+        random: any SecureRandomByteGenerating = SystemSecureRandomByteGenerator()
     ) {
         self.client = client
         self.meridianAccount = meridianAccount
+        self.random = random
     }
 
     static func connectorToken() throws -> String {
@@ -211,11 +244,7 @@ struct KeychainStore {
             return existing
         }
 
-        var bytes = [UInt8](repeating: 0, count: 32)
-        guard SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) == errSecSuccess else {
-            throw KeychainStoreError.randomGenerationFailed
-        }
-        let generated = bytes.map { String(format: "%02x", $0) }.joined()
+        let generated = try generateConnectorToken()
         do {
             try set(generated, for: .connectorToken)
             return generated
@@ -226,6 +255,74 @@ struct KeychainStore {
             }
             throw error
         }
+    }
+
+    func generateConnectorToken() throws -> String {
+        let bytes: [UInt8]
+        do {
+            bytes = try random.randomBytes(count: 32)
+        } catch {
+            throw KeychainStoreError.randomGenerationFailed
+        }
+        guard bytes.count == 32 else {
+            throw KeychainStoreError.randomGenerationFailed
+        }
+        return bytes.map { String(format: "%02x", $0) }.joined()
+    }
+
+    func replaceConnectorToken(expectedCurrent: String, with newValue: String) throws {
+        guard Self.isConnectorToken(newValue) else {
+            throw KeychainStoreError.invalidConnectorToken
+        }
+        guard try value(for: .connectorToken) == expectedCurrent else {
+            throw KeychainStoreError.concurrentModification
+        }
+        try client.update(
+            value: newValue,
+            service: KeychainItem.connectorToken.service,
+            account: KeychainItem.connectorToken.account
+        )
+        guard try value(for: .connectorToken) == newValue else {
+            throw KeychainStoreError.readBackMismatch
+        }
+    }
+
+    func replaceNgrokAuthtoken(expectedCurrent: String?, with newValue: String) throws {
+        guard !newValue.isEmpty else {
+            throw KeychainStoreError.invalidValue
+        }
+
+        let item = KeychainItem.ngrokAuthtoken
+        let current = try value(for: item)
+        switch (expectedCurrent, current) {
+        case let (.some(expected), .some(actual)) where expected == actual:
+            try client.update(value: newValue, service: item.service, account: item.account)
+            guard try value(for: item) == newValue else {
+                throw KeychainStoreError.readBackMismatch
+            }
+        case (.none, .none):
+            do {
+                try client.create(value: newValue, service: item.service, account: item.account)
+            } catch let error as KeychainStoreError {
+                if case let .operationFailed(status) = error, status == Int(errSecDuplicateItem) {
+                    throw KeychainStoreError.concurrentModification
+                }
+                throw error
+            }
+            guard try value(for: item) == newValue else {
+                throw KeychainStoreError.readBackMismatch
+            }
+        default:
+            throw KeychainStoreError.concurrentModification
+        }
+    }
+
+    func deleteNgrokAuthtoken(expectedCurrent: String?) throws {
+        let item = KeychainItem.ngrokAuthtoken
+        guard try value(for: item) == expectedCurrent else {
+            throw KeychainStoreError.concurrentModification
+        }
+        try client.delete(service: item.service, account: item.account)
     }
 
     func meridianIngestToken() throws -> String? {
@@ -240,5 +337,10 @@ struct KeychainStore {
 
     var meridianIngestItem: KeychainItem {
         .meridianIngestToken(account: meridianAccount)
+    }
+
+    private static func isConnectorToken(_ value: String) -> Bool {
+        let hexadecimal = Set("0123456789abcdef")
+        return value.count == 64 && value.allSatisfy { hexadecimal.contains($0) }
     }
 }

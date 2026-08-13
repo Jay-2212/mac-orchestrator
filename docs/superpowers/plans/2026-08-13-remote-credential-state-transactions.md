@@ -121,7 +121,7 @@
 - Test: `Tests/MacOrchestratorTests/RemoteConnectorStateTests.swift`
 
 **Interfaces:**
-- Produce `RemoteConnectorProvider`, `RemoteResultClassification`, `RemoteConnectorRecoveryPhase`, `RemotePublicOrigin`, `RemoteConnectorStateV1`, `RemoteConnectorStateStoreError`, and `RemoteConnectorStateStore` with `load()`, `loadOrCreate(provider:)`, `save(_:)`, and `update(_:)`.
+- Produce `RemoteConnectorProvider`, `RemoteResultClassification`, `RemoteConnectorRecoveryPhase`, `RemotePublicOrigin`, `RemoteConnectorStateV1`, `RemoteConnectorStateStoreError`, `RemoteConnectorStatePersisting`, and `RemoteConnectorStateStore` with `load()`, `loadOrCreate(provider:)`, `save(_:)`, and `update(_:)`.
 
 - [ ] **Step 1: Add model validation tests for exact schema, unknown keys, provider, phase/pending-generation invariants, public origin restrictions, and handoff/generation monotonicity.**
 
@@ -260,7 +260,7 @@
 - Modify: `Sources/MacOrchestrator/RemoteCredentialTransaction.swift`
 
 **Interfaces:**
-- Produce `NgrokCredentialFailurePolicy`, `NgrokCredentialCandidateValidationHooks`, `NgrokCredentialReplacementError`, `NgrokCredentialReplacementReceipt`, and `NgrokCredentialReplacementTransaction.execute(candidate:)`.
+- Produce `NgrokCredentialFailurePolicy`, `NgrokCredentialCandidateValidationHooks`, `NgrokCredentialReplacementError`, `NgrokCredentialReplacementReceipt`, and `NgrokCredentialReplacementTransaction.execute(candidate:)`; compromised-old clearing must compare the expected old Keychain value before deleting it.
 
 - [ ] **Step 1: Add failing tests for delayed commit, endpoint/readiness validation, normal failure preserving old Keychain value, normal repair hook invocation, compromised-old failure never restoring/using old value, and candidate/old secret exclusion from errors/results.**
 

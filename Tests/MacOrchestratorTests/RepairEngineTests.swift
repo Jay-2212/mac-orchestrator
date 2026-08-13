@@ -177,6 +177,42 @@ final class RepairEngineTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: store.configurationURL.path + ".corrupt"))
     }
 
+    func testSymlinkedConfigurationAncestorIsRefusedWithoutForeignReadOrPromotion() async throws {
+        let root = try makeTemporaryDirectory()
+        let foreignDirectory = root.appendingPathComponent("foreign-config", isDirectory: true)
+        try FileManager.default.createDirectory(at: foreignDirectory, withIntermediateDirectories: true)
+
+        let foreignStore = ConfigurationStore(directoryURL: foreignDirectory, ownerIDProvider: { "owner-test" })
+        _ = try foreignStore.loadOrCreate()
+        let malformedPrimary = Data("{malformed-primary".utf8)
+        try malformedPrimary.write(to: foreignStore.configurationURL)
+
+        var validBackup = AppConfiguration.fresh(ownerID: "owner-test")
+        validBackup.localMCPPort = 8123
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode(validBackup).write(to: foreignStore.backupURL)
+        let foreignPrimaryBefore = try Data(contentsOf: foreignStore.configurationURL)
+        let foreignBackupBefore = try Data(contentsOf: foreignStore.backupURL)
+
+        let redirectedDirectory = root.appendingPathComponent("redirected-config", isDirectory: true)
+        try FileManager.default.createSymbolicLink(
+            at: redirectedDirectory,
+            withDestinationURL: foreignDirectory
+        )
+        let unsafeStore = ConfigurationStore(directoryURL: redirectedDirectory, ownerIDProvider: { "owner-test" })
+        let restorer = ConfigurationStoreBackupRestorer(store: unsafeStore, expectedOwnerID: "owner-test")
+
+        let outcome = await RepairEngine(dependencies: RepairDependencies(
+            configurationBackupRestoring: restorer
+        )).execute(.restoreConfigurationBackup)
+
+        XCTAssertEqual(outcome.status, .refused)
+        XCTAssertEqual(try Data(contentsOf: foreignStore.configurationURL), foreignPrimaryBefore)
+        XCTAssertEqual(try Data(contentsOf: foreignStore.backupURL), foreignBackupBefore)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: foreignStore.configurationURL.path + ".corrupt"))
+    }
+
     func testValidBackupRestoresAndPreservesBadPrimary() async throws {
         let root = try makeTemporaryDirectory()
         let store = ConfigurationStore(directoryURL: root, ownerIDProvider: { "owner-test" })
@@ -395,6 +431,35 @@ final class RepairEngineTests: XCTestCase {
         XCTAssertFalse(inspector.inspect(contract).exactPath)
     }
 
+    func testLaunchAgentPathsRejectSymlinkedAncestorWithoutForeignReadOrWrite() async throws {
+        let root = try makeTemporaryDirectory()
+        let home = root.appendingPathComponent("home", isDirectory: true)
+        let foreignLibrary = root.appendingPathComponent("foreign-library", isDirectory: true)
+        let foreignLaunchAgents = foreignLibrary.appendingPathComponent("LaunchAgents", isDirectory: true)
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: foreignLaunchAgents, withIntermediateDirectories: true)
+
+        let library = home.appendingPathComponent("Library", isDirectory: true)
+        try FileManager.default.createSymbolicLink(at: library, withDestinationURL: foreignLibrary)
+
+        let contract = ManagedLaunchAgentContract(homeDirectory: home)
+        let foreignLaunchAgent = foreignLaunchAgents.appendingPathComponent(
+            ManagedLaunchAgentContract.label + ".plist",
+            isDirectory: false
+        )
+        let foreignData = try contract.propertyListData()
+        try foreignData.write(to: foreignLaunchAgent)
+
+        let inspector = FileSystemLaunchAgentOwnershipInspector()
+        XCTAssertFalse(inspector.inspect(contract).ownedByMacOrchestrator)
+
+        let reloader = RecordingLaunchAgentReloader(result: .repaired)
+        let writer = FileSystemManagedLaunchAgentWriter(reloader: reloader)
+        XCTAssertEqual(await writer.writeExactManagedContract(contract), .refused)
+        XCTAssertEqual(await reloader.reloadedContracts, [])
+        XCTAssertEqual(try Data(contentsOf: foreignLaunchAgent), foreignData)
+    }
+
     func testLaunchAgentWriterRequiresSuccessfulReload() async throws {
         let home = makeTemporaryHome()
         let contract = ManagedLaunchAgentContract(homeDirectory: home)
@@ -411,6 +476,10 @@ final class RepairEngineTests: XCTestCase {
         let userActionReloader = RecordingLaunchAgentReloader(result: .requiresUserAction)
         let userActionWriter = FileSystemManagedLaunchAgentWriter(reloader: userActionReloader)
         XCTAssertEqual(await userActionWriter.writeExactManagedContract(contract), .requiresUserAction)
+
+        let notNeededReloader = RecordingLaunchAgentReloader(result: .notNeeded)
+        let notNeededWriter = FileSystemManagedLaunchAgentWriter(reloader: notNeededReloader)
+        XCTAssertEqual(await notNeededWriter.writeExactManagedContract(contract), .notNeeded)
     }
 
     func testLaunchAgentRepairPassesExactContractOnlyAfterOwnershipGuard() async {

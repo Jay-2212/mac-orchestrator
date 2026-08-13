@@ -361,6 +361,40 @@ private enum SafeRepairReasons {
     }
 }
 
+private enum NonFollowingPathGuard {
+    static func isSafe(_ url: URL) -> Bool {
+        let path = url.standardizedFileURL.path
+        guard path.hasPrefix("/") else { return false }
+
+        let components = path.split(separator: "/", omittingEmptySubsequences: true)
+        var current = URL(fileURLWithPath: "/", isDirectory: true)
+
+        for (index, component) in components.enumerated() {
+            current.appendPathComponent(String(component), isDirectory: index < components.count - 1)
+
+            var metadata = stat()
+            if lstat(current.path, &metadata) == 0 {
+                let mode = UInt32(metadata.st_mode)
+                if mode & UInt32(S_IFMT) == UInt32(S_IFLNK) {
+                    return false
+                }
+                if index < components.count - 1,
+                   mode & UInt32(S_IFMT) != UInt32(S_IFDIR) {
+                    return false
+                }
+            } else if errno == ENOENT {
+                // The remaining descendants cannot exist while this component is absent.
+                // They may be created by an explicitly bounded repair and are rechecked after creation.
+                return true
+            } else {
+                return false
+            }
+        }
+
+        return true
+    }
+}
+
 struct ConfigurationStoreBackupRestorer: @unchecked Sendable, ConfigurationBackupRestoring {
     let store: ConfigurationStore
     let expectedOwnerID: String
@@ -372,6 +406,10 @@ struct ConfigurationStoreBackupRestorer: @unchecked Sendable, ConfigurationBacku
 
     func restoreValidatedBackup() async -> RepairAdapterResult {
         guard !expectedOwnerID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return .refused
+        }
+        guard NonFollowingPathGuard.isSafe(store.configurationURL),
+              NonFollowingPathGuard.isSafe(store.backupURL) else {
             return .refused
         }
 
@@ -399,7 +437,7 @@ struct ConfigurationStoreBackupRestorer: @unchecked Sendable, ConfigurationBacku
     }
 
     private func readValidatedConfiguration(at url: URL) -> AppConfiguration? {
-        guard !isSymlink(at: url) else { return nil }
+        guard NonFollowingPathGuard.isSafe(url) else { return nil }
         guard let data = try? Data(contentsOf: url) else { return nil }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
@@ -407,12 +445,6 @@ struct ConfigurationStoreBackupRestorer: @unchecked Sendable, ConfigurationBacku
             return nil
         }
         return try? decoded.validated()
-    }
-
-    private func isSymlink(at url: URL) -> Bool {
-        var metadata = stat()
-        guard lstat(url.path, &metadata) == 0 else { return false }
-        return UInt32(metadata.st_mode) & UInt32(S_IFMT) == UInt32(S_IFLNK)
     }
 }
 
@@ -613,10 +645,8 @@ struct FileSystemLaunchAgentOwnershipInspector: @unchecked Sendable, LaunchAgent
     }
 
     func inspect(_ contract: ManagedLaunchAgentContract) -> LaunchAgentOwnershipFacts {
-        let parentURL = contract.launchAgentURL.deletingLastPathComponent()
-        let safeTargetPath = fileManager.fileExists(atPath: contract.launchAgentURL.path)
-            && !isSymlink(at: parentURL)
-            && !isSymlink(at: contract.launchAgentURL)
+        let safeTargetPath = areContractPathsSafe(contract)
+            && fileManager.fileExists(atPath: contract.launchAgentURL.path)
         guard safeTargetPath,
               let data = try? Data(contentsOf: contract.launchAgentURL),
               let object = try? PropertyListSerialization.propertyList(from: data, format: nil) else {
@@ -635,10 +665,10 @@ struct FileSystemLaunchAgentOwnershipInspector: @unchecked Sendable, LaunchAgent
         )
     }
 
-    private func isSymlink(at url: URL) -> Bool {
-        var metadata = stat()
-        guard lstat(url.path, &metadata) == 0 else { return false }
-        return UInt32(metadata.st_mode) & UInt32(S_IFMT) == UInt32(S_IFLNK)
+    private func areContractPathsSafe(_ contract: ManagedLaunchAgentContract) -> Bool {
+        NonFollowingPathGuard.isSafe(contract.homeDirectory)
+            && NonFollowingPathGuard.isSafe(contract.launchAgentURL)
+            && NonFollowingPathGuard.isSafe(contract.launcherLogURL)
     }
 }
 
@@ -656,31 +686,29 @@ struct FileSystemManagedLaunchAgentWriter: @unchecked Sendable, ExactLaunchAgent
 
     func writeExactManagedContract(_ contract: ManagedLaunchAgentContract) async -> RepairAdapterResult {
         let parentURL = contract.launchAgentURL.deletingLastPathComponent()
-        guard !isSymlink(at: parentURL), !isSymlink(at: contract.launchAgentURL) else {
+        guard areContractPathsSafe(contract) else {
             return .refused
         }
         do {
             try fileManager.createDirectory(at: parentURL, withIntermediateDirectories: true)
+            guard areContractPathsSafe(contract) else {
+                return .refused
+            }
             try fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: parentURL.path)
             let data = try contract.propertyListData()
             try data.write(to: contract.launchAgentURL, options: [.atomic])
             try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: contract.launchAgentURL.path)
             let reloadResult = await reloader.reloadManagedLaunchAgent(contract)
-            switch reloadResult.status {
-            case .repaired, .notNeeded:
-                return .repaired
-            case .refused, .failed, .requiresUserAction:
-                return reloadResult
-            }
+            return reloadResult
         } catch {
             return .failed
         }
     }
 
-    private func isSymlink(at url: URL) -> Bool {
-        var metadata = stat()
-        guard lstat(url.path, &metadata) == 0 else { return false }
-        return UInt32(metadata.st_mode) & UInt32(S_IFMT) == UInt32(S_IFLNK)
+    private func areContractPathsSafe(_ contract: ManagedLaunchAgentContract) -> Bool {
+        NonFollowingPathGuard.isSafe(contract.homeDirectory)
+            && NonFollowingPathGuard.isSafe(contract.launchAgentURL)
+            && NonFollowingPathGuard.isSafe(contract.launcherLogURL)
     }
 }
 

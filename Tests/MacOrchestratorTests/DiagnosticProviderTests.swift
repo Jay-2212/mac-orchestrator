@@ -10,9 +10,11 @@ final class DiagnosticProviderTests: XCTestCase {
         let varLstatResult = lstat("/var", &varMetadata)
         let varMode = UInt32(varMetadata.st_mode) & UInt32(S_IFMT)
         let varDestination = try? FileManager.default.destinationOfSymbolicLink(atPath: "/var")
+        let varURL = URL(fileURLWithPath: "/var")
+        let varDestinationDescription = varDestination ?? "nil"
         XCTAssertTrue(
             DiagnosticPathSafety.isSafe(temporaryDirectory),
-            "raw=\(temporaryDirectory.path) standardized=\(temporaryDirectory.standardizedFileURL.path) resolved=\(temporaryDirectory.resolvingSymlinksInPath().standardizedFileURL.path) varRaw=\(URL(fileURLWithPath: \"/var\").path) varStandardized=\(URL(fileURLWithPath: \"/var\").standardizedFileURL.path) varResolved=\(URL(fileURLWithPath: \"/var\").resolvingSymlinksInPath().standardizedFileURL.path) varLstat=\(varLstatResult) varMode=\(varMode) varDestination=\(varDestination ?? \"nil\")"
+            "raw=\(temporaryDirectory.path) standardized=\(temporaryDirectory.standardizedFileURL.path) resolved=\(temporaryDirectory.resolvingSymlinksInPath().standardizedFileURL.path) varRaw=\(varURL.path) varStandardized=\(varURL.standardizedFileURL.path) varResolved=\(varURL.resolvingSymlinksInPath().standardizedFileURL.path) varLstat=\(varLstatResult) varMode=\(varMode) varDestination=\(varDestinationDescription)"
         )
         XCTAssertFalse(DiagnosticPathSafety.isSafe(URL(fileURLWithPath: "/tmp")))
 

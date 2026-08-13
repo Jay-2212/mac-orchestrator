@@ -19,14 +19,6 @@ private final class TerminalProbeErrorBox: @unchecked Sendable {
     }
 }
 
-private final class TerminalDoctorResultBox: @unchecked Sendable {
-    private let lock = NSLock()
-    private var value: DoctorReport?
-
-    func store(_ value: DoctorReport) { lock.lock(); self.value = value; lock.unlock() }
-    func load() -> DoctorReport? { lock.lock(); defer { lock.unlock() }; return value }
-}
-
 private final class TerminalRepairResultBox: @unchecked Sendable {
     private let lock = NSLock()
     private var value: RepairOutcome?
@@ -368,6 +360,15 @@ enum TerminalCommand {
                 "No authenticated InstallationReceiptV1 exists; use the externally pinned Phase 2 recovery path first."
             )
         }
+
+        guard effectiveArguments.contains("--pinned") else {
+            let result = applying
+                ? try Phase3OperationCoordinator().applyUpdate()
+                : try Phase3OperationCoordinator().checkForUpdates()
+            print(result.message)
+            return result.succeeded ? 0 : 1
+        }
+
         let lifecycle = ExternalMaintenanceLifecycleAdapter(controller: LaunchAgentMaintenanceController())
         let driver = FilesystemUpdateTransactionDriver(
             supportDirectory: ConfigurationStore.defaultDirectoryURL(),
@@ -430,15 +431,7 @@ enum TerminalCommand {
             removeConfiguration: arguments.contains("--remove-config"),
             deleteCredentials: arguments.contains("--delete-credentials")
         )
-        let support = ConfigurationStore.defaultDirectoryURL()
-        let engine = try UninstallEngine(
-            supportDirectory: support,
-            logsDirectory: FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent("Library/Logs/Mac Orchestrator", isDirectory: true),
-            keychain: KeychainStore(),
-            lifecycle: ExternalMaintenanceLifecycleAdapter(controller: LaunchAgentMaintenanceController()),
-            homeDirectory: FileManager.default.homeDirectoryForCurrentUser
-        )
+        let engine = try makeUninstallEngine()
         let plan = try engine.plan(options: options)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -450,9 +443,41 @@ enum TerminalCommand {
         return receipt.outcomes.contains { $0.status == UninstallOutcomeStatus.failedManualActionRequired } ? 1 : 0
     }
 
+    static func makeUninstallEngine(
+        fileManager: FileManager = .default,
+        supportDirectory overrideSupportDirectory: URL? = nil,
+        homeDirectory overrideHomeDirectory: URL? = nil,
+        keychain: KeychainStore = KeychainStore(),
+        lifecycle: MaintenanceLifecycleAdapter? = nil
+    ) throws -> UninstallEngine {
+        let home = (overrideHomeDirectory ?? fileManager.homeDirectoryForCurrentUser).standardizedFileURL
+        let support = (overrideSupportDirectory ?? ConfigurationStore.defaultDirectoryURL(fileManager: fileManager))
+            .standardizedFileURL
+        let configurationProvider = ReadOnlyDoctorConfigurationContextProvider(
+            directoryURL: support,
+            fileManager: fileManager
+        )
+        let configuredOwnerID = (try? configurationProvider.inspect())?.validatedConfiguration?.ownerID ?? ""
+        let processRemoval = ProductionOwnedProcessRemovalAdapter(
+            ownerID: configuredOwnerID,
+            stateURL: support.appendingPathComponent("owned-processes.json", isDirectory: false),
+            fileManager: fileManager
+        )
+        return try UninstallEngine(
+            supportDirectory: support,
+            logsDirectory: home.appendingPathComponent("Library/Logs/Mac Orchestrator", isDirectory: true),
+            keychain: keychain,
+            lifecycle: lifecycle ?? ExternalMaintenanceLifecycleAdapter(controller: LaunchAgentMaintenanceController()),
+            fileManager: fileManager,
+            homeDirectory: home,
+            processRemoval: processRemoval
+        )
+    }
+
     private static func runDoctor(json: Bool, repair: RepairActionID?) throws -> Int32 {
-        let engine = try makeDoctorEngine()
-        let report = try runDoctorReport(engine)
+        let coordinator = Phase3OperationCoordinator()
+        let doctor = try coordinator.runDoctorBlocking()
+        let report = doctor.report
         if json {
             print(String(decoding: try report.encodedJSON(), as: UTF8.self))
             return report.summary.fail == 0 ? 0 : 1
@@ -462,7 +487,7 @@ enum TerminalCommand {
         if let repair {
             let outcome = try runRepair(repair)
             print("Repair \(repair.rawValue): \(outcome.status.rawValue) — \(outcome.safeReason)")
-            let after = try runDoctorReport(engine)
+            let after = try coordinator.runDoctorBlocking().report
             print("After repair:")
             printDoctorReport(after)
             return after.summary.fail == 0 && outcome.status != .failed && outcome.status != .refused ? 0 : 1
@@ -471,40 +496,26 @@ enum TerminalCommand {
     }
 
     private static func runSupportBundle(preview: Bool, output: String?) throws -> Int32 {
-        let doctor = try makeDoctorEngine()
-        let report = try runDoctorReport(doctor)
-        let engine = makeSupportBundleEngine(report: report)
-        let plan = engine.preview()
+        let coordinator = Phase3OperationCoordinator()
+        let plan: SupportBundlePlan
+        let archive: URL?
+        if preview {
+            let result = try coordinator.previewSupportBundleBlocking()
+            plan = result.plan
+            archive = nil
+        } else {
+            let result = try coordinator.createSupportBundleBlocking(output: output)
+            plan = result.plan
+            archive = result.archiveURL
+        }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         encoder.dateEncodingStrategy = .iso8601
-        print("Support bundle preview (no files collected):")
+        print(archive == nil ? "Support bundle preview (no files collected):" : "Approved support bundle plan:")
         print(String(decoding: try encoder.encode(plan), as: UTF8.self))
-        guard !preview else { return 0 }
-
-        let destinationPath = output.map { NSString(string: $0).expandingTildeInPath }
-            ?? FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent("Desktop", isDirectory: true)
-                .appendingPathComponent("Mac-Orchestrator-support-\(Int(Date().timeIntervalSince1970)).zip")
-                .path
-        let destination = URL(fileURLWithPath: destinationPath)
-        let archive = try engine.create(plan: plan, to: destination)
+        guard let archive else { return 0 }
         print("Redacted support bundle created: \(archive.path)")
         return 0
-    }
-
-    private static func runDoctorReport(_ engine: DoctorEngine) throws -> DoctorReport {
-        let box = TerminalDoctorResultBox()
-        let semaphore = DispatchSemaphore(value: 0)
-        Task {
-            box.store(await engine.run())
-            semaphore.signal()
-        }
-        guard semaphore.wait(timeout: .now() + 60) == .success,
-              let report = box.load() else {
-            throw TerminalCommandError.agentRequestFailed("Doctor timed out")
-        }
-        return report
     }
 
     private static func printDoctorReport(_ report: DoctorReport) {
@@ -514,11 +525,17 @@ enum TerminalCommand {
         print("Summary: PASS \(report.summary.pass), WARN \(report.summary.warn), FAIL \(report.summary.fail), SKIP \(report.summary.skip)")
     }
 
-    private static func makeDoctorEngine() throws -> DoctorEngine {
-        let fileManager = FileManager.default
-        let support = ConfigurationStore.defaultDirectoryURL()
-        let paths = DiagnosticPathSet.defaultPaths(fileManager: fileManager)
-        let configurationProvider = ReadOnlyDoctorConfigurationContextProvider(
+    static func makeDoctorEngine(
+        configurationProvider overrideConfigurationProvider: (any DoctorConfigurationContextProviding)? = nil,
+        localProbe: (any LocalActivationProbeRunning)? = nil,
+        keychain: KeychainStore = KeychainStore(),
+        fileManager: FileManager = .default,
+        supportDirectory overrideSupportDirectory: URL? = nil
+    ) throws -> DoctorEngine {
+        let support = (overrideSupportDirectory ?? ConfigurationStore.defaultDirectoryURL(fileManager: fileManager))
+            .standardizedFileURL
+        let paths = DiagnosticPathSet(supportDirectory: support, fileManager: fileManager)
+        let configurationProvider = overrideConfigurationProvider ?? ReadOnlyDoctorConfigurationContextProvider(
             directoryURL: support,
             fileManager: fileManager
         )
@@ -529,12 +546,29 @@ enum TerminalCommand {
         let ownerID = configuration?.ownerID ?? ""
         let port = configuration?.localMCPPort ?? 0
 
+        let asyncLocalMCPProvider: (any DoctorAsyncLocalMCPDiagnosticProviding)?
+        if let configuration {
+            asyncLocalMCPProvider = CanonicalLocalMCPDiagnosticProvider(
+                adapter: LocalActivationProbeAdapter(
+                    probe: localProbe ?? LocalActivationProbe(),
+                    keychain: keychain,
+                    configuration: configuration,
+                    port: configuration.localMCPPort
+                )
+            )
+        } else {
+            asyncLocalMCPProvider = nil
+        }
+
         let updateProvider: any UpdateAvailabilityProviding
         if let receipt = try? InstallationReceiptStore(
             directoryURL: support.appendingPathComponent("install", isDirectory: true),
             fileManager: fileManager
         ).load(), (try? SemanticVersion(receipt.productVersion)) != nil {
-            let updateEngine = try makeUpdateEngine()
+            let updateEngine = try makeUpdateEngine(
+                supportDirectory: support,
+                fileManager: fileManager
+            )
             updateProvider = TerminalUpdateAvailabilityProvider(
                 currentVersion: receipt.productVersion,
                 check: { try updateEngine.checkForUpdate() }
@@ -552,6 +586,7 @@ enum TerminalCommand {
             keychainPresenceProvider: SystemDoctorKeychainPresenceProvider(),
             portProvider: ReadOnlyPortFactsProvider(port: port, ownerID: ownerID),
             localMCPProvider: TerminalUnavailableLocalMCPProvider(),
+            asyncLocalMCPProvider: asyncLocalMCPProvider,
             lifecycleProvider: ReadOnlyLifecycleFactsProvider(
                 paths: paths,
                 ownerID: ownerID,
@@ -579,7 +614,7 @@ enum TerminalCommand {
         ))
     }
 
-    private static func runRepair(_ action: RepairActionID) throws -> RepairOutcome {
+    static func runRepair(_ action: RepairActionID) throws -> RepairOutcome {
         let fileManager = FileManager.default
         let support = ConfigurationStore.defaultDirectoryURL()
         let paths = DiagnosticPathSet.defaultPaths(fileManager: fileManager)
@@ -638,10 +673,48 @@ enum TerminalCommand {
         return outcome
     }
 
-    private static func makeSupportBundleEngine(report: DoctorReport) -> SupportBundleEngine {
+    static func supportBundleSecretValues(keychain: KeychainStore = KeychainStore()) -> [String] {
+        let items: [KeychainItem] = [
+            .connectorToken,
+            .ngrokAuthtoken,
+            .telegramSendBotToken,
+            .telegramSendChatID,
+            .currentMeridianIngestToken,
+            .meridianIngestTokenAlias,
+            .meridianTelegramBotToken,
+            .meridianTelegramWebhookSecret,
+        ]
+        var values = Set<String>()
+        for item in items {
+            // These reads are redaction-only and remain in memory. Failures
+            // intentionally fall back to structural/pattern redaction.
+            do {
+                guard let value = try keychain.value(for: item),
+                      !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    continue
+                }
+                values.insert(value)
+            } catch {
+                continue
+            }
+        }
+        return values.sorted { lhs, rhs in
+            if lhs.count == rhs.count { return lhs < rhs }
+            return lhs.count > rhs.count
+        }
+    }
+
+    static func makeSupportBundleEngine(
+        report: DoctorReport,
+        keychain: KeychainStore = KeychainStore(),
+        fileManager: FileManager = .default,
+        supportDirectory overrideSupportDirectory: URL? = nil,
+        homeDirectory overrideHomeDirectory: URL? = nil
+    ) -> SupportBundleEngine {
         let reportData = (try? report.encodedJSON()) ?? Data("{}".utf8)
-        let support = ConfigurationStore.defaultDirectoryURL()
-        let home = FileManager.default.homeDirectoryForCurrentUser
+        let support = (overrideSupportDirectory ?? ConfigurationStore.defaultDirectoryURL(fileManager: fileManager))
+            .standardizedFileURL
+        let home = (overrideHomeDirectory ?? fileManager.homeDirectoryForCurrentUser).standardizedFileURL
         let receiptURL = support.appendingPathComponent("install/receipt.json")
         let receiptData = (try? Data(contentsOf: receiptURL)) ?? Data("{\"available\":false}".utf8)
         let entries = [
@@ -672,7 +745,10 @@ enum TerminalCommand {
         ]
         return SupportBundleEngine(
             sources: [Phase3SupportBundleSource(entries: entries)],
-            redactor: SensitiveDataRedactor(exactSecrets: [], homeDirectory: home.path)
+            redactor: SensitiveDataRedactor(
+                exactSecrets: supportBundleSecretValues(keychain: keychain),
+                homeDirectory: home.path
+            )
         )
     }
 
@@ -726,15 +802,21 @@ enum TerminalCommand {
     private static func pathHasSymlinkComponent(_ url: URL) -> Bool {
         var current = url.standardizedFileURL
         while current.path != "/" {
-            if (try? FileManager.default.destinationOfSymbolicLink(atPath: current.path)) != nil { return true }
+            if (try? FileManager.default.destinationOfSymbolicLink(atPath: current.path)) != nil,
+               !VerifiedMacOSSystemAlias.isAllowed(current) {
+                return true
+            }
             current.deleteLastPathComponent()
         }
         return false
     }
 
-    private static func makeUpdateEngine() throws -> UpdateEngine {
-        let fileManager = FileManager.default
-        let support = ConfigurationStore.defaultDirectoryURL()
+    static func makeUpdateEngine(
+        supportDirectory overrideSupportDirectory: URL? = nil,
+        fileManager: FileManager = .default
+    ) throws -> UpdateEngine {
+        let support = (overrideSupportDirectory ?? ConfigurationStore.defaultDirectoryURL(fileManager: fileManager))
+            .standardizedFileURL
         let installDirectory = support.appendingPathComponent("install", isDirectory: true)
         let receipt = try InstallationReceiptStore(directoryURL: installDirectory, fileManager: fileManager).load()
         guard let receipt, let currentVersion = try? SemanticVersion(receipt.productVersion) else {

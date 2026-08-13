@@ -509,6 +509,28 @@ final class Phase3KeychainAndUninstallTests: XCTestCase {
         XCTAssertTrue(plan.providerResourcesUntouched)
     }
 
+    func testCredentialOnlyDeletionQuiescesBeforeFirstKeychainDeletion() throws {
+        let layout = try uninstallLayout()
+        let events = OrderedMaintenanceEvents()
+        let lifecycle = OrderedMaintenanceLifecycle(events: events)
+        let keychain = OrderedKeychainClient(events: events)
+        let engine = try UninstallEngine(
+            supportDirectory: layout.support,
+            logsDirectory: layout.logs,
+            keychain: KeychainStore(client: keychain),
+            lifecycle: lifecycle,
+            homeDirectory: layout.home
+        )
+
+        let plan = try engine.plan(options: RemovalOptions(deleteCredentials: true))
+        XCTAssertTrue(plan.servicesRemainQuiesced)
+        _ = engine.apply(plan)
+
+        XCTAssertEqual(events.values.first, "quiesce")
+        XCTAssertTrue(events.values.dropFirst().contains { $0.hasPrefix("delete:") })
+        XCTAssertFalse(events.values.contains("restore"))
+    }
+
     func testUninstallRejectsBroadApplicationSupportRoot() {
         let home = FileManager.default.homeDirectoryForCurrentUser
         let validator = UninstallPathValidator()
@@ -633,6 +655,40 @@ final class Phase3KeychainAndUninstallTests: XCTestCase {
         func delete(service: String, account: String) throws {
             values.removeValue(forKey: KeychainItem.key(service: service, account: account))
         }
+    }
+
+    private final class OrderedMaintenanceEvents {
+        var values: [String] = []
+    }
+
+    private final class OrderedKeychainClient: KeychainClient {
+        let events: OrderedMaintenanceEvents
+
+        init(events: OrderedMaintenanceEvents) {
+            self.events = events
+        }
+
+        func read(service: String, account: String) throws -> String? { nil }
+        func create(value: String, service: String, account: String) throws {}
+        func update(value: String, service: String, account: String) throws {}
+        func delete(service: String, account: String) throws {
+            events.values.append("delete:\(service):\(account)")
+        }
+    }
+
+    private final class OrderedMaintenanceLifecycle: MaintenanceLifecycleAdapter {
+        let events: OrderedMaintenanceEvents
+
+        init(events: OrderedMaintenanceEvents) {
+            self.events = events
+        }
+
+        func quiesce() throws -> MaintenanceQuiesceReceipt {
+            events.values.append("quiesce")
+            return MaintenanceQuiesceReceipt(ownerID: "test-owner", remoteStopped: true, localServerStopped: true)
+        }
+
+        func restore() throws { events.values.append("restore") }
     }
 
     private final class FakeMaintenanceLifecycle: MaintenanceLifecycleAdapter {

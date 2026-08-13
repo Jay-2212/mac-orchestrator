@@ -382,7 +382,10 @@ final class UninstallEngine {
         let destructiveEntries = plan.entries.filter { $0.intent == .remove }
         var servicesQuiesced = false
 
-        if !destructiveEntries.isEmpty {
+        let requiresMaintenanceQuiesce = !destructiveEntries.isEmpty
+            || !plan.keychainItemsToDelete.isEmpty
+
+        if requiresMaintenanceQuiesce {
             do {
                 _ = try lifecycle.quiesce()
                 servicesQuiesced = true

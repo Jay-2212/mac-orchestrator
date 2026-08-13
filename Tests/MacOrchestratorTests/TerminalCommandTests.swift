@@ -36,4 +36,27 @@ final class TerminalCommandTests: XCTestCase {
         XCTAssertThrowsError(try TerminalCommand.parseMaintenanceCommand(arguments: ["support-bundle", "--preview", "--output", "/tmp/support.zip"]))
         XCTAssertThrowsError(try TerminalCommand.parseMaintenanceCommand(arguments: ["support-bundle", "--create", "--output"]))
     }
+
+    func testUpdateCheckMapsNoStableUpdateToSuccessfulCurrentState() {
+        let result = Phase3OperationCoordinator.mapUpdateCheckError(
+            UpdateEngineError.noStableUpdate,
+            currentVersion: "3.0.0"
+        )
+
+        XCTAssertEqual(result.state, .current(version: "3.0.0"))
+        XCTAssertTrue(result.succeeded)
+        XCTAssertTrue(result.message.contains("up to date"))
+        XCTAssertFalse(result.message.contains("manifest"))
+    }
+
+    func testUpdateCheckStillFailsSafelyForAuthenticationOrNetworkErrors() {
+        let result = Phase3OperationCoordinator.mapUpdateCheckError(
+            UpdateEngineError.signatureRequired,
+            currentVersion: "3.0.0"
+        )
+
+        XCTAssertEqual(result.state, .failed)
+        XCTAssertFalse(result.succeeded)
+        XCTAssertTrue(result.message.contains("failed safely"))
+    }
 }

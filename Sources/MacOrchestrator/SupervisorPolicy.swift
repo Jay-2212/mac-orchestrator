@@ -1,6 +1,6 @@
 import Foundation
 
-enum SupervisorComponent: Sendable {
+enum SupervisorComponent: Sendable, Equatable {
     case server
     case tunnel
 }

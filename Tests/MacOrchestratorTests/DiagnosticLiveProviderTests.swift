@@ -115,6 +115,80 @@ final class DiagnosticLiveProviderTests: XCTestCase {
         XCTAssertTrue(keychainClient.updateCalls.isEmpty)
     }
 
+    func testProductionDoctorWiringUsesCanonicalLocalProviderForHealthyMCP() async throws {
+        let root = try makeProductionDoctorRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let configuration = productionDoctorConfiguration()
+        let probe = RecordingActivationProbe(result: .success(
+            LocalActivationProbeDetails(
+                exposedTools: CurrentCoreMCPExpectationProvider().expectations(for: configuration).expectedTools,
+                safeCallSucceeded: true
+            )
+        ))
+        let keychainClient = RecordingDiagnosticKeychainClient(value: "connector-secret")
+        let engine = try TerminalCommand.makeDoctorEngine(
+            configurationProvider: ProductionDoctorConfigurationFixture(configuration: configuration),
+            localProbe: probe,
+            keychain: KeychainStore(client: keychainClient),
+            supportDirectory: root
+        )
+
+        let report = await engine.run()
+
+        XCTAssertEqual(report.result(withID: "mcp.liveness")?.status, .pass)
+        XCTAssertEqual(report.result(withID: "mcp.readiness")?.status, .pass)
+        XCTAssertEqual(report.result(withID: "mcp.inventory")?.status, .pass)
+        XCTAssertEqual(probe.calls.map(\.port), [configuration.localMCPPort])
+        XCTAssertEqual(probe.calls.map(\.token), ["connector-secret"])
+        XCTAssertEqual(probe.calls.map(\.requiresInteractiveUI), [false])
+        XCTAssertTrue(keychainClient.createCalls.isEmpty)
+        XCTAssertTrue(keychainClient.updateCalls.isEmpty)
+    }
+
+    func testProductionDoctorWiringReportsFailedHealthAsUnavailable() async throws {
+        let root = try makeProductionDoctorRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let probe = RecordingActivationProbe(outcome: .init(
+            phase: .health,
+            error: .healthCheckFailed(status: 503, body: "ignored")
+        ))
+        let configuration = productionDoctorConfiguration()
+        let engine = try TerminalCommand.makeDoctorEngine(
+            configurationProvider: ProductionDoctorConfigurationFixture(configuration: configuration),
+            localProbe: probe,
+            keychain: KeychainStore(client: RecordingDiagnosticKeychainClient(value: "connector-secret")),
+            supportDirectory: root
+        )
+
+        let report = await engine.run()
+
+        XCTAssertEqual(report.result(withID: "mcp.liveness")?.status, .fail)
+        XCTAssertEqual(report.result(withID: "mcp.readiness")?.status, .skip)
+        XCTAssertEqual(report.result(withID: "mcp.inventory")?.status, .skip)
+    }
+
+    func testProductionDoctorWiringReportsFailedSafeCallWithoutLosingLiveness() async throws {
+        let root = try makeProductionDoctorRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let probe = RecordingActivationProbe(outcome: .init(
+            phase: .safeCall,
+            error: .mcpError(method: "tools/call", message: "ignored")
+        ))
+        let configuration = productionDoctorConfiguration()
+        let engine = try TerminalCommand.makeDoctorEngine(
+            configurationProvider: ProductionDoctorConfigurationFixture(configuration: configuration),
+            localProbe: probe,
+            keychain: KeychainStore(client: RecordingDiagnosticKeychainClient(value: "connector-secret")),
+            supportDirectory: root
+        )
+
+        let report = await engine.run()
+
+        XCTAssertEqual(report.result(withID: "mcp.liveness")?.status, .pass)
+        XCTAssertEqual(report.result(withID: "mcp.readiness")?.status, .fail)
+        XCTAssertEqual(report.result(withID: "mcp.inventory")?.status, .skip)
+    }
+
     func testCurrentCoreExpectationsOnlyIncludeDesiredShippedGroups() {
         var configuration = AppConfiguration(ownerID: "owner-1")
         configuration.desiredCapabilities["mac.ui"] = true
@@ -1397,6 +1471,54 @@ private final class RecordingDiagnosticKeychainClient: KeychainClient, @unchecke
     func update(value: String, service: String, account: String) throws {
         updateCalls.append(KeychainItem.key(service: service, account: account))
     }
+}
+
+private struct ProductionDoctorConfigurationFixture: DoctorConfigurationContextProviding {
+    let configuration: AppConfiguration
+
+    func inspect() throws -> DoctorConfigurationSnapshot {
+        let file = ConfigurationFileFacts(
+            exists: true,
+            readable: true,
+            valid: true,
+            state: .valid,
+            schemaVersion: configuration.schemaVersion,
+            generation: configuration.generation,
+            mode: 0o600,
+            byteCount: 1
+        )
+        return DoctorConfigurationSnapshot(
+            facts: ConfigurationDiagnosticFacts(
+                directoryExists: true,
+                directoryMode: 0o700,
+                primary: file,
+                backup: file
+            ),
+            validatedConfiguration: configuration
+        )
+    }
+}
+
+private func productionDoctorConfiguration() -> AppConfiguration {
+    var configuration = AppConfiguration(
+        localMCPPort: 8007,
+        process: ProcessConfiguration(serverDesired: true, tunnelDesired: false),
+        ownerID: "production-doctor-owner"
+    )
+    configuration.desiredCapabilities["mac.ui"] = false
+    configuration.desiredCapabilities["mac.screenOcr"] = false
+    configuration.desiredCapabilities["mac.files.read"] = false
+    configuration.desiredCapabilities["mac.files.write"] = false
+    configuration.desiredCapabilities["mac.shell"] = false
+    configuration.desiredCapabilities["mac.clipboard.write"] = false
+    return configuration
+}
+
+private func makeProductionDoctorRoot() throws -> URL {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("phase3-production-doctor-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    return root
 }
 
 private final class RecordingActivationProbe: LocalActivationProbeRunning, @unchecked Sendable {

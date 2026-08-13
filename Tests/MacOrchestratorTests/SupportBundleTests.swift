@@ -155,6 +155,39 @@ final class SupportBundleTests: XCTestCase {
         XCTAssertEqual(source.collectCalls, [])
     }
 
+    func testProductionSupportBundleRedactsUnlabelledKnownSecretFromArchive() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let home = root.appendingPathComponent("home", isDirectory: true)
+        let logs = home.appendingPathComponent("Library/Logs/Mac Orchestrator", isDirectory: true)
+        try FileManager.default.createDirectory(at: logs, withIntermediateDirectories: true)
+        let secret = "opaque-current-connector-secret-928374"
+        try Data("event payload=\(secret)\n".utf8)
+            .write(to: logs.appendingPathComponent("app.log"))
+
+        let keychain = KeychainStore(client: SupportBundleKeychainClient(values: [
+            KeychainItem.connectorToken.key: secret
+        ]))
+        let report = DoctorReport(generatedAt: Date(timeIntervalSince1970: 1), results: [])
+        let engine = TerminalCommand.makeSupportBundleEngine(
+            report: report,
+            keychain: keychain,
+            supportDirectory: root,
+            homeDirectory: home
+        )
+        let plan = engine.preview()
+        let archive = root.appendingPathComponent("support.zip")
+
+        _ = try engine.create(plan: plan, to: archive)
+
+        let extracted = try extractEntries(from: archive)
+        let archiveText = extracted
+            .map { String(decoding: $0.data, as: UTF8.self) }
+            .joined(separator: "\n")
+        XCTAssertFalse(archiveText.contains(secret))
+        XCTAssertTrue(archiveText.contains("<redacted>"))
+    }
+
     func testSensitiveEntryIsNotCollectedEvenWhenSelectedByPublishedID() throws {
         let source = RecordingBundleSource(entries: [RecordingBundleSource.doctorReport, RecordingBundleSource.credential, RecordingBundleSource.telegramBotToken])
         let engine = SupportBundleEngine(sources: [source])
@@ -607,4 +640,19 @@ private final class RecordingArchiveWriter: @unchecked Sendable, SupportBundleAr
     ) throws {
         writeCalls += 1
     }
+}
+
+private final class SupportBundleKeychainClient: KeychainClient {
+    let values: [String: String]
+
+    init(values: [String: String]) {
+        self.values = values
+    }
+
+    func read(service: String, account: String) throws -> String? {
+        values[KeychainItem.key(service: service, account: account)]
+    }
+
+    func create(value: String, service: String, account: String) throws {}
+    func update(value: String, service: String, account: String) throws {}
 }

@@ -599,7 +599,7 @@ final class Phase3KeychainAndUninstallTests: XCTestCase {
 
         func quiesce() throws -> MaintenanceQuiesceReceipt {
             quiesceCalls += 1
-            MaintenanceQuiesceReceipt(ownerID: "test-owner", remoteStopped: true, localServerStopped: true)
+            return MaintenanceQuiesceReceipt(ownerID: "test-owner", remoteStopped: true, localServerStopped: true)
         }
 
         func restore() throws { restoreCalls += 1 }

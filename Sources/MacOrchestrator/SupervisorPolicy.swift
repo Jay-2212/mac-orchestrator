@@ -25,11 +25,12 @@ enum SupervisorRetryPolicy {
             return .circuitOpen(failures: updatedFailures)
         }
 
-        let delay = min(
-            pow(2.0, Double(max(0, updatedFailures.count - 1))),
-            maximumDelay
-        )
+        let delay = delay(forFailureCount: updatedFailures.count - 1)
         return .retry(failures: updatedFailures, delay: delay)
+    }
+
+    static func delay(forFailureCount failureCount: Int) -> TimeInterval {
+        min(pow(2.0, Double(max(0, failureCount))), maximumDelay)
     }
 }
 
@@ -49,6 +50,17 @@ enum ProcessOwnership {
         ownerID: String
     ) -> Bool {
         commandLine.contains(marker(for: component, ownerID: ownerID))
+    }
+}
+
+enum PortOccupancyDecision: Equatable, Sendable {
+    case allowStart
+    case refuseWithoutTermination
+}
+
+enum PortSafetyPolicy {
+    static func decision(isOccupied: Bool) -> PortOccupancyDecision {
+        isOccupied ? .refuseWithoutTermination : .allowStart
     }
 }
 

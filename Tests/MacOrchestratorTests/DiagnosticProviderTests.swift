@@ -1,10 +1,19 @@
 import Foundation
+import Darwin
 import XCTest
 @testable import MacOrchestrator
 
 final class DiagnosticProviderTests: XCTestCase {
     func testDiagnosticPathSafetyAcceptsOnlyVerifiedVarAliasAndRejectsUserSymlinks() throws {
-        XCTAssertTrue(DiagnosticPathSafety.isSafe(FileManager.default.temporaryDirectory))
+        let temporaryDirectory = FileManager.default.temporaryDirectory
+        var varMetadata = stat()
+        let varLstatResult = lstat("/var", &varMetadata)
+        let varMode = UInt32(varMetadata.st_mode) & UInt32(S_IFMT)
+        let varDestination = try? FileManager.default.destinationOfSymbolicLink(atPath: "/var")
+        XCTAssertTrue(
+            DiagnosticPathSafety.isSafe(temporaryDirectory),
+            "raw=\(temporaryDirectory.path) standardized=\(temporaryDirectory.standardizedFileURL.path) resolved=\(temporaryDirectory.resolvingSymlinksInPath().standardizedFileURL.path) varRaw=\(URL(fileURLWithPath: \"/var\").path) varStandardized=\(URL(fileURLWithPath: \"/var\").standardizedFileURL.path) varResolved=\(URL(fileURLWithPath: \"/var\").resolvingSymlinksInPath().standardizedFileURL.path) varLstat=\(varLstatResult) varMode=\(varMode) varDestination=\(varDestination ?? \"nil\")"
+        )
         XCTAssertFalse(DiagnosticPathSafety.isSafe(URL(fileURLWithPath: "/tmp")))
 
         let root = try makeTemporaryDirectory()

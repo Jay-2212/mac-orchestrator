@@ -31,17 +31,17 @@ enum DiagnosticChecks {
     }
 
     static func configurationRead(_ facts: ConfigurationDiagnosticFacts?) -> DiagnosticResult {
-        if facts == nil {
+        guard let facts else {
             return result("configuration.read", "Configuration read", .fail, Text.providerUnavailable)
         }
-        let primary = facts!.primary
-        guard primary.exists, primary.readable, primary.valid, primary.state == .valid else {
+        guard isUsableConfigurationFile(facts.primary) else {
+            let repair = isUsableConfigurationFile(facts.backup) ? RepairActionID.restoreConfigurationBackup : nil
             return result(
                 "configuration.read",
                 "Configuration read",
                 .fail,
                 Text.invalidConfiguration,
-                repair: .restoreConfigurationBackup
+                repair: repair
             )
         }
         return result("configuration.read", "Configuration read", .pass, Text.verified)
@@ -70,8 +70,11 @@ enum DiagnosticChecks {
         guard let facts, let schemaVersion = facts.primary.schemaVersion else {
             return result("configuration.schema", "Configuration schema", .fail, Text.invalidConfiguration)
         }
-        guard schemaVersion == AppConfiguration.currentSchemaVersion, facts.primary.state != .unsupported else {
+        if facts.primary.state == .unsupported || schemaVersion != AppConfiguration.currentSchemaVersion {
             return result("configuration.schema", "Configuration schema", .fail, "The configuration schema is unsupported.")
+        }
+        guard isUsableConfigurationFile(facts.primary) else {
+            return result("configuration.schema", "Configuration schema", .fail, Text.invalidConfiguration)
         }
         return result("configuration.schema", "Configuration schema", .pass, Text.verified)
     }
@@ -84,7 +87,7 @@ enum DiagnosticChecks {
         guard backup.exists else {
             return result("configuration.backup", "Configuration backup", .skip, "No configuration backup is present.")
         }
-        guard backup.readable, backup.valid, backup.state == .valid, !backup.isSymlink else {
+        guard isUsableConfigurationFile(backup) else {
             return result("configuration.backup", "Configuration backup", .warn, Text.invalidBackup)
         }
         return result("configuration.backup", "Configuration backup", .pass, Text.verified)
@@ -94,8 +97,8 @@ enum DiagnosticChecks {
         guard let facts else {
             return result("configuration.recovery", "Configuration recovery", .skip, Text.providerUnavailable)
         }
-        let primaryUsable = facts.primary.exists && facts.primary.readable && facts.primary.valid
-        let backupUsable = facts.backup.exists && facts.backup.readable && facts.backup.valid
+        let primaryUsable = isUsableConfigurationFile(facts.primary)
+        let backupUsable = isUsableConfigurationFile(facts.backup)
         if !primaryUsable && backupUsable {
             return result(
                 "configuration.recovery",
@@ -118,10 +121,10 @@ enum DiagnosticChecks {
         guard let facts else {
             return result("configuration.generation", "Configuration generation", .skip, Text.providerUnavailable)
         }
-        guard facts.primary.valid, let generation = facts.primary.generation, generation >= 1 else {
+        guard isUsableConfigurationFile(facts.primary), let generation = facts.primary.generation, generation >= 1 else {
             return result("configuration.generation", "Configuration generation", .fail, Text.invalidConfiguration)
         }
-        if facts.backup.valid, let backupGeneration = facts.backup.generation, backupGeneration > generation {
+        if isUsableConfigurationFile(facts.backup), let backupGeneration = facts.backup.generation, backupGeneration > generation {
             return result(
                 "configuration.generation",
                 "Configuration generation",
@@ -209,6 +212,9 @@ enum DiagnosticChecks {
     }
 
     static func permissionsRequester(_ facts: PermissionFacts?, configuration: AppConfiguration?) -> DiagnosticResult {
+        guard let configuration else {
+            return result("permissions.requester", "Requester permissions", .skip, "Requester permissions require validated configuration.")
+        }
         guard let facts else {
             return result("permissions.requester", "Requester permissions", .warn, Text.providerUnavailable)
         }
@@ -218,7 +224,7 @@ enum DiagnosticChecks {
         guard facts.activeConsole, !facts.sessionLocked else {
             return result("permissions.requester", "Requester permissions", .fail, Text.sessionUnavailable)
         }
-        let capabilities = configuration?.desiredCapabilities ?? [:]
+        let capabilities = configuration.desiredCapabilities
         if capabilities["mac.ui"] == true && !facts.accessibility {
             return result("permissions.requester", "Requester permissions", .fail, Text.permissionRequired, repair: .openAccessibilitySettings)
         }
@@ -246,11 +252,13 @@ enum DiagnosticChecks {
     }
 
     static func portSelected(_ facts: PortFacts?, configuredPort: Int?) -> DiagnosticResult {
+        guard let configuredPort else {
+            return result("port.selected", "Selected local port", .skip, "The selected port requires validated configuration.")
+        }
         guard let facts else {
             return result("port.selected", "Selected local port", .fail, Text.providerUnavailable, repair: .reassignLocalPort)
         }
-        let port = configuredPort ?? facts.port
-        guard (1...65535).contains(port) else {
+        guard (1...65535).contains(configuredPort) else {
             return result("port.selected", "Selected local port", .fail, Text.malformedPort, repair: .reassignLocalPort)
         }
         if facts.pidReuseDetected || (facts.listenerPresent && !facts.listenerOwned) {
@@ -420,5 +428,14 @@ enum DiagnosticChecks {
 
     private static func privateMode(_ mode: UInt16) -> Bool {
         mode & 0o077 == 0
+    }
+
+    static func isUsableConfigurationFile(_ file: ConfigurationFileFacts) -> Bool {
+        file.exists
+            && file.readable
+            && file.valid
+            && file.state == .valid
+            && !file.isSymlink
+            && file.schemaVersion == AppConfiguration.currentSchemaVersion
     }
 }

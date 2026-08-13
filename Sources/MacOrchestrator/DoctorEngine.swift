@@ -8,6 +8,27 @@ struct DoctorThresholds: Equatable, Sendable {
     }
 }
 
+struct DoctorConfigurationSnapshot: Equatable, Sendable {
+    let facts: ConfigurationDiagnosticFacts
+    let validatedConfiguration: AppConfiguration?
+
+    init(
+        facts: ConfigurationDiagnosticFacts,
+        validatedConfiguration: AppConfiguration?
+    ) {
+        self.facts = facts
+        self.validatedConfiguration = validatedConfiguration
+    }
+}
+
+protocol DoctorConfigurationContextProviding {
+    func inspect() throws -> DoctorConfigurationSnapshot
+}
+
+protocol DoctorKeychainPresenceProviding {
+    func inspect(items: Set<KeychainPresenceItem>) throws -> KeychainPresenceFacts
+}
+
 protocol DoctorAsyncLocalMCPDiagnosticProviding {
     func inspect() async throws -> LocalMCPFacts
 }
@@ -25,11 +46,10 @@ struct CanonicalLocalMCPDiagnosticProvider: DoctorAsyncLocalMCPDiagnosticProvidi
 }
 
 struct DoctorDependencies {
-    let configurationProvider: any ConfigurationDiagnosticProviding
-    let configuration: AppConfiguration?
+    let configurationContextProvider: any DoctorConfigurationContextProviding
     let installedReleaseProvider: any InstalledReleaseFactsProviding
     let permissionProvider: any PermissionFactsProviding
-    let keychainPresenceProvider: any KeychainPresenceProviding
+    let keychainPresenceProvider: any DoctorKeychainPresenceProviding
     let portProvider: any PortFactsProviding
     let localMCPProvider: any LocalMCPDiagnosticProviding
     let asyncLocalMCPProvider: (any DoctorAsyncLocalMCPDiagnosticProviding)?
@@ -41,11 +61,10 @@ struct DoctorDependencies {
     let clock: @Sendable () -> Date
 
     init(
-        configurationProvider: any ConfigurationDiagnosticProviding = UnavailableConfigurationProvider(),
-        configuration: AppConfiguration? = nil,
+        configurationContextProvider: any DoctorConfigurationContextProviding = UnavailableConfigurationContextProvider(),
         installedReleaseProvider: any InstalledReleaseFactsProviding = UnavailableInstalledReleaseProvider(),
         permissionProvider: any PermissionFactsProviding = UnavailablePermissionProvider(),
-        keychainPresenceProvider: any KeychainPresenceProviding = UnavailableKeychainPresenceProvider(),
+        keychainPresenceProvider: any DoctorKeychainPresenceProviding = UnavailableDoctorKeychainProvider(),
         portProvider: any PortFactsProviding = UnavailablePortProvider(),
         localMCPProvider: any LocalMCPDiagnosticProviding = UnavailableLocalMCPProvider(),
         asyncLocalMCPProvider: (any DoctorAsyncLocalMCPDiagnosticProviding)? = nil,
@@ -56,8 +75,7 @@ struct DoctorDependencies {
         thresholds: DoctorThresholds = DoctorThresholds(),
         clock: @escaping @Sendable () -> Date = { Date() }
     ) {
-        self.configurationProvider = configurationProvider
-        self.configuration = configuration
+        self.configurationContextProvider = configurationContextProvider
         self.installedReleaseProvider = installedReleaseProvider
         self.permissionProvider = permissionProvider
         self.keychainPresenceProvider = keychainPresenceProvider
@@ -81,24 +99,31 @@ struct DoctorEngine {
     }
 
     func run() async -> DoctorReport {
-        let configurationFacts = inspectConfiguration()
+        // Configuration is the only source of desired state. Nothing that
+        // depends on those decisions is inspected until this snapshot exists.
+        let snapshot = inspectConfigurationContext()
+        let configurationFacts = snapshot?.facts
+        let configuration = snapshot.flatMap {
+            DiagnosticChecks.isUsableConfigurationFile($0.facts.primary) ? $0.validatedConfiguration : nil
+        }
+        let hasValidatedConfiguration = configuration != nil
+        let serverDesired = configuration?.process.serverDesired == true
+        let remoteDesired = configuration?.process.tunnelDesired == true
+            || configuration?.desiredCapabilities["remote.connector"] == true
+
         let installedFacts = inspectInstalledRelease()
-        let permissionFacts = inspectPermissions()
-        let keychainFacts = inspectKeychain()
-        let portFacts = inspectPort()
-        let localMCPFacts = await inspectLocalMCP()
-        let lifecycleFacts = inspectLifecycle()
-        let remoteFacts = inspectRemote()
+        let permissionFacts = hasValidatedConfiguration ? inspectPermissions() : nil
+        let portFacts = serverDesired ? inspectPort() : nil
+        let localMCPFacts = serverDesired ? await inspectLocalMCP() : nil
+        let lifecycleFacts = (serverDesired || remoteDesired) ? inspectLifecycle() : nil
+        let keychainFacts = inspectKeychain(
+            localDesired: serverDesired,
+            remoteDesired: remoteDesired,
+            hasValidatedConfiguration: hasValidatedConfiguration
+        )
+        let remoteFacts = remoteDesired ? inspectRemote() : nil
         let diskFacts = inspectDisk()
         let updateFacts = inspectUpdate()
-
-        let usableConfiguration = configurationFacts?.primary.valid == true
-            ? dependencies.configuration
-            : nil
-        let serverDesired = usableConfiguration?.process.serverDesired ?? true
-        let remoteDesired = (usableConfiguration?.process.tunnelDesired == true)
-            || (usableConfiguration?.desiredCapabilities["remote.connector"] == true)
-            || (remoteFacts?.desired == true)
 
         var results = [
             DiagnosticChecks.configurationRead(configurationFacts),
@@ -107,23 +132,23 @@ struct DoctorEngine {
             DiagnosticChecks.configurationBackup(configurationFacts),
             DiagnosticChecks.configurationRecovery(configurationFacts),
             DiagnosticChecks.configurationGeneration(configurationFacts),
-            DiagnosticChecks.configurationMigration(usableConfiguration),
+            DiagnosticChecks.configurationMigration(configuration),
             DiagnosticChecks.installationHelper(installedFacts),
             DiagnosticChecks.installationRuntime(installedFacts),
             DiagnosticChecks.installationIntegrity(installedFacts),
             DiagnosticChecks.installationVersionMatch(installedFacts),
             DiagnosticChecks.trustCodeSign(installedFacts),
-            DiagnosticChecks.permissionsRequester(permissionFacts, configuration: usableConfiguration),
-            DiagnosticChecks.keychainConnector(keychainFacts),
-            DiagnosticChecks.portSelected(portFacts, configuredPort: usableConfiguration?.localMCPPort),
+            DiagnosticChecks.permissionsRequester(permissionFacts, configuration: configuration),
+            DiagnosticChecks.keychainConnector(serverDesired ? keychainFacts : nil),
+            DiagnosticChecks.portSelected(portFacts, configuredPort: serverDesired ? configuration?.localMCPPort : nil),
             DiagnosticChecks.mcpLiveness(localMCPFacts, desired: serverDesired),
             DiagnosticChecks.mcpReadiness(localMCPFacts, desired: serverDesired),
             DiagnosticChecks.mcpInventory(localMCPFacts, desired: serverDesired),
-            DiagnosticChecks.lifecycleLaunchAgent(lifecycleFacts, desired: serverDesired || remoteDesired),
-            DiagnosticChecks.lifecycleProcessOwnership(lifecycleFacts, desired: serverDesired || remoteDesired),
+            DiagnosticChecks.lifecycleLaunchAgent(lifecycleFacts, desired: hasValidatedConfiguration && (serverDesired || remoteDesired)),
+            DiagnosticChecks.lifecycleProcessOwnership(lifecycleFacts, desired: hasValidatedConfiguration && (serverDesired || remoteDesired)),
             DiagnosticChecks.remoteNgrok(
                 remoteFacts,
-                auth: keychainFacts?.presence(for: .ngrokAuthtoken),
+                auth: remoteDesired ? keychainFacts?.presence(for: .ngrokAuthtoken) : nil,
                 desired: remoteDesired
             ),
             DiagnosticChecks.remoteEndpoint(remoteFacts, desired: remoteDesired),
@@ -138,8 +163,8 @@ struct DoctorEngine {
         return DoctorReport(generatedAt: dependencies.clock(), results: results)
     }
 
-    private func inspectConfiguration() -> ConfigurationDiagnosticFacts? {
-        try? dependencies.configurationProvider.inspect()
+    private func inspectConfigurationContext() -> DoctorConfigurationSnapshot? {
+        try? dependencies.configurationContextProvider.inspect()
     }
 
     private func inspectInstalledRelease() -> InstalledReleaseFacts? {
@@ -150,8 +175,17 @@ struct DoctorEngine {
         try? dependencies.permissionProvider.inspect()
     }
 
-    private func inspectKeychain() -> KeychainPresenceFacts? {
-        try? dependencies.keychainPresenceProvider.inspect()
+    private func inspectKeychain(
+        localDesired: Bool,
+        remoteDesired: Bool,
+        hasValidatedConfiguration: Bool
+    ) -> KeychainPresenceFacts? {
+        guard hasValidatedConfiguration else { return nil }
+        var items = Set<KeychainPresenceItem>()
+        if localDesired { items.insert(.connectorToken) }
+        if remoteDesired { items.insert(.ngrokAuthtoken) }
+        guard !items.isEmpty else { return nil }
+        return try? dependencies.keychainPresenceProvider.inspect(items: items)
     }
 
     private func inspectPort() -> PortFacts? {
@@ -188,8 +222,8 @@ extension DoctorReport {
     }
 }
 
-private struct UnavailableConfigurationProvider: ConfigurationDiagnosticProviding {
-    func inspect() throws -> ConfigurationDiagnosticFacts { throw DiagnosticProviderError.unavailable }
+private struct UnavailableConfigurationContextProvider: DoctorConfigurationContextProviding {
+    func inspect() throws -> DoctorConfigurationSnapshot { throw DiagnosticProviderError.unavailable }
 }
 
 private struct UnavailableInstalledReleaseProvider: InstalledReleaseFactsProviding {
@@ -200,8 +234,10 @@ private struct UnavailablePermissionProvider: PermissionFactsProviding {
     func inspect() throws -> PermissionFacts { throw DiagnosticProviderError.unavailable }
 }
 
-private struct UnavailableKeychainPresenceProvider: KeychainPresenceProviding {
-    func inspect() throws -> KeychainPresenceFacts { throw DiagnosticProviderError.unavailable }
+private struct UnavailableDoctorKeychainProvider: DoctorKeychainPresenceProviding {
+    func inspect(items: Set<KeychainPresenceItem>) throws -> KeychainPresenceFacts {
+        throw DiagnosticProviderError.unavailable
+    }
 }
 
 private struct UnavailablePortProvider: PortFactsProviding {

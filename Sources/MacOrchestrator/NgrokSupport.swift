@@ -13,6 +13,15 @@ struct NgrokEndpointUpstream: Decodable, Equatable, Sendable {
     let url: String
 }
 
+enum RemoteEndpointReconciliation: Equatable, Sendable {
+    case current(publicURL: URL)
+    case missing
+    case foreign
+    case ambiguous
+    case agentAPIUnavailable
+    case invalidAgentAPIResponse
+}
+
 enum NgrokEndpointParser {
     static func isValidResponse(from data: Data) -> Bool {
         (try? JSONDecoder().decode(NgrokEndpointResponse.self, from: data)) != nil
@@ -28,17 +37,47 @@ enum NgrokEndpointParser {
         }
     }
 
+    static func reconcile(
+        from data: Data,
+        matching target: String
+    ) -> RemoteEndpointReconciliation {
+        guard let response = try? JSONDecoder().decode(NgrokEndpointResponse.self, from: data) else {
+            return .invalidAgentAPIResponse
+        }
+        guard !response.endpoints.isEmpty else {
+            return .missing
+        }
+
+        let normalizedTarget = normalizedAddress(target)
+        let matching = response.endpoints.filter { endpoint in
+            normalizedAddress(endpoint.upstream.url) == normalizedTarget
+        }
+        guard !matching.isEmpty else {
+            return .foreign
+        }
+
+        let publicURLs = matching.compactMap { endpoint -> URL? in
+            guard let url = URL(string: endpoint.url),
+                  url.scheme?.lowercased() == "https",
+                  url.host != nil else {
+                return nil
+            }
+            return url
+        }
+        guard publicURLs.count == matching.count else {
+            return .invalidAgentAPIResponse
+        }
+        guard publicURLs.count == 1, let publicURL = publicURLs.first else {
+            return .ambiguous
+        }
+        return .current(publicURL: publicURL)
+    }
+
     static func publicURL(from data: Data, matching target: String) -> URL? {
-        guard let response = try? JSONDecoder().decode(NgrokEndpointResponse.self, from: data),
-              let endpoint = response.endpoints.first(where: {
-                  normalizedAddress($0.upstream.url) == normalizedAddress(target)
-              }),
-              let url = URL(string: endpoint.url),
-              url.scheme?.lowercased() == "https",
-              url.host != nil else {
+        guard case let .current(publicURL) = reconcile(from: data, matching: target) else {
             return nil
         }
-        return url
+        return publicURL
     }
 
     private static func normalizedAddress(_ address: String) -> String {
@@ -47,6 +86,8 @@ enum NgrokEndpointParser {
                 in: CharacterSet(charactersIn: "/")
             )
         }
+        components.scheme = components.scheme?.lowercased()
+        components.host = components.host?.lowercased()
         components.path = components.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         components.query = nil
         components.fragment = nil

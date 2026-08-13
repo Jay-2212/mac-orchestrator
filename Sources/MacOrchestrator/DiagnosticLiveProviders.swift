@@ -341,11 +341,16 @@ private func matchesExactOwnershipMarker(
     }.map(String.init)
     switch component {
     case .server:
-        guard let markerIndex = tokens.firstIndex(of: "--managed-owner") else { return false }
+        let markerIndices = tokens.indices.filter { tokens[$0] == "--managed-owner" }
+        guard markerIndices.count == 1,
+              !tokens.contains(where: { $0.hasPrefix("--managed-owner=") }),
+              let markerIndex = markerIndices.first else { return false }
         let ownerIndex = tokens.index(after: markerIndex)
         return ownerIndex < tokens.endIndex && tokens[ownerIndex] == ownerID
     case .tunnel:
-        return tokens.contains("mac-orchestrator-owner=\(ownerID)")
+        let markerPrefix = "mac-orchestrator-owner="
+        let markerTokens = tokens.filter { $0.contains(markerPrefix) }
+        return markerTokens.count == 1 && markerTokens[0] == "\(markerPrefix)\(ownerID)"
     }
 }
 
@@ -410,45 +415,62 @@ struct ReadOnlyInstalledReleaseFactsProvider: InstalledReleaseFactsProviding {
     }
 
     func inspect() throws -> InstalledReleaseFacts {
+        let appLayoutSafe = appLayoutIsSafe()
+        let runtimeLayoutSafe = runtimeLayoutIsSafe()
         let infoURL = paths.appURL.appendingPathComponent("Contents/Info.plist")
-        let info = infoDictionary(at: infoURL)
+        let info = appLayoutSafe ? infoDictionary(at: infoURL) : nil
         let bundleIdentifier = (info?["CFBundleIdentifier"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
         let bundleVersion = (info?["CFBundleShortVersionString"] as? String ?? info?["CFBundleVersion"] as? String)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        let usableBundleMetadata = isNonEmptyRegularNonSymlinkFile(at: infoURL)
+        let usableBundleMetadata = appLayoutSafe
+            && isNonEmptyRegularNonSymlinkFile(at: infoURL)
             && bundleIdentifier?.isEmpty == false
             && bundleVersion?.isEmpty == false
-        let helperPresent = isExecutableRegularFile(at: paths.helperExecutableURL) && usableBundleMetadata
-        let markerFilePresent = isNonEmptyRegularNonSymlinkFile(at: paths.runtimeMarkerURL)
-        let runtimePresent = isExecutableRegularFile(at: paths.runtimePythonURL)
-        let payloadPresent = isNonEmptyRegularNonSymlinkFile(at: paths.runtimeScriptURL)
-        let releaseVersion = markerFilePresent
+        let helperPresent = appLayoutSafe
+            && isExecutableRegularFile(at: paths.helperExecutableURL)
+            && usableBundleMetadata
+        let markerFilePresent = runtimeLayoutSafe
+            && isNonEmptyRegularNonSymlinkFile(at: paths.runtimeMarkerURL)
+        let runtimePresent = runtimeLayoutSafe && isExecutableRegularFile(at: paths.runtimePythonURL)
+        let payloadPresent = runtimeLayoutSafe && isNonEmptyRegularNonSymlinkFile(at: paths.runtimeScriptURL)
+        let releaseVersion = runtimeLayoutSafe && markerFilePresent
             ? (try? String(contentsOf: paths.runtimeMarkerURL, encoding: .utf8)).flatMap {
                 let version = $0.trimmingCharacters(in: .whitespacesAndNewlines)
                 return version.isEmpty ? nil : version
             }
             : nil
         let markerPresent = releaseVersion?.isEmpty == false
-        let file = commandRunner.run(DiagnosticCommandRequest(
-            executable: "/usr/bin/file",
-            arguments: ["-b", paths.helperExecutableURL.path]
-        ))
-        let signature = commandRunner.run(DiagnosticCommandRequest(
-            executable: "/usr/bin/codesign",
-            arguments: ["-dv", "--verbose=4", paths.appURL.path]
-        ))
-        let verify = commandRunner.run(DiagnosticCommandRequest(
-            executable: "/usr/bin/codesign",
-            arguments: ["--verify", "--deep", "--strict", paths.appURL.path]
-        ))
-        let runtimeFile = commandRunner.run(DiagnosticCommandRequest(
-            executable: "/usr/bin/file",
-            arguments: ["-b", paths.runtimePythonURL.path]
-        ))
-        let runtimeVersion = commandRunner.run(DiagnosticCommandRequest(
-            executable: paths.runtimePythonURL.path,
-            arguments: ["--version"]
-        ))
+        let unavailable = DiagnosticCommandResult(status: -1, stdout: "", stderr: "")
+        let file = appLayoutSafe
+            ? commandRunner.run(DiagnosticCommandRequest(
+                executable: "/usr/bin/file",
+                arguments: ["-b", paths.helperExecutableURL.path]
+            ))
+            : unavailable
+        let signature = appLayoutSafe
+            ? commandRunner.run(DiagnosticCommandRequest(
+                executable: "/usr/bin/codesign",
+                arguments: ["-dv", "--verbose=4", paths.appURL.path]
+            ))
+            : unavailable
+        let verify = appLayoutSafe
+            ? commandRunner.run(DiagnosticCommandRequest(
+                executable: "/usr/bin/codesign",
+                arguments: ["--verify", "--deep", "--strict", paths.appURL.path]
+            ))
+            : unavailable
+        let runtimeFile = appLayoutSafe && runtimeLayoutSafe
+            ? commandRunner.run(DiagnosticCommandRequest(
+                executable: "/usr/bin/file",
+                arguments: ["-b", paths.runtimePythonURL.path]
+            ))
+            : unavailable
+        let runtimeVersion = appLayoutSafe && runtimeLayoutSafe && runtimePresent
+            ? commandRunner.run(DiagnosticCommandRequest(
+                executable: paths.runtimePythonURL.path,
+                arguments: ["--version"]
+            ))
+            : unavailable
         let helperArchitecture = architecture(from: file.stdout)
         let runtimeArchitecture = architecture(from: runtimeFile.stdout)
         let parsedRuntimeVersion = pythonVersion(from: runtimeVersion.stdout + runtimeVersion.stderr)
@@ -460,8 +482,10 @@ struct ReadOnlyInstalledReleaseFactsProvider: InstalledReleaseFactsProviding {
             isSigned: verify.status == 0,
             isAdHoc: details.localizedCaseInsensitiveContains("adhoc") || details.localizedCaseInsensitiveContains("ad hoc"),
             developerIDTrusted: details.contains("Developer ID Application"),
-            receiptAvailable: fileManager.fileExists(atPath: paths.appURL.appendingPathComponent("Contents/_MASReceipt/receipt").path),
-            integrityAvailable: fileManager.fileExists(atPath: paths.appURL.appendingPathComponent("Contents/_CodeSignature/CodeResources").path)
+            receiptAvailable: appLayoutSafe
+                && fileManager.fileExists(atPath: paths.appURL.appendingPathComponent("Contents/_MASReceipt/receipt").path),
+            integrityAvailable: appLayoutSafe
+                && fileManager.fileExists(atPath: paths.appURL.appendingPathComponent("Contents/_CodeSignature/CodeResources").path)
         )
         let runtime = RuntimeFacts(
             runtimePresent: runtimePresent,
@@ -485,8 +509,27 @@ struct ReadOnlyInstalledReleaseFactsProvider: InstalledReleaseFactsProviding {
             helper: helper,
             runtime: runtime,
             helperPresent: helperPresent,
-            ownershipMarkerPresent: markerPresent
+            ownershipMarkerPresent: appLayoutSafe && markerPresent
         )
+    }
+
+    private func appLayoutIsSafe() -> Bool {
+        [
+            paths.supportDirectory,
+            paths.appURL.deletingLastPathComponent(),
+            paths.appURL,
+            paths.appURL.appendingPathComponent("Contents", isDirectory: true),
+            paths.appURL.appendingPathComponent("Contents/MacOS", isDirectory: true),
+        ].allSatisfy(isRegularNonSymlinkDirectory(at:))
+    }
+
+    private func runtimeLayoutIsSafe() -> Bool {
+        [
+            paths.supportDirectory,
+            paths.runtimeDirectory,
+            paths.runtimePythonURL.deletingLastPathComponent(),
+            paths.runtimePythonURL.deletingLastPathComponent().deletingLastPathComponent(),
+        ].allSatisfy(isRegularNonSymlinkDirectory(at:))
     }
 
     private func infoDictionary(at url: URL) -> [String: Any]? {
@@ -508,6 +551,13 @@ struct ReadOnlyInstalledReleaseFactsProvider: InstalledReleaseFactsProviding {
         guard lstat(url.path, &metadata) == 0 else { return false }
         let mode = UInt32(metadata.st_mode)
         return mode & UInt32(S_IFMT) == UInt32(S_IFREG) && metadata.st_size > 0
+    }
+
+    private func isRegularNonSymlinkDirectory(at url: URL) -> Bool {
+        var metadata = stat()
+        guard lstat(url.path, &metadata) == 0 else { return false }
+        let mode = UInt32(metadata.st_mode)
+        return mode & UInt32(S_IFMT) == UInt32(S_IFDIR)
     }
 
     private func isExecutableRegularFile(at url: URL) -> Bool {
@@ -597,7 +647,8 @@ struct ReadOnlyLifecycleFactsProvider: LifecycleFactsProviding {
         let serverPID = state?.serverPID
         let tunnelPID = state?.tunnelPID
         let stateOwnerMatches = state?.ownerID == ownerID
-        let stateHasNoPIDs = state != nil && serverPID == nil && tunnelPID == nil
+        let stateHasCompletePIDs = serverPID != nil && tunnelPID != nil
+        let stateHasPartialPIDs = state != nil && !stateHasCompletePIDs
         let duplicateAssignment = serverPID != nil && serverPID == tunnelPID
         let serverAssignmentValid = serverPID.map { pid in
             serverProcesses.count == 1 && serverProcesses[0].pid == pid
@@ -606,7 +657,7 @@ struct ReadOnlyLifecycleFactsProvider: LifecycleFactsProviding {
             tunnelProcesses.count == 1 && tunnelProcesses[0].pid == pid
         } ?? true
         let pidReuse = stateResult.malformed
-            || stateHasNoPIDs
+            || stateHasPartialPIDs
             || (state != nil && !stateOwnerMatches)
             || !serverAssignmentValid
             || !tunnelAssignmentValid
@@ -623,7 +674,7 @@ struct ReadOnlyLifecycleFactsProvider: LifecycleFactsProviding {
         let ownedCount = serverProcesses.count + tunnelProcesses.count
         let ownershipMarkerPresent = state != nil
             && stateOwnerMatches
-            && !stateHasNoPIDs
+            && stateHasCompletePIDs
             && serverAssignmentValid
             && tunnelAssignmentValid
             && !pidReuse

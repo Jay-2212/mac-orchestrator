@@ -760,22 +760,44 @@ enum DiagnosticPathSafety {
 
 enum VerifiedMacOSSystemAlias {
     static func isAllowed(_ url: URL) -> Bool {
-        let path = url.standardizedFileURL.path
-        let expected: String
-        switch path {
-        case "/var": expected = "/private/var"
-        case "/tmp": expected = "/private/tmp"
-        default: return false
+        let visiblePath: String
+        let resolvedPath: String
+        switch url.path {
+        case "/var", "/private/var":
+            visiblePath = "/var"
+            resolvedPath = "/private/var"
+        case "/tmp", "/private/tmp":
+            visiblePath = "/tmp"
+            resolvedPath = "/private/tmp"
+        default:
+            let candidates = Set([
+                url.path,
+                url.standardizedFileURL.path,
+                url.resolvingSymlinksInPath().standardizedFileURL.path
+            ])
+            if candidates.contains("/var") || candidates.contains("/private/var") {
+                visiblePath = "/var"
+                resolvedPath = "/private/var"
+            } else if candidates.contains("/tmp") || candidates.contains("/private/tmp") {
+                visiblePath = "/tmp"
+                resolvedPath = "/private/tmp"
+            } else {
+                return false
+            }
         }
 
         var metadata = stat()
         guard lstat(url.path, &metadata) == 0 else { return false }
         let mode = UInt32(metadata.st_mode) & UInt32(S_IFMT)
         if mode == UInt32(S_IFLNK) {
-            return url.resolvingSymlinksInPath().standardizedFileURL.path == expected
+            return url.resolvingSymlinksInPath().standardizedFileURL.path == resolvedPath
         }
-        return path == "/var" || path == "/tmp"
-            ? mode == UInt32(S_IFDIR)
-            : false
+        let candidates = Set([
+            url.path,
+            url.standardizedFileURL.path,
+            url.resolvingSymlinksInPath().standardizedFileURL.path
+        ])
+        return mode == UInt32(S_IFDIR)
+            && (candidates.contains(visiblePath) || candidates.contains(resolvedPath))
     }
 }

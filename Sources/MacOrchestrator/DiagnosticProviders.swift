@@ -332,7 +332,11 @@ protocol KeychainPresenceProviding {
     func inspect() throws -> KeychainPresenceFacts
 }
 
-struct ReadOnlySystemKeychainPresenceProvider: KeychainPresenceProviding {
+protocol SelectiveKeychainPresenceProviding: KeychainPresenceProviding {
+    func inspect(items: Set<KeychainPresenceItem>) throws -> KeychainPresenceFacts
+}
+
+struct ReadOnlySystemKeychainPresenceProvider: SelectiveKeychainPresenceProviding {
     private let querying: KeychainPresenceQuerying
 
     private static let currentCoreItems: [KeychainPresenceItem] = [
@@ -347,8 +351,12 @@ struct ReadOnlySystemKeychainPresenceProvider: KeychainPresenceProviding {
     }
 
     func inspect() throws -> KeychainPresenceFacts {
+        try inspect(items: Set(Self.currentCoreItems))
+    }
+
+    func inspect(items: Set<KeychainPresenceItem>) throws -> KeychainPresenceFacts {
         var states = [KeychainPresenceItem: KeychainPresence]()
-        for item in Self.currentCoreItems {
+        for item in Self.currentCoreItems where items.contains(item) {
             guard let keychainItem = item.keychainItem else {
                 continue
             }
@@ -515,6 +523,7 @@ struct LifecycleFacts: Codable, Equatable, Sendable {
     let tunnelPID: Int32?
     let ownershipMarkerPresent: Bool
     let duplicateOwnedProcesses: Bool
+    let duplicateHelperInstances: Bool
     let pidReuseDetected: Bool
 
     init(
@@ -526,6 +535,7 @@ struct LifecycleFacts: Codable, Equatable, Sendable {
         tunnelPID: Int32? = nil,
         ownershipMarkerPresent: Bool = false,
         duplicateOwnedProcesses: Bool = false,
+        duplicateHelperInstances: Bool = false,
         pidReuseDetected: Bool = false
     ) {
         self.launchAgentPresent = launchAgentPresent
@@ -536,6 +546,7 @@ struct LifecycleFacts: Codable, Equatable, Sendable {
         self.tunnelPID = tunnelPID
         self.ownershipMarkerPresent = ownershipMarkerPresent
         self.duplicateOwnedProcesses = duplicateOwnedProcesses
+        self.duplicateHelperInstances = duplicateHelperInstances
         self.pidReuseDetected = pidReuseDetected
     }
 }

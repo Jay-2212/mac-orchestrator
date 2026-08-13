@@ -254,6 +254,29 @@ final class RepairEngineTests: XCTestCase {
         XCTAssertEqual(try store.load().localMCPPort, 8123)
     }
 
+    func testSchemaZeroBackupUsesExistingMigrationSemanticsBeforePromotion() async throws {
+        let root = try makeTemporaryDirectory()
+        let store = ConfigurationStore(directoryURL: root, ownerIDProvider: { "owner-test" })
+        try Data("{malformed-primary".utf8).write(to: store.configurationURL)
+        var legacy = AppConfiguration.fresh(ownerID: "owner-test")
+        legacy.schemaVersion = 0
+        legacy.generation = 0
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode(legacy).write(to: store.backupURL)
+
+        let outcome = await RepairEngine(dependencies: RepairDependencies(
+            configurationBackupRestoring: ConfigurationStoreBackupRestorer(
+                store: store,
+                expectedOwnerID: "owner-test"
+            )
+        )).execute(.restoreConfigurationBackup)
+
+        XCTAssertEqual(outcome.status, .repaired)
+        XCTAssertEqual(try store.load().schemaVersion, AppConfiguration.currentSchemaVersion)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: store.configurationURL.path + ".corrupt"))
+    }
+
     func testBackupOwnerMismatchRefusesAndPreservesMalformedPrimary() async throws {
         let root = try makeTemporaryDirectory()
         let store = ConfigurationStore(directoryURL: root, ownerIDProvider: { "owner-test" })
@@ -401,6 +424,48 @@ final class RepairEngineTests: XCTestCase {
                 .execute(.reassignLocalPort).status,
             .refused
         )
+    }
+
+    func testConcretePortUpdaterRefusesMissingConfigurationWithoutCreatingSupportState() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("MacOrchestratorPortRepairMissing-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = ConfigurationStore(directoryURL: root, ownerIDProvider: { "owner-test" })
+        let reassigner = SafeLocalPortReassigner(
+            request: LocalPortReassignmentRequest(
+                currentPort: 8000,
+                candidatePort: 8123,
+                expectedOwnerID: "owner-test"
+            ),
+            occupancy: SequencedPortOccupancy(results: [.occupiedUnrelated, .free, .free]),
+            configuration: ConfigurationStorePortUpdater(store: store)
+        )
+
+        let outcome = await reassigner.reassignLocalPort()
+
+        XCTAssertEqual(outcome.status, .refused)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.path))
+    }
+
+    func testConcretePortUpdaterRefusesMalformedConfigurationWithoutChangingBytes() async throws {
+        let root = try makeTemporaryDirectory()
+        let store = ConfigurationStore(directoryURL: root, ownerIDProvider: { "owner-test" })
+        let malformed = Data("{malformed-primary".utf8)
+        try malformed.write(to: store.configurationURL)
+        let reassigner = SafeLocalPortReassigner(
+            request: LocalPortReassignmentRequest(
+                currentPort: 8000,
+                candidatePort: 8123,
+                expectedOwnerID: "owner-test"
+            ),
+            occupancy: SequencedPortOccupancy(results: [.occupiedUnrelated, .free, .free]),
+            configuration: ConfigurationStorePortUpdater(store: store)
+        )
+
+        let outcome = await reassigner.reassignLocalPort()
+
+        XCTAssertEqual(outcome.status, .refused)
+        XCTAssertEqual(try Data(contentsOf: store.configurationURL), malformed)
     }
 
     func testLaunchAgentRepairRequiresExactOwnershipLabelPathAndContract() async {

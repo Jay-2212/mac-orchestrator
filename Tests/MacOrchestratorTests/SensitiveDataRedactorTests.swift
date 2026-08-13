@@ -51,7 +51,7 @@ final class SensitiveDataRedactorTests: XCTestCase {
             homeDirectory: "/Users/synthetic"
         )
         let input = Data(
-            #"{"category":"network","status":"fail","filename":"doctor.json","details":{"AuThToKeN":"field-only-auth-value","CAPABILITYTOKEN":"field-only-capability-value","errorClass":"timeout"}}"#.utf8
+            #"{"category":"network","status":"fail","filename":"doctor.json","details":{"AuThToKeN":"field-only-auth-value","CAPABILITYTOKEN":"field-only-capability-value","apiKey":"field-only-api-key","privateKey":"field-only-private-key","errorClass":"timeout"}}"#.utf8
         )
 
         let sanitized = try XCTUnwrap(redactor.redactJSON(input))
@@ -66,9 +66,13 @@ final class SensitiveDataRedactorTests: XCTestCase {
         XCTAssertEqual(details["errorClass"] as? String, "timeout")
         XCTAssertEqual(details["AuThToKeN"] as? String, "<redacted>")
         XCTAssertEqual(details["CAPABILITYTOKEN"] as? String, "<redacted>")
+        XCTAssertEqual(details["apiKey"] as? String, "<redacted>")
+        XCTAssertEqual(details["privateKey"] as? String, "<redacted>")
         let text = String(decoding: sanitized, as: UTF8.self)
         XCTAssertFalse(text.contains("field-only-auth-value"))
         XCTAssertFalse(text.contains("field-only-capability-value"))
+        XCTAssertFalse(text.contains("field-only-api-key"))
+        XCTAssertFalse(text.contains("field-only-private-key"))
     }
 
     func testRedactedPathNormalizesConfiguredAndUserHomePaths() {
@@ -89,14 +93,27 @@ final class SensitiveDataRedactorTests: XCTestCase {
 
     func testRedactsPlaintextSecretAssignmentsWithoutRemovingFieldContext() {
         let redactor = SensitiveDataRedactor(exactSecrets: [], homeDirectory: "/Users/synthetic")
-        let output = redactor.redact("ngrok_authtoken=FAKE_NGROK_TOKEN password: fake-password authorization=Bearer fake-auth")
+        let output = redactor.redact("ngrok_authtoken=FAKE_NGROK_TOKEN chat_id=123456789 password: fake-password authorization=Bearer fake-auth")
 
         XCTAssertTrue(output.contains("ngrok_authtoken=<redacted>"))
         XCTAssertTrue(output.contains("password: <redacted>"))
         XCTAssertTrue(output.contains("authorization=Bearer <redacted>"))
+        XCTAssertTrue(output.contains("chat_id=<redacted>"))
         XCTAssertFalse(output.contains("FAKE_NGROK_TOKEN"))
         XCTAssertFalse(output.contains("fake-password"))
         XCTAssertFalse(output.contains("fake-auth"))
+    }
+
+    func testRedactsChatIDAndBotTokenStructuredFields() throws {
+        let redactor = SensitiveDataRedactor(exactSecrets: [], homeDirectory: nil)
+        let sanitized = try XCTUnwrap(redactor.redactJSON(Data(
+            #"{"botToken":"bot-secret-value","chat_id":"123456789","chatSecret":"chat-secret-value"}"#.utf8
+        )))
+        let text = String(decoding: sanitized, as: UTF8.self)
+
+        XCTAssertFalse(text.contains("bot-secret-value"))
+        XCTAssertFalse(text.contains("123456789"))
+        XCTAssertFalse(text.contains("chat-secret-value"))
     }
 
     func testRedactsAbsoluteConnectorURLsRouteOnlyFormsAndBareCredentialAssignments() {
@@ -123,6 +140,17 @@ final class SensitiveDataRedactorTests: XCTestCase {
         XCTAssertFalse(output.contains("bare-password"))
         XCTAssertFalse(output.contains("bare-authz"))
         XCTAssertTrue(output.contains("safe-context=preserved"))
+    }
+
+    func testStreamingRedactionNormalizesConfiguredHomePaths() {
+        var redactor = StreamingLogRedactor(
+            secrets: [],
+            homeDirectory: "/Users/synthetic"
+        )
+
+        let lines = redactor.append("path=/Users/synthetic/Library/Logs/current.log\n", flush: false)
+
+        XCTAssertEqual(lines, ["path=<home>/Library/Logs/current.log"])
     }
 
     func testRotatingLogRedactsCurrentAndRotatedFilesAndPreservesPermissions() throws {

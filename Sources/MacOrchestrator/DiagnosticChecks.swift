@@ -470,7 +470,10 @@ enum DiagnosticChecks {
         guard let facts else {
             return result("remote.endpoint", "Remote endpoint", .fail, Text.providerUnavailable, repair: .retryRemoteConnector)
         }
-        guard facts.endpointAvailable, facts.endpointCount == 1 else {
+        // The configured upstream is the trust boundary. Other endpoints in
+        // the Agent API response are unrelated; their presence must not turn
+        // an otherwise exact match into a failure.
+        guard facts.endpointAvailable, facts.endpointCount > 0 else {
             return result("remote.endpoint", "Remote endpoint", .fail, Text.endpointUnavailable, repair: .retryRemoteConnector)
         }
         return result("remote.endpoint", "Remote endpoint", .pass, Text.verified)

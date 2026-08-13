@@ -8,6 +8,16 @@ struct DoctorThresholds: Equatable, Sendable {
     }
 }
 
+private struct DoctorInspection<Value> {
+    let value: Value?
+    let failureReason: String?
+
+    init(value: Value? = nil, failureReason: String? = nil) {
+        self.value = value
+        self.failureReason = failureReason
+    }
+}
+
 struct DoctorConfigurationSnapshot: Equatable, Sendable {
     let facts: ConfigurationDiagnosticFacts
     let validatedConfiguration: AppConfiguration?
@@ -216,7 +226,8 @@ struct DoctorEngine {
     func run() async -> DoctorReport {
         // Configuration is the only source of desired state. Nothing that
         // depends on those decisions is inspected until this snapshot exists.
-        let snapshot = inspectConfigurationContext()
+        let configurationInspection = inspectConfigurationContext()
+        let snapshot = configurationInspection.value
         let configurationFacts = snapshot?.facts
         let configuration = snapshot.flatMap {
             DiagnosticChecks.isUsableConfigurationContext($0.facts) ? $0.validatedConfiguration : nil
@@ -227,22 +238,33 @@ struct DoctorEngine {
             || configuration?.desiredCapabilities["remote.connector"] == true
         let telegramSendDesired = configuration?.desiredCapabilities["telegram.send"] == true
 
-        let installedFacts = inspectInstalledRelease()
-        let permissionFacts = DiagnosticChecks.consumesProtectedBehavior(configuration)
+        let installedInspection = inspectInstalledRelease()
+        let installedFacts = installedInspection.value
+        let permissionInspection = DiagnosticChecks.consumesProtectedBehavior(configuration)
             ? inspectPermissions()
-            : nil
-        let portFacts = serverDesired ? inspectPort() : nil
-        let localMCPFacts = serverDesired ? await inspectLocalMCP() : nil
-        let lifecycleFacts = (serverDesired || remoteDesired) ? inspectLifecycle() : nil
-        let keychainFacts = inspectKeychain(
+            : DoctorInspection<PermissionFacts>()
+        let permissionFacts = permissionInspection.value
+        let portInspection = serverDesired ? inspectPort() : DoctorInspection<PortFacts>()
+        let portFacts = portInspection.value
+        let localMCPInspection = serverDesired ? await inspectLocalMCP() : DoctorInspection<LocalMCPFacts>()
+        let localMCPFacts = localMCPInspection.value
+        let lifecycleInspection = (serverDesired || remoteDesired)
+            ? inspectLifecycle()
+            : DoctorInspection<LifecycleFacts>()
+        let lifecycleFacts = lifecycleInspection.value
+        let keychainInspection = inspectKeychain(
             localDesired: serverDesired,
             remoteDesired: remoteDesired,
             telegramSendDesired: telegramSendDesired,
             hasValidatedConfiguration: hasValidatedConfiguration
         )
-        let remoteFacts = remoteDesired ? inspectRemote() : nil
-        let diskFacts = inspectDisk()
-        let logDirectoryFacts = inspectLogDirectory()
+        let keychainFacts = keychainInspection.value
+        let remoteInspection = remoteDesired ? inspectRemote() : DoctorInspection<RemoteConnectorFacts>()
+        let remoteFacts = remoteInspection.value
+        let diskInspection = inspectDisk()
+        let diskFacts = diskInspection.value
+        let logDirectoryInspection = inspectLogDirectory()
+        let logDirectoryFacts = logDirectoryInspection.value
         let updateFacts = inspectUpdate()
 
         var results = [
@@ -286,20 +308,72 @@ struct DoctorEngine {
             DiagnosticChecks.futureCapability("capability.cloudflare", title: "Cloudflare capability"),
             DiagnosticChecks.futureCapability("capability.telegram-assistant", title: "Telegram Assistant capability"),
         ]
+        applyFailure(
+            configurationInspection.failureReason,
+            to: ["configuration.read"],
+            in: &results
+        )
+        applyFailure(
+            installedInspection.failureReason,
+            to: ["installation.helper"],
+            in: &results
+        )
+        applyFailure(
+            permissionInspection.failureReason,
+            to: ["permissions.requester"],
+            in: &results
+        )
+        let keychainFailureTarget: [String]
+        if serverDesired {
+            keychainFailureTarget = ["keychain.connector"]
+        } else if remoteDesired {
+            keychainFailureTarget = ["remote.ngrok"]
+        } else if telegramSendDesired {
+            keychainFailureTarget = ["keychain.telegram-send"]
+        } else {
+            keychainFailureTarget = []
+        }
+        applyFailure(keychainInspection.failureReason, to: keychainFailureTarget, in: &results)
+        applyFailure(portInspection.failureReason, to: ["port.selected"], in: &results)
+        applyFailure(localMCPInspection.failureReason, to: ["mcp.liveness"], in: &results)
+        applyFailure(
+            lifecycleInspection.failureReason,
+            to: ["lifecycle.launch-agent", "lifecycle.process-ownership"],
+            in: &results
+        )
+        applyFailure(remoteInspection.failureReason, to: ["remote.ngrok"], in: &results)
+        applyFailure(diskInspection.failureReason, to: ["disk.free-space"], in: &results)
+        applyFailure(
+            logDirectoryInspection.failureReason,
+            to: ["filesystem.log-directory-permissions"],
+            in: &results
+        )
         results.sort { $0.id < $1.id }
         return DoctorReport(generatedAt: dependencies.clock(), results: results)
     }
 
-    private func inspectConfigurationContext() -> DoctorConfigurationSnapshot? {
-        try? dependencies.configurationContextProvider.inspect()
+    private func inspectConfigurationContext() -> DoctorInspection<DoctorConfigurationSnapshot> {
+        do {
+            return DoctorInspection(value: try dependencies.configurationContextProvider.inspect())
+        } catch {
+            return DoctorInspection(failureReason: providerFailureReason(error, subject: "configuration"))
+        }
     }
 
-    private func inspectInstalledRelease() -> InstalledReleaseFacts? {
-        try? dependencies.installedReleaseProvider.inspect()
+    private func inspectInstalledRelease() -> DoctorInspection<InstalledReleaseFacts> {
+        do {
+            return DoctorInspection(value: try dependencies.installedReleaseProvider.inspect())
+        } catch {
+            return DoctorInspection(failureReason: providerFailureReason(error, subject: "installed helper and runtime"))
+        }
     }
 
-    private func inspectPermissions() -> PermissionFacts? {
-        try? dependencies.permissionProvider.inspect()
+    private func inspectPermissions() -> DoctorInspection<PermissionFacts> {
+        do {
+            return DoctorInspection(value: try dependencies.permissionProvider.inspect())
+        } catch {
+            return DoctorInspection(failureReason: providerFailureReason(error, subject: "managed runtime permissions"))
+        }
     }
 
     private func inspectKeychain(
@@ -307,8 +381,8 @@ struct DoctorEngine {
         remoteDesired: Bool,
         telegramSendDesired: Bool,
         hasValidatedConfiguration: Bool
-    ) -> KeychainPresenceFacts? {
-        guard hasValidatedConfiguration else { return nil }
+    ) -> DoctorInspection<KeychainPresenceFacts> {
+        guard hasValidatedConfiguration else { return DoctorInspection() }
         var items = Set<KeychainPresenceItem>()
         if localDesired { items.insert(.connectorToken) }
         if remoteDesired { items.insert(.ngrokAuthtoken) }
@@ -316,35 +390,103 @@ struct DoctorEngine {
             items.insert(.telegramSendBotToken)
             items.insert(.telegramSendChatID)
         }
-        guard !items.isEmpty else { return nil }
-        return try? dependencies.keychainPresenceProvider.inspect(items: items)
-    }
-
-    private func inspectPort() -> PortFacts? {
-        try? dependencies.portProvider.inspect()
-    }
-
-    private func inspectLocalMCP() async -> LocalMCPFacts? {
-        if let provider = dependencies.asyncLocalMCPProvider {
-            return try? await provider.inspect()
+        guard !items.isEmpty else { return DoctorInspection() }
+        do {
+            return DoctorInspection(value: try dependencies.keychainPresenceProvider.inspect(items: items))
+        } catch {
+            return DoctorInspection(failureReason: providerFailureReason(error, subject: "Keychain presence"))
         }
-        return try? dependencies.localMCPProvider.inspect()
     }
 
-    private func inspectLifecycle() -> LifecycleFacts? {
-        try? dependencies.lifecycleProvider.inspect()
+    private func inspectPort() -> DoctorInspection<PortFacts> {
+        do {
+            return DoctorInspection(value: try dependencies.portProvider.inspect())
+        } catch {
+            return DoctorInspection(failureReason: providerFailureReason(error, subject: "selected local port"))
+        }
     }
 
-    private func inspectRemote() -> RemoteConnectorFacts? {
-        try? dependencies.remoteConnectorProvider.inspect()
+    private func inspectLocalMCP() async -> DoctorInspection<LocalMCPFacts> {
+        if let provider = dependencies.asyncLocalMCPProvider {
+            do {
+                return DoctorInspection(value: try await provider.inspect())
+            } catch {
+                return DoctorInspection(failureReason: providerFailureReason(error, subject: "local MCP"))
+            }
+        }
+        do {
+            return DoctorInspection(value: try dependencies.localMCPProvider.inspect())
+        } catch {
+            return DoctorInspection(failureReason: providerFailureReason(error, subject: "local MCP"))
+        }
     }
 
-    private func inspectDisk() -> DiskSpaceFacts? {
-        try? dependencies.diskSpaceProvider.inspect()
+    private func inspectLifecycle() -> DoctorInspection<LifecycleFacts> {
+        do {
+            return DoctorInspection(value: try dependencies.lifecycleProvider.inspect())
+        } catch {
+            return DoctorInspection(failureReason: providerFailureReason(error, subject: "managed lifecycle"))
+        }
     }
 
-    private func inspectLogDirectory() -> LogDirectoryFacts? {
-        try? dependencies.logDirectoryProvider.inspect()
+    private func inspectRemote() -> DoctorInspection<RemoteConnectorFacts> {
+        do {
+            return DoctorInspection(value: try dependencies.remoteConnectorProvider.inspect())
+        } catch {
+            return DoctorInspection(failureReason: providerFailureReason(error, subject: "remote connector"))
+        }
+    }
+
+    private func inspectDisk() -> DoctorInspection<DiskSpaceFacts> {
+        do {
+            return DoctorInspection(value: try dependencies.diskSpaceProvider.inspect())
+        } catch {
+            return DoctorInspection(failureReason: providerFailureReason(error, subject: "free disk space"))
+        }
+    }
+
+    private func inspectLogDirectory() -> DoctorInspection<LogDirectoryFacts> {
+        do {
+            return DoctorInspection(value: try dependencies.logDirectoryProvider.inspect())
+        } catch {
+            return DoctorInspection(failureReason: providerFailureReason(error, subject: "log-directory permissions"))
+        }
+    }
+
+    private func applyFailure(
+        _ reason: String?,
+        to ids: [String],
+        in results: inout [DiagnosticResult]
+    ) {
+        guard let reason else { return }
+        for index in results.indices where ids.contains(results[index].id) {
+            let result = results[index]
+            results[index] = DiagnosticResult(
+                id: result.id,
+                title: result.title,
+                status: result.status,
+                reason: reason,
+                repair: result.repair
+            )
+        }
+    }
+
+    private func providerFailureReason(_ error: Error, subject: String) -> String {
+        let detail: String
+        if let error = error as? DiagnosticProviderError {
+            switch error {
+            case .unavailable: detail = "unavailable"
+            case .inaccessible: detail = "inaccessible"
+            case .unreadable: detail = "unreadable"
+            case .malformed: detail = "malformed"
+            case .unsupportedSchema: detail = "unsupported schema"
+            case .invalid: detail = "invalid"
+            case .permissionDenied: detail = "permission denied"
+            }
+        } else {
+            detail = "inspection failed"
+        }
+        return "Unable to inspect \(subject): \(detail)."
     }
 
     private func inspectUpdate() -> UpdateAvailabilityFacts? {

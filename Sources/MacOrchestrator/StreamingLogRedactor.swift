@@ -4,8 +4,8 @@ struct StreamingLogRedactor: Sendable {
     private let redactor: SensitiveDataRedactor
     private var pending = ""
 
-    init(secrets: [String]) {
-        self.redactor = SensitiveDataRedactor(exactSecrets: secrets, homeDirectory: nil)
+    init(secrets: [String], homeDirectory: String? = NSHomeDirectory()) {
+        self.redactor = SensitiveDataRedactor(exactSecrets: secrets, homeDirectory: homeDirectory)
     }
 
     mutating func append(_ chunk: String, flush: Bool) -> [String] {

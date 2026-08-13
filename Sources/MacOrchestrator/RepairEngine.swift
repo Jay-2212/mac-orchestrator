@@ -464,6 +464,16 @@ struct ConfigurationStoreBackupRestorer: @unchecked Sendable, ConfigurationBacku
         guard let decoded = try? decoder.decode(AppConfiguration.self, from: data) else {
             return nil
         }
+        if decoded.schemaVersion == 0 {
+            // ConfigurationStore.load() treats schema zero as a supported
+            // migration input. Validate the same normalized values here
+            // before allowing that existing recovery path to run, so an
+            // unusable legacy backup cannot trigger primary mutation.
+            var migrated = decoded
+            migrated.schemaVersion = AppConfiguration.currentSchemaVersion
+            migrated.generation = max(1, migrated.generation)
+            return try? migrated.validated()
+        }
         return try? decoded.validated()
     }
 }
@@ -528,16 +538,39 @@ struct SafeLocalPortReassigner: LocalPortReassigning {
         do {
             try await configuration.updateLocalMCPPort(request.candidatePort)
             return RepairAdapterResult(status: .repaired, clientReconfigurationRequired: true)
+        } catch is CanonicalLocalPortUpdateError {
+            return .refused
         } catch {
             return .failed
         }
     }
 }
 
+enum CanonicalLocalPortUpdateError: Error {
+    case notSafe
+}
+
 struct ConfigurationStorePortUpdater: @unchecked Sendable, CanonicalLocalPortUpdating {
     let store: ConfigurationStore
 
     func updateLocalMCPPort(_ port: Int) async throws {
+        guard (1...65535).contains(port) else {
+            throw CanonicalLocalPortUpdateError.notSafe
+        }
+        let facts: ConfigurationDiagnosticFacts
+        do {
+            facts = try ReadOnlyConfigurationDiagnosticProvider(
+                directoryURL: store.configurationURL.deletingLastPathComponent()
+            ).inspect()
+        } catch {
+            throw error
+        }
+        guard DiagnosticChecks.isUsableConfigurationContext(facts) else {
+            // ConfigurationStore.update() is intentionally not used as the
+            // existence probe: its loadOrCreate() fallback would create a
+            // new support directory for a missing configuration.
+            throw CanonicalLocalPortUpdateError.notSafe
+        }
         _ = try store.update { configuration in
             configuration.localMCPPort = port
         }

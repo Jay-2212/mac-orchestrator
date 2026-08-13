@@ -51,7 +51,7 @@ final class DiagnosticLiveProviderTests: XCTestCase {
 
         let facts = await adapter.inspect()
 
-        XCTAssertTrue(facts.livenessVerified)
+        XCTAssertFalse(facts.livenessVerified)
         XCTAssertFalse(facts.readinessVerified)
         XCTAssertFalse(facts.sessionEstablished)
         XCTAssertFalse(facts.safeCallSucceeded)
@@ -278,6 +278,25 @@ final class DiagnosticLiveProviderTests: XCTestCase {
         )
     }
 
+    func testPortProviderTreatsAnEmptyNoMatchResultAsAVerifiedFreePort() throws {
+        let request = DiagnosticCommandRequest(executable: "/usr/sbin/lsof", arguments: [
+            "-nP", "-iTCP:8007", "-sTCP:LISTEN", "-t"
+        ])
+        let provider = ReadOnlyPortFactsProvider(
+            port: 8007,
+            commandRunner: RecordingDiagnosticCommandRunner(outputs: [
+                request: DiagnosticCommandResult(status: 1, stdout: "", stderr: "")
+            ]),
+            processRunner: RecordingDiagnosticProcessRunner(processes: [])
+        )
+
+        let facts = try provider.inspect()
+
+        XCTAssertTrue(facts.inspectionAvailable)
+        XCTAssertFalse(facts.listenerPresent)
+        XCTAssertEqual(DiagnosticChecks.portSelected(facts, configuredPort: 8007).status, .pass)
+    }
+
     func testNgrokProviderParsesEndpointCountWithoutReturningURLOrBody() throws {
         let apiURL = URL(string: "http://127.0.0.1:4040/api/endpoints")!
         let http = RecordingDiagnosticHTTPRunner(response: DiagnosticHTTPResponse(
@@ -303,6 +322,28 @@ final class DiagnosticLiveProviderTests: XCTestCase {
         XCTAssertFalse(String(describing: facts).contains("public.example"))
         XCTAssertFalse(String(describing: facts).contains("127.0.0.1:8007"))
         XCTAssertEqual(http.requests, [apiURL])
+    }
+
+    func testNgrokProviderAcceptsAnExactConfiguredTargetAmongMultipleEndpoints() throws {
+        let apiURL = URL(string: "http://127.0.0.1:4040/api/endpoints")!
+        let http = RecordingDiagnosticHTTPRunner(response: DiagnosticHTTPResponse(
+            status: 200,
+            url: apiURL,
+            body: Data(#"{"endpoints":[{"url":"https://unrelated.example","upstream":{"url":"http://127.0.0.1:9000"}},{"url":"https://public.example","upstream":{"url":"http://127.0.0.1:8007"}}]}"#.utf8)
+        ))
+        let provider = ReadOnlyRemoteConnectorFactsProvider(
+            desired: true,
+            binaryPresent: true,
+            configurationPresent: true,
+            target: "http://127.0.0.1:8007",
+            httpRunner: http
+        )
+
+        let facts = try provider.inspect()
+
+        XCTAssertEqual(facts.endpointCount, 2)
+        XCTAssertTrue(facts.endpointAvailable)
+        XCTAssertEqual(DiagnosticChecks.remoteEndpoint(facts, desired: true).status, .pass)
     }
 
     func testNgrokProviderReportsOnlyAuthPresenceAndStillChecksAgentAPI() throws {
@@ -463,6 +504,68 @@ final class DiagnosticLiveProviderTests: XCTestCase {
         XCTAssertEqual(runner.requests, [fileRequest, signRequest])
     }
 
+    func testNgrokPathProviderRejectsSymlinkedBinaryWithoutProbingOrContactingAgentAPI() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mac-orchestrator-ngrok-symlink-\(UUID().uuidString)", isDirectory: true)
+        let foreign = root.appendingPathComponent("foreign-ngrok")
+        let binary = root.appendingPathComponent("ngrok")
+        let configuration = root.appendingPathComponent("ngrok.yml")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try Data("binary-fixture".utf8).write(to: foreign)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: foreign.path)
+        try FileManager.default.createSymbolicLink(at: binary, withDestinationURL: foreign)
+        try Data("version: 2".utf8).write(to: configuration)
+
+        let runner = RecordingDiagnosticCommandRunner(outputs: [:])
+        let http = RecordingDiagnosticHTTPRunner(response: DiagnosticHTTPResponse(
+            status: 200,
+            url: URL(string: "http://127.0.0.1:4040/api/endpoints")!,
+            body: Data(#"{"endpoints":[]}"#.utf8)
+        ))
+        let provider = ReadOnlyRemoteConnectorFactsProvider(
+            desired: true,
+            binaryURL: binary,
+            configurationURL: configuration,
+            target: "http://127.0.0.1:8007",
+            httpRunner: http,
+            commandRunner: runner
+        )
+
+        let facts = try provider.inspect()
+
+        XCTAssertFalse(facts.binaryPresent)
+        XCTAssertFalse(facts.configurationPresent)
+        XCTAssertFalse(facts.endpointAvailable)
+        XCTAssertTrue(runner.requests.isEmpty)
+        XCTAssertTrue(http.requests.isEmpty)
+    }
+
+    func testNgrokProviderUsesSelectiveExistenceOnlyKeychainRequest() throws {
+        let apiURL = URL(string: "http://127.0.0.1:4040/api/endpoints")!
+        let keychain = RecordingSelectiveDiagnosticKeychainPresenceProvider(
+            facts: KeychainPresenceFacts(states: [.ngrokAuthtoken: .present])
+        )
+        let provider = ReadOnlyRemoteConnectorFactsProvider(
+            desired: true,
+            binaryPresent: true,
+            configurationPresent: true,
+            target: "http://127.0.0.1:8007",
+            httpRunner: RecordingDiagnosticHTTPRunner(response: DiagnosticHTTPResponse(
+                status: 200,
+                url: apiURL,
+                body: Data(#"{"endpoints":[]}"#.utf8)
+            )),
+            keychainPresenceProvider: keychain
+        )
+
+        let inspection = try provider.inspectDetailed()
+
+        XCTAssertEqual(inspection.ngrokAuthtokenPresence, .present)
+        XCTAssertEqual(keychain.requestedItems, [Set([.ngrokAuthtoken])])
+        XCTAssertTrue(keychain.legacyInspectCalls.isEmpty)
+    }
+
     func testNgrokProviderRejectsRedirectedAgentAPIWithoutExposingEndpoint() throws {
         let apiURL = URL(string: "http://127.0.0.1:4040/api/endpoints")!
         let redirectedURL = URL(string: "http://127.0.0.1:4040/redirected")!
@@ -586,6 +689,39 @@ final class DiagnosticLiveProviderTests: XCTestCase {
         XCTAssertEqual(facts.ownedProcessCount, 0)
         XCTAssertFalse(facts.ownershipMarkerPresent)
         XCTAssertTrue(facts.pidReuseDetected)
+    }
+
+    func testLifecycleRejectsDuplicateHelperInstances() throws {
+        let fixture = try makeLifecycleFixture()
+        try JSONEncoder().encode(OwnedProcessState(ownerID: "owner-1", serverPID: 42, tunnelPID: 43))
+            .write(to: fixture.paths.ownedProcessesURL)
+        try writeSupportedLaunchAgent(to: fixture.paths.launchAgentURL, helper: fixture.paths.helperExecutableURL)
+        let helperCommand = fixture.paths.helperExecutableURL.path
+        let provider = ReadOnlyLifecycleFactsProvider(
+            paths: fixture.paths,
+            ownerID: "owner-1",
+            commandRunner: launchctlRunner(),
+            processRunner: RecordingDiagnosticProcessRunner(processes: [
+                DiagnosticProcessRecord(pid: 10, commandLine: helperCommand, running: true),
+                DiagnosticProcessRecord(pid: 11, commandLine: helperCommand, running: true),
+                DiagnosticProcessRecord(
+                    pid: 42,
+                    commandLine: "python automac_mcp.py --managed-owner owner-1",
+                    running: true
+                ),
+                DiagnosticProcessRecord(
+                    pid: 43,
+                    commandLine: "ngrok http --metadata mac-orchestrator-owner=owner-1",
+                    running: true
+                ),
+            ])
+        )
+
+        let facts = try provider.inspect()
+
+        XCTAssertTrue(facts.duplicateHelperInstances)
+        XCTAssertTrue(facts.duplicateOwnedProcesses)
+        XCTAssertFalse(facts.ownershipMarkerPresent)
     }
 
     func testLifecycleRejectsOwnedStateWithOwnerButNoComponentPIDs() throws {
@@ -1289,7 +1425,7 @@ private final class RecordingActivationProbe: LocalActivationProbeRunning, @unch
     }
 }
 
-private final class RecordingDiagnosticKeychainPresenceProvider: KeychainPresenceProviding, @unchecked Sendable {
+private final class RecordingDiagnosticKeychainPresenceProvider: SelectiveKeychainPresenceProviding, @unchecked Sendable {
     let facts: KeychainPresenceFacts
     var calls = 0
 
@@ -1300,6 +1436,41 @@ private final class RecordingDiagnosticKeychainPresenceProvider: KeychainPresenc
     func inspect() throws -> KeychainPresenceFacts {
         calls += 1
         return facts
+    }
+
+    func inspect(items: Set<KeychainPresenceItem>) throws -> KeychainPresenceFacts {
+        calls += 1
+        return KeychainPresenceFacts(states: items.reduce(into: [:]) { states, item in
+            if let presence = facts.presence(for: item) {
+                states[item] = presence
+            }
+        })
+    }
+}
+
+private final class RecordingSelectiveDiagnosticKeychainPresenceProvider:
+    SelectiveKeychainPresenceProviding,
+    @unchecked Sendable {
+    let facts: KeychainPresenceFacts
+    var requestedItems: [Set<KeychainPresenceItem>] = []
+    var legacyInspectCalls: [Bool] = []
+
+    init(facts: KeychainPresenceFacts) {
+        self.facts = facts
+    }
+
+    func inspect() throws -> KeychainPresenceFacts {
+        legacyInspectCalls.append(true)
+        return facts
+    }
+
+    func inspect(items: Set<KeychainPresenceItem>) throws -> KeychainPresenceFacts {
+        requestedItems.append(items)
+        return KeychainPresenceFacts(states: items.reduce(into: [:]) { states, item in
+            if let presence = facts.presence(for: item) {
+                states[item] = presence
+            }
+        })
     }
 }
 

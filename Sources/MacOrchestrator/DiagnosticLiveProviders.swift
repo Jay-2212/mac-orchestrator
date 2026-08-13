@@ -152,10 +152,10 @@ struct LocalActivationProbeAdapter {
                     exposedCapabilityGroups: groups(for: details.exposedTools, expectations: expectations)
                 )
             }
-            let liveness = outcome.phase != .health || outcome.error.map {
-                if case .healthCheckFailed = $0 { return true }
-                return false
-            } ?? false
+            // The canonical probe only establishes liveness after the health
+            // response has passed. A health failure is not a live service,
+            // even when the endpoint returned an HTTP response.
+            let liveness = outcome.phase != .health
             let session = outcome.phase == .initialized || outcome.phase == .toolsList || outcome.phase == .safeCall
             return LocalMCPFacts(
                 livenessVerified: liveness,
@@ -648,6 +648,14 @@ struct ReadOnlyLifecycleFactsProvider: LifecycleFactsProviding {
         let tunnelProcesses = runningProcesses.filter {
             matchesExactOwnershipMarker(commandLine: $0.commandLine, component: .tunnel, ownerID: ownerID)
         }
+        let helperProcesses = runningProcesses.filter {
+            let command = $0.commandLine
+            let executable = paths.helperExecutableURL.path
+            return command == executable
+                || command.hasPrefix(executable + " ")
+                || command.hasPrefix(executable + "\t")
+        }
+        let duplicateHelperInstances = helperProcesses.count > 1
         let serverPID = state?.serverPID
         let tunnelPID = state?.tunnelPID
         let stateOwnerMatches = state?.ownerID == ownerID
@@ -671,6 +679,7 @@ struct ReadOnlyLifecycleFactsProvider: LifecycleFactsProviding {
         let duplicateOwnedProcesses = duplicateAssignment
             || serverProcesses.count > 1
             || tunnelProcesses.count > 1
+            || duplicateHelperInstances
             || runningProcesses.contains {
                 matchesExactOwnershipMarker(commandLine: $0.commandLine, component: .server, ownerID: ownerID)
                     && matchesExactOwnershipMarker(commandLine: $0.commandLine, component: .tunnel, ownerID: ownerID)
@@ -692,6 +701,7 @@ struct ReadOnlyLifecycleFactsProvider: LifecycleFactsProviding {
             tunnelPID: tunnelPID,
             ownershipMarkerPresent: ownershipMarkerPresent,
             duplicateOwnedProcesses: duplicateOwnedProcesses,
+            duplicateHelperInstances: duplicateHelperInstances,
             pidReuseDetected: pidReuse
         )
     }
@@ -783,6 +793,13 @@ struct ReadOnlyPortFactsProvider: PortFactsProviding {
             executable: "/usr/sbin/lsof",
             arguments: ["-nP", "-iTCP:\(port)", "-sTCP:LISTEN", "-t"]
         ))
+        if result.status == 1,
+           result.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           result.stderr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            // lsof uses exit 1 for a successful no-match query. That is a
+            // verified free-port observation, not an inspection failure.
+            return PortFacts(port: port, inspectionAvailable: true)
+        }
         guard result.status == 0 else {
             return PortFacts(port: port, inspectionAvailable: false)
         }
@@ -819,6 +836,7 @@ struct RemoteConnectorInspection: Equatable, Sendable {
 
 struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
     private let desired: Bool
+    private let pathsSafe: Bool
     private let binaryPresent: Bool
     private let binaryArchitecture: String?
     private let originalVendorSigning: Bool?
@@ -826,7 +844,7 @@ struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
     private let ownershipMarkerPresent: Bool
     private let target: String
     private let httpRunner: any DiagnosticHTTPRunning
-    private let keychainPresenceProvider: any KeychainPresenceProviding
+    private let keychainPresenceProvider: any SelectiveKeychainPresenceProviding
     private let ownerID: String?
     private let processRunner: (any DiagnosticProcessRunning)?
     private let expectedBinaryPath: String?
@@ -838,14 +856,16 @@ struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
         target: String,
         ownershipMarkerPresent: Bool = false,
         httpRunner: any DiagnosticHTTPRunning,
-        keychainPresenceProvider: any KeychainPresenceProviding = ReadOnlySystemKeychainPresenceProvider(),
+        keychainPresenceProvider: any SelectiveKeychainPresenceProviding = ReadOnlySystemKeychainPresenceProvider(),
         binaryArchitecture: String? = nil,
         originalVendorSigning: Bool? = nil,
         ownerID: String? = nil,
         processRunner: (any DiagnosticProcessRunning)? = nil,
-        expectedBinaryPath: String? = nil
+        expectedBinaryPath: String? = nil,
+        pathsSafe: Bool = true
     ) {
         self.desired = desired
+        self.pathsSafe = pathsSafe
         self.binaryPresent = binaryPresent
         self.binaryArchitecture = binaryArchitecture
         self.originalVendorSigning = originalVendorSigning
@@ -867,17 +887,20 @@ struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
         ownershipMarkerPresent: Bool = false,
         httpRunner: any DiagnosticHTTPRunning,
         fileManager: FileManager = .default,
-        keychainPresenceProvider: any KeychainPresenceProviding = ReadOnlySystemKeychainPresenceProvider(),
+        keychainPresenceProvider: any SelectiveKeychainPresenceProviding = ReadOnlySystemKeychainPresenceProvider(),
         commandRunner: any DiagnosticCommandRunning = SystemDiagnosticCommandRunner(),
         ownerID: String? = nil,
         processRunner: (any DiagnosticProcessRunning)? = nil
     ) {
-        let binaryPresent = fileManager.isExecutableFile(atPath: binaryURL.path)
+        let binaryPathSafe = DiagnosticPathSafety.isSafe(binaryURL)
+        let configurationPathSafe = DiagnosticPathSafety.isSafe(configurationURL)
+        let pathsSafe = binaryPathSafe && configurationPathSafe
+        let binaryPresent = pathsSafe && fileManager.isExecutableFile(atPath: binaryURL.path)
         let binaryFacts = Self.inspectBinary(at: binaryURL, present: binaryPresent, commandRunner: commandRunner)
         self.init(
             desired: desired,
             binaryPresent: binaryPresent,
-            configurationPresent: fileManager.fileExists(atPath: configurationURL.path),
+            configurationPresent: pathsSafe && fileManager.fileExists(atPath: configurationURL.path),
             target: target,
             ownershipMarkerPresent: ownershipMarkerPresent,
             httpRunner: httpRunner,
@@ -886,7 +909,8 @@ struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
             originalVendorSigning: binaryFacts.originalVendorSigning,
             ownerID: ownerID,
             processRunner: processRunner,
-            expectedBinaryPath: binaryURL.path
+            expectedBinaryPath: binaryPathSafe ? binaryURL.path : "",
+            pathsSafe: pathsSafe
         )
     }
 
@@ -897,7 +921,7 @@ struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
         ownershipMarkerPresent: Bool = false,
         httpRunner: any DiagnosticHTTPRunning,
         fileManager: FileManager = .default,
-        keychainPresenceProvider: any KeychainPresenceProviding = ReadOnlySystemKeychainPresenceProvider(),
+        keychainPresenceProvider: any SelectiveKeychainPresenceProviding = ReadOnlySystemKeychainPresenceProvider(),
         commandRunner: any DiagnosticCommandRunning = SystemDiagnosticCommandRunner(),
         ownerID: String? = nil,
         processRunner: (any DiagnosticProcessRunning)? = nil
@@ -922,7 +946,7 @@ struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
         target: String,
         httpRunner: any DiagnosticHTTPRunning,
         fileManager: FileManager = .default,
-        keychainPresenceProvider: any KeychainPresenceProviding = ReadOnlySystemKeychainPresenceProvider(),
+        keychainPresenceProvider: any SelectiveKeychainPresenceProviding = ReadOnlySystemKeychainPresenceProvider(),
         commandRunner: any DiagnosticCommandRunning = SystemDiagnosticCommandRunner(),
         ownerID: String? = nil,
         processRunner: (any DiagnosticProcessRunning)? = nil
@@ -948,8 +972,16 @@ struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
         guard desired else {
             return RemoteConnectorInspection(facts: RemoteConnectorFacts(desired: false), ngrokAuthtokenPresence: nil)
         }
+        let authPresence = inspectAuthPresence()
+        guard pathsSafe else {
+            return RemoteConnectorInspection(facts: RemoteConnectorFacts(
+                desired: true,
+                binaryPresent: false,
+                configurationPresent: false,
+                ownershipMarkerPresent: false
+            ), ngrokAuthtokenPresence: authPresence)
+        }
         let ownership = inspectOwnership()
-        let authPresence = (try? keychainPresenceProvider.inspect())?.presence(for: .ngrokAuthtoken) ?? .inaccessible
         guard !ownershipInspectionConfigured || ownership else {
             return RemoteConnectorInspection(facts: RemoteConnectorFacts(
                 desired: true,
@@ -988,6 +1020,10 @@ struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
             ),
             ngrokAuthtokenPresence: authPresence
         )
+    }
+
+    private func inspectAuthPresence() -> KeychainPresence {
+        return (try? keychainPresenceProvider.inspect(items: [.ngrokAuthtoken]))?.presence(for: .ngrokAuthtoken) ?? .inaccessible
     }
 
     private func inspectOwnership() -> Bool {

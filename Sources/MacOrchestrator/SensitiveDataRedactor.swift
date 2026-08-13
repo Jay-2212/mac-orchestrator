@@ -9,6 +9,12 @@ struct SensitiveDataRedactor: Sendable {
         "authorization",
         "credential",
         "connectorurl",
+        "chatid",
+        "chatsecret",
+        "apikey",
+        "privatekey",
+        "ngrokauthtoken",
+        "webhooksecret",
         "capabilitytoken"
     ]
 
@@ -78,7 +84,7 @@ struct SensitiveDataRedactor: Sendable {
 
     private func replaceSecretAssignments(in value: String) -> String {
         replacingMatches(
-            pattern: #"(?i)(\b(?:token|bot[_-]?token|auth[_-]?token|access[_-]?token|refresh[_-]?token|capability[_-]?token|connector[_-]?(?:url|token|secret)|api[_-]?(?:key|token|secret)|ngrok[_-]?authtoken|password|secret|authorization|credential|private[_-]?key|webhook[_-]?secret|client[_-]?secret)\b\s*[:=]\s*["']?(?:Bearer\s+)?)([^\s"'&,}\]]+)"#,
+            pattern: #"(?i)(\b(?:token|bot[_-]?token|auth[_-]?token|access[_-]?token|refresh[_-]?token|capability[_-]?token|connector[_-]?(?:url|token|secret)|api[_-]?(?:key|token|secret)|ngrok[_-]?authtoken|chat[_-]?id|password|secret|authorization|credential|private[_-]?key|webhook[_-]?secret|client[_-]?secret)\b\s*[:=]\s*["']?(?:Bearer\s+)?)([^\s"'&,}\]]+)"#,
             in: value,
             with: "$1<redacted>"
         )

@@ -9,6 +9,10 @@ final class DoctorEngineTests: XCTestCase {
         let report = await DoctorEngine(dependencies: dependencies.dependencies).run()
 
         XCTAssertEqual(report.result(withID: "configuration.read")?.status, .fail)
+        XCTAssertEqual(
+            report.result(withID: "configuration.read")?.reason,
+            "Unable to inspect configuration: permission denied."
+        )
         XCTAssertEqual(report.result(withID: "installation.helper")?.status, .pass)
         XCTAssertEqual(report.result(withID: "update.availability")?.status, .skip)
         XCTAssertEqual(report.result(withID: "mcp.liveness")?.status, .skip)

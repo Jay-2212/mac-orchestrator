@@ -55,6 +55,24 @@ final class RepairEngineTests: XCTestCase {
         XCTAssertEqual(counts.bootstrap, 1)
     }
 
+    func testRemoteRecoveryActionsAreManualAndDoNotAcceptSecretsOrMutateClients() async {
+        let engine = RepairEngine(dependencies: RepairDependencies())
+        let actions: [RepairActionID] = [
+            .replaceNgrokCredential,
+            .rotateConnectorCredential,
+            .reconfigureRemoteClients,
+        ]
+
+        for action in actions {
+            let outcome = await engine.execute(action)
+            XCTAssertEqual(outcome.status, .requiresUserAction)
+            XCTAssertFalse(outcome.reason.contains("https://"))
+            XCTAssertFalse(outcome.reason.contains("capability"))
+            XCTAssertFalse(outcome.reason.contains("token"))
+            XCTAssertFalse(outcome.reason.contains("client.json"))
+        }
+    }
+
     func testMissingAdapterReturnsRefusedWithoutFanout() async {
         let recorder = RecordingRepairAdapters()
         let engine = RepairEngine(dependencies: RepairDependencies(lifecycleRetrying: recorder))

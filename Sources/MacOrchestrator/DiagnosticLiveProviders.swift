@@ -864,6 +864,10 @@ struct RemoteConnectorInspection: Equatable, Sendable {
     let ngrokAuthtokenPresence: KeychainPresence?
 }
 
+private struct DiagnosticNgrokEndpointResponse: Decodable {
+    let endpoints: [NgrokEndpoint]
+}
+
 struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
     private let desired: Bool
     private let pathsSafe: Bool
@@ -873,6 +877,7 @@ struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
     private let configurationPresent: Bool
     private let ownershipMarkerPresent: Bool
     private let target: String
+    private let providerCredentialState: RemoteProviderCredentialState
     private let httpRunner: any DiagnosticHTTPRunning
     private let keychainPresenceProvider: any SelectiveKeychainPresenceProviding
     private let ownerID: String?
@@ -885,6 +890,7 @@ struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
         configurationPresent: Bool,
         target: String,
         ownershipMarkerPresent: Bool = false,
+        providerCredentialState: RemoteProviderCredentialState = .notObserved,
         httpRunner: any DiagnosticHTTPRunning,
         keychainPresenceProvider: any SelectiveKeychainPresenceProviding = ReadOnlySystemKeychainPresenceProvider(),
         binaryArchitecture: String? = nil,
@@ -902,6 +908,7 @@ struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
         self.configurationPresent = configurationPresent
         self.ownershipMarkerPresent = ownershipMarkerPresent
         self.target = target
+        self.providerCredentialState = providerCredentialState
         self.httpRunner = httpRunner
         self.keychainPresenceProvider = keychainPresenceProvider
         self.ownerID = ownerID
@@ -915,6 +922,7 @@ struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
         configurationURL: URL,
         target: String,
         ownershipMarkerPresent: Bool = false,
+        providerCredentialState: RemoteProviderCredentialState = .notObserved,
         httpRunner: any DiagnosticHTTPRunning,
         fileManager: FileManager = .default,
         keychainPresenceProvider: any SelectiveKeychainPresenceProviding = ReadOnlySystemKeychainPresenceProvider(),
@@ -933,6 +941,7 @@ struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
             configurationPresent: pathsSafe && fileManager.fileExists(atPath: configurationURL.path),
             target: target,
             ownershipMarkerPresent: ownershipMarkerPresent,
+            providerCredentialState: providerCredentialState,
             httpRunner: httpRunner,
             keychainPresenceProvider: keychainPresenceProvider,
             binaryArchitecture: binaryFacts.architecture,
@@ -949,6 +958,7 @@ struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
         paths: DiagnosticPathSet,
         target: String,
         ownershipMarkerPresent: Bool = false,
+        providerCredentialState: RemoteProviderCredentialState = .notObserved,
         httpRunner: any DiagnosticHTTPRunning,
         fileManager: FileManager = .default,
         keychainPresenceProvider: any SelectiveKeychainPresenceProviding = ReadOnlySystemKeychainPresenceProvider(),
@@ -962,6 +972,7 @@ struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
             configurationURL: paths.ngrokConfigURL,
             target: target,
             ownershipMarkerPresent: ownershipMarkerPresent,
+            providerCredentialState: providerCredentialState,
             httpRunner: httpRunner,
             fileManager: fileManager,
             keychainPresenceProvider: keychainPresenceProvider,
@@ -974,6 +985,7 @@ struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
     init(
         desired: Bool,
         target: String,
+        providerCredentialState: RemoteProviderCredentialState = .notObserved,
         httpRunner: any DiagnosticHTTPRunning,
         fileManager: FileManager = .default,
         keychainPresenceProvider: any SelectiveKeychainPresenceProviding = ReadOnlySystemKeychainPresenceProvider(),
@@ -985,6 +997,7 @@ struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
             desired: desired,
             paths: .defaultPaths(fileManager: fileManager),
             target: target,
+            providerCredentialState: providerCredentialState,
             httpRunner: httpRunner,
             fileManager: fileManager,
             keychainPresenceProvider: keychainPresenceProvider,
@@ -1008,18 +1021,21 @@ struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
                 desired: true,
                 binaryPresent: false,
                 configurationPresent: false,
-                ownershipMarkerPresent: false
+                ownershipMarkerPresent: false,
+                providerCredentialState: providerCredentialState
             ), ngrokAuthtokenPresence: authPresence)
         }
-        let ownership = inspectOwnership()
-        guard !ownershipInspectionConfigured || ownership else {
+        let processState = inspectProcessState()
+        guard !ownershipInspectionConfigured || processState == .owned else {
             return RemoteConnectorInspection(facts: RemoteConnectorFacts(
                 desired: true,
                 binaryPresent: binaryPresent,
                 configurationPresent: configurationPresent,
                 ownershipMarkerPresent: false,
                 binaryArchitecture: binaryArchitecture,
-                originalVendorSigning: originalVendorSigning
+                originalVendorSigning: originalVendorSigning,
+                providerCredentialState: providerCredentialState,
+                managedProcessState: processState
             ), ngrokAuthtokenPresence: authPresence)
         }
         let url = URL(string: "http://127.0.0.1:4040/api/endpoints")!
@@ -1028,25 +1044,63 @@ struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
                 desired: true,
                 binaryPresent: binaryPresent,
                 configurationPresent: configurationPresent,
-                ownershipMarkerPresent: ownership,
+                ownershipMarkerPresent: processState == .owned || (!ownershipInspectionConfigured && ownershipMarkerPresent),
                 binaryArchitecture: binaryArchitecture,
-                originalVendorSigning: originalVendorSigning
+                originalVendorSigning: originalVendorSigning,
+                providerCredentialState: providerCredentialState,
+                managedProcessState: processState,
+                agentAPIState: .unavailable
             ), ngrokAuthtokenPresence: authPresence)
         }
-        let endpointCount = (try? JSONSerialization.jsonObject(with: response.body) as? [String: Any])
-            .flatMap { $0["endpoints"] as? [[String: Any]] }?.count ?? 0
-        let endpointAvailable = endpointCount > 0
-            && NgrokEndpointParser.publicURL(from: response.body, matching: target) != nil
+        guard let endpointResponse = try? JSONDecoder().decode(
+            DiagnosticNgrokEndpointResponse.self,
+            from: response.body
+        ) else {
+            return RemoteConnectorInspection(facts: RemoteConnectorFacts(
+                desired: true,
+                binaryPresent: binaryPresent,
+                configurationPresent: configurationPresent,
+                ownershipMarkerPresent: processState == .owned || (!ownershipInspectionConfigured && ownershipMarkerPresent),
+                binaryArchitecture: binaryArchitecture,
+                originalVendorSigning: originalVendorSigning,
+                providerCredentialState: providerCredentialState,
+                managedProcessState: processState,
+                agentAPIState: .malformed
+            ), ngrokAuthtokenPresence: authPresence)
+        }
+        let matchingUpstreamEndpoints = endpointResponse.endpoints.filter { endpoint in
+            normalizedAddress(endpoint.upstream.url) == normalizedAddress(target)
+        }
+        let matchingEndpoints = matchingUpstreamEndpoints.filter { endpoint in
+            isValidPublicHTTPSURL(endpoint.url)
+        }
+        let endpointState: RemoteEndpointState
+        switch matchingEndpoints.count {
+        case 0:
+            endpointState = matchingUpstreamEndpoints.isEmpty && !endpointResponse.endpoints.isEmpty
+                ? .foreignOnly
+                : .noExpectedUpstream
+        case 1:
+            endpointState = .established
+        default:
+            endpointState = .ambiguous
+        }
+        let endpointAvailable = endpointState == .established
+        let ownershipMarker = processState == .owned || (!ownershipInspectionConfigured && ownershipMarkerPresent)
         return RemoteConnectorInspection(
             facts: RemoteConnectorFacts(
                 desired: true,
                 binaryPresent: binaryPresent,
                 configurationPresent: configurationPresent,
                 endpointAvailable: endpointAvailable,
-                endpointCount: endpointCount,
-                ownershipMarkerPresent: ownership,
+                endpointCount: endpointResponse.endpoints.count,
+                ownershipMarkerPresent: ownershipMarker,
                 binaryArchitecture: binaryArchitecture,
-                originalVendorSigning: originalVendorSigning
+                originalVendorSigning: originalVendorSigning,
+                providerCredentialState: providerCredentialState,
+                managedProcessState: processState,
+                agentAPIState: .available,
+                endpointState: endpointState
             ),
             ngrokAuthtokenPresence: authPresence
         )
@@ -1056,16 +1110,24 @@ struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
         return (try? keychainPresenceProvider.inspect(items: [.ngrokAuthtoken]))?.presence(for: .ngrokAuthtoken) ?? .inaccessible
     }
 
-    private func inspectOwnership() -> Bool {
+    private func inspectProcessState() -> RemoteManagedProcessState {
         guard let ownerID, let processRunner else {
-            return ownershipMarkerPresent
+            return ownershipMarkerPresent ? .owned : .notObserved
         }
-        let matches = processRunner.snapshot().filter { process in
+        let candidates = processRunner.snapshot().filter { process in
             process.running
                 && (expectedBinaryPath == nil || process.commandLine.split { $0 == " " || $0 == "\t" }.map(String.init).contains(expectedBinaryPath!))
-                && matchesExactOwnershipMarker(commandLine: process.commandLine, component: .tunnel, ownerID: ownerID)
         }
-        return matches.count == 1
+        let matches = candidates.filter { process in
+            matchesExactOwnershipMarker(commandLine: process.commandLine, component: .tunnel, ownerID: ownerID)
+        }
+        if matches.count == 1, candidates.count == 1 {
+            return .owned
+        }
+        if candidates.isEmpty {
+            return .missing
+        }
+        return .ambiguous
     }
 
     private var ownershipInspectionConfigured: Bool {
@@ -1101,6 +1163,23 @@ struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
         if lower.contains("arm64") { return "arm64" }
         if lower.contains("x86_64") { return "x86_64" }
         return nil
+    }
+
+    private func isValidPublicHTTPSURL(_ value: String) -> Bool {
+        guard let url = URL(string: value) else { return false }
+        return url.scheme?.lowercased() == "https" && url.host != nil
+    }
+
+    private func normalizedAddress(_ address: String) -> String {
+        guard var components = URLComponents(string: address.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+            return address.trimmingCharacters(in: .whitespacesAndNewlines).trimmingCharacters(
+                in: CharacterSet(charactersIn: "/")
+            )
+        }
+        components.path = components.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        components.query = nil
+        components.fragment = nil
+        return components.string ?? address
     }
 }
 

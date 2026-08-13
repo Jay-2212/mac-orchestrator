@@ -28,6 +28,26 @@ enum DiagnosticChecks {
         static let ownershipInvalid = "Managed process ownership could not be verified safely."
         static let remoteInvalid = "The requested remote connector is missing or invalid."
         static let endpointUnavailable = "The requested remote endpoint is unavailable."
+        static let remoteLocalPrerequisiteUnavailable = "Remote checks require a verified local MCP prerequisite; downstream remote checks were skipped."
+        static let ngrokBinaryConfigurationInvalid = "The managed ngrok binary or configuration is missing or invalid."
+        static let ngrokCredentialAbsent = "The ngrok provider credential is absent."
+        static let ngrokCredentialInaccessible = "The ngrok provider credential could not be accessed from Keychain."
+        static let ngrokProviderCredentialRejected = "The ngrok provider rejected its credential."
+        static let ngrokProcessMissing = "The managed ngrok process is missing."
+        static let ngrokProcessAmbiguous = "Duplicate or foreign ngrok process ownership is ambiguous."
+        static let agentAPIUnavailable = "The ngrok Agent API is unavailable."
+        static let agentAPIMalformed = "The ngrok Agent API response is malformed."
+        static let endpointNoExpectedUpstream = "No endpoint was observed for the expected local MCP upstream."
+        static let endpointForeignOnly = "The Agent API exposed endpoints only for foreign upstreams."
+        static let endpointAmbiguous = "Multiple endpoints matched the expected upstream."
+        static let remoteProbeNotRun = "The current endpoint is established, but the authenticated remote MCP probe was not run."
+        static let remoteAuthenticationRejected = "Remote MCP authentication or the capability path was rejected."
+        static let remoteInitializeSessionFailed = "The remote MCP initialize or session step failed."
+        static let remoteInventoryMismatch = "The remote MCP tool inventory does not match the expected inventory."
+        static let remoteSafeCallFailed = "The remote MCP safe application call failed."
+        static let remoteClientHandoffUnavailable = "No client handoff receipt is available; no arbitrary client was classified as stale."
+        static let remoteClientHandoffUnchanged = "The connector identity matches the recorded client handoff."
+        static let remoteClientHandoffChanged = "The connector identity changed since the recorded client handoff; configured clients require manual reconfiguration."
         static let updateUnavailable = "Update discovery is unavailable."
         static let diskUnavailable = "The filesystem free-space observation is unavailable."
         static let diskLow = "Free disk space is below the configured noncritical threshold."
@@ -421,21 +441,65 @@ enum DiagnosticChecks {
         return result("lifecycle.process-ownership", "Process ownership", .pass, Text.verified)
     }
 
-    static func remoteNgrok(_ facts: RemoteConnectorFacts?, auth: KeychainPresence?, desired: Bool) -> DiagnosticResult {
+    static func remoteNgrok(
+        _ facts: RemoteConnectorFacts?,
+        auth: KeychainPresence?,
+        desired: Bool
+    ) -> DiagnosticResult {
         guard desired else { return result("remote.ngrok", "Remote ngrok", .skip, Text.notApplicable) }
         guard let facts else {
             return result("remote.ngrok", "Remote ngrok", .fail, Text.providerUnavailable, repair: .retryRemoteConnector)
         }
-        guard facts.binaryPresent, facts.configurationPresent, facts.ownershipMarkerPresent else {
-            return result("remote.ngrok", "Remote ngrok", .fail, Text.remoteInvalid, repair: .retryRemoteConnector)
+        guard remotePrerequisiteIsAvailable(facts) else {
+            return result("remote.ngrok", "Remote ngrok", .skip, Text.remoteLocalPrerequisiteUnavailable)
+        }
+        guard facts.binaryPresent, facts.configurationPresent else {
+            return result(
+                "remote.ngrok",
+                "Remote ngrok",
+                .fail,
+                Text.ngrokBinaryConfigurationInvalid,
+                repair: .retryRemoteConnector
+            )
+        }
+        switch facts.managedProcessState {
+        case .missing:
+            return result("remote.ngrok", "Remote ngrok", .fail, Text.ngrokProcessMissing, repair: .retryRemoteConnector)
+        case .ambiguous:
+            return result("remote.ngrok", "Remote ngrok", .fail, Text.ngrokProcessAmbiguous)
+        case .notObserved where !facts.ownershipMarkerPresent:
+            return result("remote.ngrok", "Remote ngrok", .fail, Text.ownershipInvalid, repair: .retryRemoteConnector)
+        case .notObserved, .owned:
+            break
+        }
+        if facts.providerCredentialState == .rejected {
+            return result(
+                "remote.ngrok",
+                "Remote ngrok",
+                .fail,
+                Text.ngrokProviderCredentialRejected,
+                repair: .replaceNgrokCredential
+            )
         }
         switch auth {
         case .present:
             return result("remote.ngrok", "Remote ngrok", .pass, Text.verified)
         case .absent, nil:
-            return result("remote.ngrok", "Remote ngrok", .fail, Text.remoteInvalid, repair: .retryRemoteConnector)
+            return result(
+                "remote.ngrok",
+                "Remote ngrok",
+                .fail,
+                Text.ngrokCredentialAbsent,
+                repair: .replaceNgrokCredential
+            )
         case .inaccessible:
-            return result("remote.ngrok", "Remote ngrok", .warn, Text.keychainUnavailable, repair: .retryRemoteConnector)
+            return result(
+                "remote.ngrok",
+                "Remote ngrok",
+                .warn,
+                Text.ngrokCredentialInaccessible,
+                repair: .replaceNgrokCredential
+            )
         }
     }
 
@@ -445,6 +509,9 @@ enum DiagnosticChecks {
         }
         guard let facts else {
             return result("remote.ngrok-architecture", "Remote ngrok architecture", .fail, Text.providerUnavailable, repair: .retryRemoteConnector)
+        }
+        guard remotePrerequisiteIsAvailable(facts) else {
+            return result("remote.ngrok-architecture", "Remote ngrok architecture", .skip, Text.remoteLocalPrerequisiteUnavailable)
         }
         guard facts.binaryPresent else {
             return result("remote.ngrok-architecture", "Remote ngrok architecture", .fail, Text.remoteInvalid, repair: .retryRemoteConnector)
@@ -465,6 +532,9 @@ enum DiagnosticChecks {
         guard let facts else {
             return result("remote.ngrok-signing", "Remote ngrok vendor signing", .fail, Text.providerUnavailable, repair: .retryRemoteConnector)
         }
+        guard remotePrerequisiteIsAvailable(facts) else {
+            return result("remote.ngrok-signing", "Remote ngrok vendor signing", .skip, Text.remoteLocalPrerequisiteUnavailable)
+        }
         guard facts.binaryPresent else {
             return result("remote.ngrok-signing", "Remote ngrok vendor signing", .fail, Text.remoteInvalid, repair: .retryRemoteConnector)
         }
@@ -482,13 +552,119 @@ enum DiagnosticChecks {
         guard let facts else {
             return result("remote.endpoint", "Remote endpoint", .fail, Text.providerUnavailable, repair: .retryRemoteConnector)
         }
-        // The configured upstream is the trust boundary. Other endpoints in
-        // the Agent API response are unrelated; their presence must not turn
-        // an otherwise exact match into a failure.
-        guard facts.endpointAvailable, facts.endpointCount > 0 else {
-            return result("remote.endpoint", "Remote endpoint", .fail, Text.endpointUnavailable, repair: .retryRemoteConnector)
+        guard remotePrerequisiteIsAvailable(facts) else {
+            return result("remote.endpoint", "Remote endpoint", .skip, Text.remoteLocalPrerequisiteUnavailable)
+        }
+        switch facts.agentAPIState {
+        case .unavailable:
+            return result("remote.endpoint", "Remote endpoint", .fail, Text.agentAPIUnavailable, repair: .retryRemoteConnector)
+        case .malformed:
+            return result("remote.endpoint", "Remote endpoint", .fail, Text.agentAPIMalformed, repair: .retryRemoteConnector)
+        case .notObserved, .available:
+            break
+        }
+        switch facts.endpointState {
+        case .noExpectedUpstream:
+            return result("remote.endpoint", "Remote endpoint", .fail, Text.endpointNoExpectedUpstream, repair: .retryRemoteConnector)
+        case .notObserved:
+            guard facts.endpointAvailable else {
+                return result("remote.endpoint", "Remote endpoint", .fail, Text.endpointNoExpectedUpstream, repair: .retryRemoteConnector)
+            }
+        case .foreignOnly:
+            return result("remote.endpoint", "Remote endpoint", .fail, Text.endpointForeignOnly, repair: .retryRemoteConnector)
+        case .ambiguous:
+            return result("remote.endpoint", "Remote endpoint", .fail, Text.endpointAmbiguous, repair: .retryRemoteConnector)
+        case .established:
+            break
         }
         return result("remote.endpoint", "Remote endpoint", .pass, Text.verified)
+    }
+
+    static func remoteAuthenticatedReadiness(_ facts: RemoteConnectorFacts?, desired: Bool) -> DiagnosticResult {
+        guard desired else {
+            return result("remote.authenticated-readiness", "Remote authenticated readiness", .skip, Text.notApplicable)
+        }
+        guard let facts else {
+            return result("remote.authenticated-readiness", "Remote authenticated readiness", .skip, Text.providerUnavailable)
+        }
+        guard remotePrerequisiteIsAvailable(facts) else {
+            return result("remote.authenticated-readiness", "Remote authenticated readiness", .skip, Text.remoteLocalPrerequisiteUnavailable)
+        }
+        guard facts.endpointState == .established || facts.endpointAvailable else {
+            return result("remote.authenticated-readiness", "Remote authenticated readiness", .skip, Text.endpointUnavailable)
+        }
+        switch facts.authenticatedReadiness.state {
+        case .notRun:
+            return result("remote.authenticated-readiness", "Remote authenticated readiness", .warn, Text.remoteProbeNotRun)
+        case .authenticationRejected:
+            return result(
+                "remote.authenticated-readiness",
+                "Remote authenticated readiness",
+                .fail,
+                Text.remoteAuthenticationRejected,
+                repair: .rotateConnectorCredential
+            )
+        case .initializeSessionFailed:
+            return result("remote.authenticated-readiness", "Remote authenticated readiness", .fail, Text.remoteInitializeSessionFailed)
+        case .inventoryMismatch:
+            return result("remote.authenticated-readiness", "Remote authenticated readiness", .fail, Text.remoteInventoryMismatch)
+        case .safeCallFailed:
+            return result("remote.authenticated-readiness", "Remote authenticated readiness", .fail, Text.remoteSafeCallFailed)
+        case .ready:
+            return result("remote.authenticated-readiness", "Remote authenticated readiness", .pass, Text.verified)
+        }
+    }
+
+    static func remoteInventory(_ facts: RemoteConnectorFacts?, desired: Bool) -> DiagnosticResult {
+        guard desired else {
+            return result("remote.inventory", "Remote inventory", .skip, Text.notApplicable)
+        }
+        guard let facts else {
+            return result("remote.inventory", "Remote inventory", .skip, Text.providerUnavailable)
+        }
+        guard remotePrerequisiteIsAvailable(facts) else {
+            return result("remote.inventory", "Remote inventory", .skip, Text.remoteLocalPrerequisiteUnavailable)
+        }
+        guard facts.endpointState == .established || facts.endpointAvailable else {
+            return result("remote.inventory", "Remote inventory", .skip, Text.endpointUnavailable)
+        }
+        switch facts.authenticatedReadiness.state {
+        case .inventoryMismatch:
+            return result("remote.inventory", "Remote inventory", .fail, Text.remoteInventoryMismatch)
+        case .ready:
+            return result("remote.inventory", "Remote inventory", .pass, Text.verified)
+        case .notRun, .authenticationRejected, .initializeSessionFailed, .safeCallFailed:
+            return result("remote.inventory", "Remote inventory", .skip, "Inventory requires complete authenticated remote MCP readiness.")
+        }
+    }
+
+    static func remoteClientHandoff(_ facts: RemoteConnectorFacts?, desired: Bool) -> DiagnosticResult {
+        guard desired else {
+            return result("remote.client-handoff", "Remote client handoff", .skip, Text.notApplicable)
+        }
+        guard let facts else {
+            return result("remote.client-handoff", "Remote client handoff", .skip, Text.providerUnavailable)
+        }
+        guard remotePrerequisiteIsAvailable(facts) else {
+            return result("remote.client-handoff", "Remote client handoff", .skip, Text.remoteLocalPrerequisiteUnavailable)
+        }
+        guard facts.authenticatedReadiness.state == .ready else {
+            return result("remote.client-handoff", "Remote client handoff", .skip, "Client handoff comparison requires current authenticated remote readiness.")
+        }
+        switch facts.authenticatedReadiness.clientHandoff {
+        case .notAvailable:
+            return result("remote.client-handoff", "Remote client handoff", .skip, Text.remoteClientHandoffUnavailable)
+        case .unchanged:
+            return result("remote.client-handoff", "Remote client handoff", .pass, Text.remoteClientHandoffUnchanged)
+        case .changed:
+            return result(
+                "remote.client-handoff",
+                "Remote client handoff",
+                .warn,
+                Text.remoteClientHandoffChanged,
+                repair: .reconfigureRemoteClients
+            )
+        }
     }
 
     static func updateAvailability(_ facts: UpdateAvailabilityFacts?) -> DiagnosticResult {
@@ -551,6 +727,10 @@ enum DiagnosticChecks {
         result(id, title, .skip, "This capability is not implemented in the current core.")
     }
 
+    private static func remotePrerequisiteIsAvailable(_ facts: RemoteConnectorFacts) -> Bool {
+        facts.localMCPPrerequisite != .unavailable
+    }
+
     private static func result(
         _ id: String,
         _ title: String,
@@ -587,6 +767,12 @@ enum DiagnosticChecks {
             return RepairActionDescriptor(id: id, title: "Repair LaunchAgent", guidance: "Review and explicitly repair the managed LaunchAgent contract.")
         case .rerunVerifiedBootstrap:
             return RepairActionDescriptor(id: id, title: "Rerun verified bootstrap", guidance: "Use the pinned, verified bootstrap recovery path.")
+        case .replaceNgrokCredential:
+            return RepairActionDescriptor(id: id, title: "Replace ngrok credential", guidance: "Enter a replacement ngrok credential through the helper's protected input, then run Doctor again.")
+        case .rotateConnectorCredential:
+            return RepairActionDescriptor(id: id, title: "Rotate connector credential", guidance: "Use the supported connector-credential rotation workflow, then update authorized clients manually.")
+        case .reconfigureRemoteClients:
+            return RepairActionDescriptor(id: id, title: "Reconfigure remote clients", guidance: "Copy the current connector URL into clients you have recorded; Mac Orchestrator does not inspect or rewrite client configuration.")
         }
     }
 

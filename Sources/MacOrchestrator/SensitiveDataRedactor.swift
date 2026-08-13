@@ -17,7 +17,7 @@ struct SensitiveDataRedactor: Sendable {
 
     init(exactSecrets: [String], homeDirectory: String?) {
         self.exactSecrets = exactSecrets
-            .filter { !$0.isEmpty }
+            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
             .sorted { $0.count > $1.count }
         let normalizedHome = homeDirectory?.trimmingCharacters(in: .whitespacesAndNewlines)
         self.homeDirectory = normalizedHome.flatMap { $0.isEmpty ? nil : $0 }

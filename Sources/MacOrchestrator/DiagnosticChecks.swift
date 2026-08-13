@@ -1,6 +1,8 @@
 import Foundation
 
 enum DiagnosticChecks {
+    static let expectedHelperBundleIdentifier = "com.jay.mac-orchestrator"
+
     private enum Text {
         static let verified = "Verified."
         static let notApplicable = "Not applicable for the current configuration."
@@ -166,6 +168,54 @@ enum DiagnosticChecks {
         return result("installation.runtime", "Managed runtime", .pass, Text.verified)
     }
 
+    static func installationHelperArchitecture(_ facts: InstalledReleaseFacts?) -> DiagnosticResult {
+        guard let facts else {
+            return result("installation.helper-architecture", "Helper architecture", .fail, Text.providerUnavailable, repair: .rerunVerifiedBootstrap)
+        }
+        guard facts.helperPresent else {
+            return result("installation.helper-architecture", "Helper architecture", .fail, Text.requiredMissing, repair: .rerunVerifiedBootstrap)
+        }
+        guard let architecture = facts.helper.architecture else {
+            return result("installation.helper-architecture", "Helper architecture", .warn, "The helper architecture could not be determined.")
+        }
+        guard architecture == "arm64" else {
+            return result("installation.helper-architecture", "Helper architecture", .fail, "The installed helper is not arm64.", repair: .rerunVerifiedBootstrap)
+        }
+        return result("installation.helper-architecture", "Helper architecture", .pass, Text.verified)
+    }
+
+    static func installationRuntimeArchitecture(_ facts: InstalledReleaseFacts?) -> DiagnosticResult {
+        guard let facts else {
+            return result("installation.runtime-architecture", "Managed runtime architecture", .fail, Text.providerUnavailable, repair: .rerunVerifiedBootstrap)
+        }
+        guard facts.runtime.runtimePresent else {
+            return result("installation.runtime-architecture", "Managed runtime architecture", .fail, Text.requiredMissing, repair: .rerunVerifiedBootstrap)
+        }
+        guard let architecture = facts.runtime.architecture else {
+            return result("installation.runtime-architecture", "Managed runtime architecture", .warn, "The managed runtime architecture could not be determined.")
+        }
+        guard architecture == "arm64" else {
+            return result("installation.runtime-architecture", "Managed runtime architecture", .fail, "The managed runtime is not arm64.", repair: .rerunVerifiedBootstrap)
+        }
+        return result("installation.runtime-architecture", "Managed runtime architecture", .pass, Text.verified)
+    }
+
+    static func installationHelperBundleIdentifier(_ facts: InstalledReleaseFacts?) -> DiagnosticResult {
+        guard let facts else {
+            return result("installation.helper-bundle-id", "Helper bundle identifier", .fail, Text.providerUnavailable, repair: .rerunVerifiedBootstrap)
+        }
+        guard facts.helperPresent else {
+            return result("installation.helper-bundle-id", "Helper bundle identifier", .fail, Text.requiredMissing, repair: .rerunVerifiedBootstrap)
+        }
+        guard let bundleIdentifier = facts.helper.bundleIdentifier else {
+            return result("installation.helper-bundle-id", "Helper bundle identifier", .warn, "The helper bundle identifier could not be determined.")
+        }
+        guard bundleIdentifier == expectedHelperBundleIdentifier else {
+            return result("installation.helper-bundle-id", "Helper bundle identifier", .fail, "The helper bundle identifier does not match the current Mac Orchestrator helper.", repair: .rerunVerifiedBootstrap)
+        }
+        return result("installation.helper-bundle-id", "Helper bundle identifier", .pass, Text.verified)
+    }
+
     static func installationIntegrity(_ facts: InstalledReleaseFacts?) -> DiagnosticResult {
         guard let facts else {
             return result("installation.integrity", "Installation integrity", .skip, Text.providerUnavailable)
@@ -252,6 +302,24 @@ enum DiagnosticChecks {
         case .inaccessible:
             return result("keychain.connector", "Connector Keychain presence", .warn, Text.keychainUnavailable)
         }
+    }
+
+    static func keychainTelegramSend(_ facts: KeychainPresenceFacts?, desired: Bool) -> DiagnosticResult {
+        guard desired else {
+            return result("keychain.telegram-send", "Telegram Send Keychain presence", .skip, Text.notApplicable)
+        }
+        guard let facts else {
+            return result("keychain.telegram-send", "Telegram Send Keychain presence", .warn, Text.keychainUnavailable)
+        }
+        let token = facts.presence(for: .telegramSendBotToken)
+        let chatID = facts.presence(for: .telegramSendChatID)
+        if token == .inaccessible || chatID == .inaccessible || token == nil || chatID == nil {
+            return result("keychain.telegram-send", "Telegram Send Keychain presence", .warn, Text.keychainUnavailable)
+        }
+        if token == .absent || chatID == .absent {
+            return result("keychain.telegram-send", "Telegram Send Keychain presence", .fail, "Telegram Send is enabled but a required Keychain item is absent.")
+        }
+        return result("keychain.telegram-send", "Telegram Send Keychain presence", .pass, Text.verified)
     }
 
     static func portSelected(_ facts: PortFacts?, configuredPort: Int?) -> DiagnosticResult {
@@ -344,6 +412,44 @@ enum DiagnosticChecks {
         case .inaccessible:
             return result("remote.ngrok", "Remote ngrok", .warn, Text.keychainUnavailable, repair: .retryRemoteConnector)
         }
+    }
+
+    static func remoteNgrokArchitecture(_ facts: RemoteConnectorFacts?, desired: Bool) -> DiagnosticResult {
+        guard desired else {
+            return result("remote.ngrok-architecture", "Remote ngrok architecture", .skip, Text.notApplicable)
+        }
+        guard let facts else {
+            return result("remote.ngrok-architecture", "Remote ngrok architecture", .fail, Text.providerUnavailable, repair: .retryRemoteConnector)
+        }
+        guard facts.binaryPresent else {
+            return result("remote.ngrok-architecture", "Remote ngrok architecture", .fail, Text.remoteInvalid, repair: .retryRemoteConnector)
+        }
+        guard let architecture = facts.binaryArchitecture else {
+            return result("remote.ngrok-architecture", "Remote ngrok architecture", .warn, "The ngrok binary architecture could not be determined.")
+        }
+        guard architecture == "arm64" else {
+            return result("remote.ngrok-architecture", "Remote ngrok architecture", .fail, "The installed ngrok binary is not arm64.", repair: .retryRemoteConnector)
+        }
+        return result("remote.ngrok-architecture", "Remote ngrok architecture", .pass, Text.verified)
+    }
+
+    static func remoteNgrokSigning(_ facts: RemoteConnectorFacts?, desired: Bool) -> DiagnosticResult {
+        guard desired else {
+            return result("remote.ngrok-signing", "Remote ngrok vendor signing", .skip, Text.notApplicable)
+        }
+        guard let facts else {
+            return result("remote.ngrok-signing", "Remote ngrok vendor signing", .fail, Text.providerUnavailable, repair: .retryRemoteConnector)
+        }
+        guard facts.binaryPresent else {
+            return result("remote.ngrok-signing", "Remote ngrok vendor signing", .fail, Text.remoteInvalid, repair: .retryRemoteConnector)
+        }
+        guard let originalVendorSigning = facts.originalVendorSigning else {
+            return result("remote.ngrok-signing", "Remote ngrok vendor signing", .warn, "Original ngrok vendor signing could not be determined.")
+        }
+        guard originalVendorSigning else {
+            return result("remote.ngrok-signing", "Remote ngrok vendor signing", .warn, "Original ngrok vendor signing was not established.")
+        }
+        return result("remote.ngrok-signing", "Remote ngrok vendor signing", .pass, Text.verified)
     }
 
     static func remoteEndpoint(_ facts: RemoteConnectorFacts?, desired: Bool) -> DiagnosticResult {

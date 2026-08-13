@@ -809,6 +809,8 @@ struct RemoteConnectorInspection: Equatable, Sendable {
 struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
     private let desired: Bool
     private let binaryPresent: Bool
+    private let binaryArchitecture: String?
+    private let originalVendorSigning: Bool?
     private let configurationPresent: Bool
     private let ownershipMarkerPresent: Bool
     private let target: String
@@ -822,10 +824,14 @@ struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
         target: String,
         ownershipMarkerPresent: Bool = false,
         httpRunner: any DiagnosticHTTPRunning,
-        keychainPresenceProvider: any KeychainPresenceProviding = ReadOnlySystemKeychainPresenceProvider()
+        keychainPresenceProvider: any KeychainPresenceProviding = ReadOnlySystemKeychainPresenceProvider(),
+        binaryArchitecture: String? = nil,
+        originalVendorSigning: Bool? = nil
     ) {
         self.desired = desired
         self.binaryPresent = binaryPresent
+        self.binaryArchitecture = binaryArchitecture
+        self.originalVendorSigning = originalVendorSigning
         self.configurationPresent = configurationPresent
         self.ownershipMarkerPresent = ownershipMarkerPresent
         self.target = target
@@ -841,16 +847,21 @@ struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
         ownershipMarkerPresent: Bool = false,
         httpRunner: any DiagnosticHTTPRunning,
         fileManager: FileManager = .default,
-        keychainPresenceProvider: any KeychainPresenceProviding = ReadOnlySystemKeychainPresenceProvider()
+        keychainPresenceProvider: any KeychainPresenceProviding = ReadOnlySystemKeychainPresenceProvider(),
+        commandRunner: any DiagnosticCommandRunning = SystemDiagnosticCommandRunner()
     ) {
+        let binaryPresent = fileManager.isExecutableFile(atPath: binaryURL.path)
+        let binaryFacts = Self.inspectBinary(at: binaryURL, present: binaryPresent, commandRunner: commandRunner)
         self.init(
             desired: desired,
-            binaryPresent: fileManager.isExecutableFile(atPath: binaryURL.path),
+            binaryPresent: binaryPresent,
             configurationPresent: fileManager.fileExists(atPath: configurationURL.path),
             target: target,
             ownershipMarkerPresent: ownershipMarkerPresent,
             httpRunner: httpRunner,
-            keychainPresenceProvider: keychainPresenceProvider
+            keychainPresenceProvider: keychainPresenceProvider,
+            binaryArchitecture: binaryFacts.architecture,
+            originalVendorSigning: binaryFacts.originalVendorSigning
         )
     }
 
@@ -861,7 +872,8 @@ struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
         ownershipMarkerPresent: Bool = false,
         httpRunner: any DiagnosticHTTPRunning,
         fileManager: FileManager = .default,
-        keychainPresenceProvider: any KeychainPresenceProviding = ReadOnlySystemKeychainPresenceProvider()
+        keychainPresenceProvider: any KeychainPresenceProviding = ReadOnlySystemKeychainPresenceProvider(),
+        commandRunner: any DiagnosticCommandRunning = SystemDiagnosticCommandRunner()
     ) {
         self.init(
             desired: desired,
@@ -871,7 +883,8 @@ struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
             ownershipMarkerPresent: ownershipMarkerPresent,
             httpRunner: httpRunner,
             fileManager: fileManager,
-            keychainPresenceProvider: keychainPresenceProvider
+            keychainPresenceProvider: keychainPresenceProvider,
+            commandRunner: commandRunner
         )
     }
 
@@ -880,7 +893,8 @@ struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
         target: String,
         httpRunner: any DiagnosticHTTPRunning,
         fileManager: FileManager = .default,
-        keychainPresenceProvider: any KeychainPresenceProviding = ReadOnlySystemKeychainPresenceProvider()
+        keychainPresenceProvider: any KeychainPresenceProviding = ReadOnlySystemKeychainPresenceProvider(),
+        commandRunner: any DiagnosticCommandRunning = SystemDiagnosticCommandRunner()
     ) {
         self.init(
             desired: desired,
@@ -888,7 +902,8 @@ struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
             target: target,
             httpRunner: httpRunner,
             fileManager: fileManager,
-            keychainPresenceProvider: keychainPresenceProvider
+            keychainPresenceProvider: keychainPresenceProvider,
+            commandRunner: commandRunner
         )
     }
 
@@ -907,7 +922,9 @@ struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
                 desired: true,
                 binaryPresent: binaryPresent,
                 configurationPresent: configurationPresent,
-                ownershipMarkerPresent: ownershipMarkerPresent
+                ownershipMarkerPresent: ownershipMarkerPresent,
+                binaryArchitecture: binaryArchitecture,
+                originalVendorSigning: originalVendorSigning
             ), ngrokAuthtokenPresence: authPresence)
         }
         let endpointCount = (try? JSONSerialization.jsonObject(with: response.body) as? [String: Any])
@@ -921,10 +938,43 @@ struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
                 configurationPresent: configurationPresent,
                 endpointAvailable: endpointAvailable,
                 endpointCount: endpointCount,
-                ownershipMarkerPresent: ownershipMarkerPresent
+                ownershipMarkerPresent: ownershipMarkerPresent,
+                binaryArchitecture: binaryArchitecture,
+                originalVendorSigning: originalVendorSigning
             ),
             ngrokAuthtokenPresence: authPresence
         )
+    }
+
+    private static func inspectBinary(
+        at url: URL,
+        present: Bool,
+        commandRunner: any DiagnosticCommandRunning
+    ) -> (architecture: String?, originalVendorSigning: Bool?) {
+        guard present else { return (nil, nil) }
+        let file = commandRunner.run(DiagnosticCommandRequest(
+            executable: "/usr/bin/file",
+            arguments: ["-b", url.path]
+        ))
+        let signature = commandRunner.run(DiagnosticCommandRequest(
+            executable: "/usr/bin/codesign",
+            arguments: ["-dv", "--verbose=4", url.path]
+        ))
+        let architecture = Self.architecture(from: file.stdout)
+        guard signature.status == 0 else {
+            return (architecture, nil)
+        }
+        let details = (signature.stderr + signature.stdout).lowercased()
+        let vendorSigned = details.contains("authority=developer id application: ngrok")
+            || details.contains("authority=developer id application: ngrok, inc.")
+        return (architecture, vendorSigned)
+    }
+
+    private static func architecture(from output: String) -> String? {
+        let lower = output.lowercased()
+        if lower.contains("arm64") { return "arm64" }
+        if lower.contains("x86_64") { return "x86_64" }
+        return nil
     }
 }
 

@@ -309,6 +309,68 @@ final class DiagnosticLiveProviderTests: XCTestCase {
         XCTAssertFalse(String(describing: inspection).contains("ngrok_"))
     }
 
+    func testNgrokProviderCarriesInjectedArchitectureAndVendorSigningFacts() throws {
+        let apiURL = URL(string: "http://127.0.0.1:4040/api/endpoints")!
+        let http = RecordingDiagnosticHTTPRunner(response: DiagnosticHTTPResponse(
+            status: 200,
+            url: apiURL,
+            body: Data(#"{"endpoints":[]}"#.utf8)
+        ))
+        let provider = ReadOnlyRemoteConnectorFactsProvider(
+            desired: true,
+            binaryPresent: true,
+            configurationPresent: true,
+            target: "http://127.0.0.1:8007",
+            httpRunner: http,
+            binaryArchitecture: "arm64",
+            originalVendorSigning: true
+        )
+
+        let facts = try provider.inspect()
+
+        XCTAssertEqual(facts.binaryArchitecture, "arm64")
+        XCTAssertEqual(facts.originalVendorSigning, true)
+    }
+
+    func testNgrokPathProviderUsesFixedReadOnlyArchitectureAndSigningProbes() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mac-orchestrator-ngrok-facts-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let binary = root.appendingPathComponent("ngrok")
+        let configuration = root.appendingPathComponent("ngrok.yml")
+        try Data("binary-fixture".utf8).write(to: binary)
+        try Data("version: 2".utf8).write(to: configuration)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: binary.path)
+
+        let fileRequest = DiagnosticCommandRequest(executable: "/usr/bin/file", arguments: ["-b", binary.path])
+        let signRequest = DiagnosticCommandRequest(executable: "/usr/bin/codesign", arguments: ["-dv", "--verbose=4", binary.path])
+        let runner = RecordingDiagnosticCommandRunner(outputs: [
+            fileRequest: DiagnosticCommandResult(status: 0, stdout: "Mach-O 64-bit executable arm64", stderr: ""),
+            signRequest: DiagnosticCommandResult(status: 0, stdout: "", stderr: "Authority=Developer ID Application: ngrok, Inc.")
+        ])
+        let apiURL = URL(string: "http://127.0.0.1:4040/api/endpoints")!
+        let http = RecordingDiagnosticHTTPRunner(response: DiagnosticHTTPResponse(
+            status: 200,
+            url: apiURL,
+            body: Data(#"{"endpoints":[]}"#.utf8)
+        ))
+
+        let provider = ReadOnlyRemoteConnectorFactsProvider(
+            desired: true,
+            binaryURL: binary,
+            configurationURL: configuration,
+            target: "http://127.0.0.1:8007",
+            httpRunner: http,
+            commandRunner: runner
+        )
+        let facts = try provider.inspect()
+
+        XCTAssertEqual(facts.binaryArchitecture, "arm64")
+        XCTAssertEqual(facts.originalVendorSigning, true)
+        XCTAssertEqual(runner.requests, [fileRequest, signRequest])
+    }
+
     func testNgrokProviderRejectsRedirectedAgentAPIWithoutExposingEndpoint() throws {
         let apiURL = URL(string: "http://127.0.0.1:4040/api/endpoints")!
         let redirectedURL = URL(string: "http://127.0.0.1:4040/redirected")!

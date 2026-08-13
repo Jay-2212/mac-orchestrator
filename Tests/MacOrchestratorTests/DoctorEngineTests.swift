@@ -222,6 +222,99 @@ final class DoctorEngineTests: XCTestCase {
         XCTAssertEqual(DiagnosticChecks.installationRuntime(InstalledReleaseFacts()).status, .fail)
     }
 
+    func testCurrentCoreArchitectureAndBundleFactsAreReportedConservatively() {
+        let healthy = InstalledReleaseFacts(
+            helper: CodeSignFacts(
+                bundleIdentifier: "com.jay.mac-orchestrator",
+                architecture: "arm64",
+                isSigned: true
+            ),
+            runtime: RuntimeFacts(
+                runtimePresent: true,
+                architecture: "arm64",
+                markerPresent: true,
+                payloadPresent: true,
+                structurallyValid: true
+            ),
+            helperPresent: true
+        )
+        XCTAssertEqual(DiagnosticChecks.installationHelperArchitecture(healthy).status, .pass)
+        XCTAssertEqual(DiagnosticChecks.installationRuntimeArchitecture(healthy).status, .pass)
+        XCTAssertEqual(DiagnosticChecks.installationHelperBundleIdentifier(healthy).status, .pass)
+
+        let wrongArchitecture = InstalledReleaseFacts(
+            helper: CodeSignFacts(bundleIdentifier: "com.jay.mac-orchestrator", architecture: "x86_64"),
+            runtime: RuntimeFacts(runtimePresent: true, architecture: "x86_64"),
+            helperPresent: true
+        )
+        XCTAssertEqual(DiagnosticChecks.installationHelperArchitecture(wrongArchitecture).status, .fail)
+        XCTAssertEqual(DiagnosticChecks.installationRuntimeArchitecture(wrongArchitecture).status, .fail)
+
+        let unknownEvidence = InstalledReleaseFacts(helperPresent: true)
+        XCTAssertEqual(DiagnosticChecks.installationHelperArchitecture(unknownEvidence).status, .warn)
+        XCTAssertEqual(DiagnosticChecks.installationRuntimeArchitecture(unknownEvidence).status, .warn)
+        XCTAssertEqual(DiagnosticChecks.installationHelperBundleIdentifier(unknownEvidence).status, .warn)
+
+        let wrongBundle = InstalledReleaseFacts(
+            helper: CodeSignFacts(bundleIdentifier: "com.example.other", architecture: "arm64"),
+            helperPresent: true
+        )
+        XCTAssertEqual(DiagnosticChecks.installationHelperBundleIdentifier(wrongBundle).status, .fail)
+    }
+
+    func testNgrokArchitectureAndVendorSigningFactsRemainExplicit() {
+        let healthy = RemoteConnectorFacts(
+            desired: true,
+            binaryPresent: true,
+            configurationPresent: true,
+            ownershipMarkerPresent: true,
+            binaryArchitecture: "arm64",
+            originalVendorSigning: true
+        )
+        XCTAssertEqual(DiagnosticChecks.remoteNgrokArchitecture(healthy, desired: true).status, .pass)
+        XCTAssertEqual(DiagnosticChecks.remoteNgrokSigning(healthy, desired: true).status, .pass)
+
+        let wrongArchitecture = RemoteConnectorFacts(
+            desired: true,
+            binaryPresent: true,
+            configurationPresent: true,
+            ownershipMarkerPresent: true,
+            binaryArchitecture: "x86_64",
+            originalVendorSigning: false
+        )
+        XCTAssertEqual(DiagnosticChecks.remoteNgrokArchitecture(wrongArchitecture, desired: true).status, .fail)
+        XCTAssertEqual(DiagnosticChecks.remoteNgrokSigning(wrongArchitecture, desired: true).status, .warn)
+
+        let unknown = RemoteConnectorFacts(desired: true, binaryPresent: true)
+        XCTAssertEqual(DiagnosticChecks.remoteNgrokArchitecture(unknown, desired: true).status, .warn)
+        XCTAssertEqual(DiagnosticChecks.remoteNgrokSigning(unknown, desired: true).status, .warn)
+        XCTAssertEqual(DiagnosticChecks.remoteNgrokArchitecture(nil, desired: false).status, .skip)
+        XCTAssertEqual(DiagnosticChecks.remoteNgrokSigning(nil, desired: false).status, .skip)
+    }
+
+    func testTelegramSendPresenceDistinguishesAbsentAndInaccessibleItems() {
+        XCTAssertEqual(
+            DiagnosticChecks.keychainTelegramSend(
+                KeychainPresenceFacts(states: [
+                    .telegramSendBotToken: .absent,
+                    .telegramSendChatID: .present,
+                ]),
+                desired: true
+            ).status,
+            .fail
+        )
+        XCTAssertEqual(
+            DiagnosticChecks.keychainTelegramSend(
+                KeychainPresenceFacts(states: [
+                    .telegramSendBotToken: .inaccessible,
+                    .telegramSendChatID: .present,
+                ]),
+                desired: true
+            ).status,
+            .warn
+        )
+    }
+
     func testPermissionFailuresAndLockedNonConsoleSessionsKeepRequesterTruth() {
         var configuration = AppConfiguration(ownerID: "owner")
         configuration.desiredCapabilities["mac.ui"] = true
@@ -452,6 +545,36 @@ final class DoctorEngineTests: XCTestCase {
         XCTAssertFalse(fixture.keychain.requests.contains(.init([.connectorToken, .ngrokAuthtoken])))
         XCTAssertTrue(fixture.local.calls.isEmpty)
         XCTAssertEqual(asyncProvider.calls, 0)
+    }
+
+    func testTelegramSendPresenceIsQueriedOnlyWhenDesired() async {
+        var configuration = AppConfiguration(
+            process: ProcessConfiguration(serverDesired: false, tunnelDesired: false),
+            ownerID: "telegram-owner"
+        )
+        configuration.desiredCapabilities["telegram.send"] = true
+        let fixture = DoctorFixture.make(
+            validatedConfiguration: configuration,
+            serverDesired: false,
+            remoteDesired: false
+        )
+
+        let report = await DoctorEngine(dependencies: fixture.dependencies).run()
+
+        XCTAssertEqual(
+            fixture.keychain.requests,
+            [Set([.telegramSendBotToken, .telegramSendChatID])]
+        )
+        XCTAssertEqual(report.result(withID: "keychain.telegram-send")?.status, .pass)
+    }
+
+    func testDisabledTelegramSendIsSkippedWithoutAKeychainQuery() async {
+        let fixture = DoctorFixture.make(serverDesired: false, remoteDesired: false)
+
+        let report = await DoctorEngine(dependencies: fixture.dependencies).run()
+
+        XCTAssertEqual(report.result(withID: "keychain.telegram-send")?.status, .skip)
+        XCTAssertTrue(fixture.keychain.requests.isEmpty)
     }
 
     func testSystemDoctorKeychainProviderSelectsRequestedCurrentCorePresenceOnly() throws {

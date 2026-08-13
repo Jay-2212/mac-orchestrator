@@ -575,6 +575,8 @@ protocol LocalMCPDiagnosticProviding {
 struct RemoteConnectorFacts: Codable, Equatable, Sendable {
     let desired: Bool
     let binaryPresent: Bool
+    let binaryArchitecture: String?
+    let originalVendorSigning: Bool?
     let configurationPresent: Bool
     let endpointAvailable: Bool
     let endpointCount: Int
@@ -586,10 +588,14 @@ struct RemoteConnectorFacts: Codable, Equatable, Sendable {
         configurationPresent: Bool = false,
         endpointAvailable: Bool = false,
         endpointCount: Int = 0,
-        ownershipMarkerPresent: Bool = false
+        ownershipMarkerPresent: Bool = false,
+        binaryArchitecture: String? = nil,
+        originalVendorSigning: Bool? = nil
     ) {
         self.desired = desired
         self.binaryPresent = binaryPresent
+        self.binaryArchitecture = binaryArchitecture
+        self.originalVendorSigning = originalVendorSigning
         self.configurationPresent = configurationPresent
         self.endpointAvailable = endpointAvailable
         self.endpointCount = endpointCount

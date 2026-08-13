@@ -190,6 +190,7 @@ struct DoctorEngine {
         let serverDesired = configuration?.process.serverDesired == true
         let remoteDesired = configuration?.process.tunnelDesired == true
             || configuration?.desiredCapabilities["remote.connector"] == true
+        let telegramSendDesired = configuration?.desiredCapabilities["telegram.send"] == true
 
         let installedFacts = inspectInstalledRelease()
         let permissionFacts = DiagnosticChecks.consumesProtectedBehavior(configuration)
@@ -201,6 +202,7 @@ struct DoctorEngine {
         let keychainFacts = inspectKeychain(
             localDesired: serverDesired,
             remoteDesired: remoteDesired,
+            telegramSendDesired: telegramSendDesired,
             hasValidatedConfiguration: hasValidatedConfiguration
         )
         let remoteFacts = remoteDesired ? inspectRemote() : nil
@@ -217,11 +219,15 @@ struct DoctorEngine {
             DiagnosticChecks.configurationMigration(configuration),
             DiagnosticChecks.installationHelper(installedFacts),
             DiagnosticChecks.installationRuntime(installedFacts),
+            DiagnosticChecks.installationHelperArchitecture(installedFacts),
+            DiagnosticChecks.installationRuntimeArchitecture(installedFacts),
+            DiagnosticChecks.installationHelperBundleIdentifier(installedFacts),
             DiagnosticChecks.installationIntegrity(installedFacts),
             DiagnosticChecks.installationVersionMatch(installedFacts),
             DiagnosticChecks.trustCodeSign(installedFacts),
             DiagnosticChecks.permissionsRequester(permissionFacts, configuration: configuration),
             DiagnosticChecks.keychainConnector(serverDesired ? keychainFacts : nil),
+            DiagnosticChecks.keychainTelegramSend(keychainFacts, desired: telegramSendDesired),
             DiagnosticChecks.portSelected(portFacts, configuredPort: serverDesired ? configuration?.localMCPPort : nil),
             DiagnosticChecks.mcpLiveness(localMCPFacts, desired: serverDesired),
             DiagnosticChecks.mcpReadiness(localMCPFacts, desired: serverDesired),
@@ -233,6 +239,8 @@ struct DoctorEngine {
                 auth: remoteDesired ? keychainFacts?.presence(for: .ngrokAuthtoken) : nil,
                 desired: remoteDesired
             ),
+            DiagnosticChecks.remoteNgrokArchitecture(remoteFacts, desired: remoteDesired),
+            DiagnosticChecks.remoteNgrokSigning(remoteFacts, desired: remoteDesired),
             DiagnosticChecks.remoteEndpoint(remoteFacts, desired: remoteDesired),
             DiagnosticChecks.updateAvailability(updateFacts),
             DiagnosticChecks.diskFreeSpace(diskFacts, thresholdBytes: dependencies.thresholds.lowDiskBytes),
@@ -260,12 +268,17 @@ struct DoctorEngine {
     private func inspectKeychain(
         localDesired: Bool,
         remoteDesired: Bool,
+        telegramSendDesired: Bool,
         hasValidatedConfiguration: Bool
     ) -> KeychainPresenceFacts? {
         guard hasValidatedConfiguration else { return nil }
         var items = Set<KeychainPresenceItem>()
         if localDesired { items.insert(.connectorToken) }
         if remoteDesired { items.insert(.ngrokAuthtoken) }
+        if telegramSendDesired {
+            items.insert(.telegramSendBotToken)
+            items.insert(.telegramSendChatID)
+        }
         guard !items.isEmpty else { return nil }
         return try? dependencies.keychainPresenceProvider.inspect(items: items)
     }

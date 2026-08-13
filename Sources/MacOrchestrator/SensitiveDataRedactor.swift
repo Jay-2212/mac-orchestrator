@@ -26,6 +26,7 @@ struct SensitiveDataRedactor: Sendable {
     func redact(_ value: String) -> String {
         var redacted = replaceConnectorURLs(in: value)
         redacted = replaceExactSecrets(in: redacted)
+        redacted = replaceSecretAssignments(in: redacted)
         return normalizeHomePaths(in: redacted)
     }
 
@@ -51,7 +52,9 @@ struct SensitiveDataRedactor: Sendable {
             redacted = "<home>" + redacted.dropFirst(homeDirectory.count)
         }
         redacted = replaceUserHomePath(in: redacted)
-        return replaceExactSecrets(in: redacted)
+        redacted = replaceConnectorURLs(in: redacted)
+        redacted = replaceExactSecrets(in: redacted)
+        return replaceSecretAssignments(in: redacted)
     }
 
     private func replaceExactSecrets(in value: String) -> String {
@@ -61,10 +64,24 @@ struct SensitiveDataRedactor: Sendable {
     }
 
     private func replaceConnectorURLs(in value: String) -> String {
-        replacingMatches(
-            pattern: #"https://[A-Za-z0-9._-]+(?::[0-9]+)?/[A-Za-z0-9._~-]+/mcp(?:[/?#][^\s"'<>]*)?"#,
+        var redacted = replacingMatches(
+            pattern: #"https?://[A-Za-z0-9._-]+(?::[0-9]+)?/[A-Za-z0-9._~-]+/mcp(?:[/?#][^\s"'<>]*)?"#,
             in: value,
             with: "<redacted>"
+        )
+        redacted = replacingMatches(
+            pattern: #"(?i)(https?://[^\s"'<>]*/mcp(?:[/?#][^\s"'<>]*)?)"#,
+            in: redacted,
+            with: "<redacted>"
+        )
+        return redacted
+    }
+
+    private func replaceSecretAssignments(in value: String) -> String {
+        replacingMatches(
+            pattern: #"(?i)(\b(?:ngrok[_-]?authtoken|auth[_-]?token|access[_-]?token|refresh[_-]?token|capability[_-]?token|connector[_-]?(?:url|token|secret)|api[_-]?key|password|secret|authorization|credential)\b\s*[:=]\s*["']?(?:Bearer\s+)?)([^\s"'&,}\]]+)"#,
+            in: value,
+            with: "$1<redacted>"
         )
     }
 

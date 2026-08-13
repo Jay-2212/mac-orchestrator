@@ -15,10 +15,16 @@ struct SupportBundleRedactionSummary: Codable, Equatable, Sendable {
         excludedSensitiveCategories: [String] = [
             "credentials",
             "keychain-values",
-            "user-documents",
             "clipboard",
+            "user-documents",
             "shell-history",
-            "request-response-bodies"
+            "shell-browser-data",
+            "browser-data",
+            "connector-url",
+            "connector-token",
+            "ngrok-credentials",
+            "request-response-bodies",
+            "mcp-request-response-bodies"
         ]
     ) {
         self.appliedTransforms = appliedTransforms.sorted()
@@ -54,6 +60,17 @@ struct SupportBundleEntryPlan: Codable, Equatable, Sendable {
     }
 }
 
+enum SupportBundleSelectionError: Error, Equatable, LocalizedError, Sendable {
+    case unknownLogicalIDs([String])
+
+    var errorDescription: String? {
+        switch self {
+        case .unknownLogicalIDs:
+            return "Support-bundle selection contains an unknown logical entry."
+        }
+    }
+}
+
 struct SupportBundlePlan: Codable, Equatable, Sendable {
     let planIdentifier: String
     let generatedAt: Date
@@ -81,8 +98,13 @@ struct SupportBundlePlan: Codable, Equatable, Sendable {
         self.catalogFingerprint = catalogFingerprint ?? Self.fingerprint(for: entries)
     }
 
-    func selecting(logicalIDs: [String]) -> SupportBundlePlan {
+    func selecting(logicalIDs: [String]) throws -> SupportBundlePlan {
         let requested = Set(logicalIDs)
+        let known = Set(entries.map(\.logicalID))
+        let unknown = requested.subtracting(known).sorted()
+        guard unknown.isEmpty else {
+            throw SupportBundleSelectionError.unknownLogicalIDs(unknown)
+        }
         let selectedEntries = entries.filter { requested.contains($0.logicalID) }
         let selectedIDs = selectedEntries.map(\.logicalID).sorted()
         return SupportBundlePlan(
@@ -207,11 +229,8 @@ struct DittoSupportBundleArchiveWriter: SupportBundleArchiveWriting {
         entries: [SupportBundleArchiveEntry],
         to destination: URL
     ) throws {
-        guard FileManager.default.fileExists(atPath: stagingDirectory.path),
-              !FileManager.default.fileExists(atPath: destination.path),
-              isDirectory(stagingDirectory) else {
-            throw SupportBundleError.archiveWriteFailed
-        }
+        try validateStagingContents(stagingDirectory: stagingDirectory, entries: entries)
+        try validateDestination(destination)
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
@@ -238,29 +257,148 @@ struct DittoSupportBundleArchiveWriter: SupportBundleArchiveWriting {
         }
     }
 
+    private func validateStagingContents(
+        stagingDirectory: URL,
+        entries: [SupportBundleArchiveEntry]
+    ) throws {
+        guard isDirectory(stagingDirectory), hasNoSymlinkAncestors(stagingDirectory) else {
+            throw SupportBundleError.archiveWriteFailed
+        }
+
+        var expected: [String: Data] = [:]
+        for entry in entries {
+            let path = try validatedArchivePath(entry.archivePath)
+            guard expected.updateValue(entry.data, forKey: path) == nil else {
+                throw SupportBundleError.duplicateArchivePath(path)
+            }
+        }
+
+        var actual: [String: Data] = [:]
+        guard let enumerator = FileManager.default.enumerator(
+            at: stagingDirectory,
+            includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
+            options: []
+        ) else {
+            throw SupportBundleError.archiveWriteFailed
+        }
+        while let url = enumerator.nextObject() as? URL {
+            var info = stat()
+            guard lstat(url.path, &info) == 0 else {
+                throw SupportBundleError.archiveWriteFailed
+            }
+            let type = info.st_mode & S_IFMT
+            if type == S_IFLNK {
+                throw SupportBundleError.archiveWriteFailed
+            }
+            if type == S_IFDIR {
+                continue
+            }
+            guard type == S_IFREG else {
+                throw SupportBundleError.archiveWriteFailed
+            }
+            let relative = String(url.path.dropFirst(stagingDirectory.path.count + 1))
+            let path = try validatedArchivePath(relative)
+            guard actual[path] == nil else {
+                throw SupportBundleError.duplicateArchivePath(path)
+            }
+            actual[path] = try Data(contentsOf: url)
+        }
+        guard actual.count == expected.count,
+              actual.keys.sorted() == expected.keys.sorted(),
+              actual.allSatisfy({ expected[$0.key] == $0.value }) else {
+            throw SupportBundleError.archiveWriteFailed
+        }
+    }
+
+    private func validateDestination(_ url: URL) throws {
+        guard url.path.hasPrefix("/") else {
+            throw SupportBundleError.archiveWriteFailed
+        }
+        try validateExistingPathComponents(url.deletingLastPathComponent(), requireDirectory: true)
+        var info = stat()
+        if lstat(url.path, &info) == 0 {
+            throw SupportBundleError.archiveWriteFailed
+        }
+        guard errno == ENOENT else {
+            throw SupportBundleError.archiveWriteFailed
+        }
+    }
+
+    private func validateExistingPathComponents(_ url: URL, requireDirectory: Bool) throws {
+        let path = url.standardizedFileURL.path
+        guard path.hasPrefix("/") else { throw SupportBundleError.archiveWriteFailed }
+        var current = URL(fileURLWithPath: "/", isDirectory: true)
+        for component in path.split(separator: "/") {
+            current.appendPathComponent(String(component), isDirectory: true)
+            var info = stat()
+            guard lstat(current.path, &info) == 0,
+                  (info.st_mode & S_IFMT) != S_IFLNK else {
+                throw SupportBundleError.archiveWriteFailed
+            }
+            if requireDirectory {
+                guard (info.st_mode & S_IFMT) == S_IFDIR else {
+                    throw SupportBundleError.archiveWriteFailed
+                }
+            }
+        }
+    }
+
+    private func hasNoSymlinkAncestors(_ url: URL) -> Bool {
+        do {
+            try validateExistingPathComponents(url, requireDirectory: false)
+            return true
+        } catch {
+            return false
+        }
+    }
+
     private func isDirectory(_ url: URL) -> Bool {
         var info = stat()
-        return stat(url.path, &info) == 0 && (info.st_mode & S_IFMT) == S_IFDIR
+        return lstat(url.path, &info) == 0 && (info.st_mode & S_IFMT) == S_IFDIR
     }
 
     private func isRegularFile(_ url: URL) -> Bool {
         var info = stat()
-        return stat(url.path, &info) == 0 && (info.st_mode & S_IFMT) == S_IFREG
+        return lstat(url.path, &info) == 0 && (info.st_mode & S_IFMT) == S_IFREG
+    }
+
+    private func validatedArchivePath(_ path: String) throws -> String {
+        guard !path.isEmpty,
+              !path.hasPrefix("/"),
+              !path.contains("\\"),
+              !path.contains("\0") else {
+            throw SupportBundleError.unsafeArchivePath(path)
+        }
+        let components = path.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
+        guard components.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." }) else {
+            throw SupportBundleError.unsafeArchivePath(path)
+        }
+        return components.joined(separator: "/")
     }
 }
 
 final class SupportBundleEngine: @unchecked Sendable {
+    private struct IssuedEntry: Sendable {
+        let original: SupportBundleEntryPlan
+        let published: SupportBundleEntryPlan
+    }
+
+    private struct IssuedPlan: Sendable {
+        let plan: SupportBundlePlan
+        let entriesByPublishedLogicalID: [String: IssuedEntry]
+    }
+
     private final class IssuedPlans: @unchecked Sendable {
         let lock = NSLock()
-        var plans: [String: SupportBundlePlan] = [:]
+        var plans: [String: IssuedPlan] = [:]
 
-        func insert(_ plan: SupportBundlePlan) {
+        func insert(_ plan: IssuedPlan) {
             lock.lock()
-            plans[plan.planIdentifier] = plan
+            plans[plan.plan.planIdentifier] = plan
             lock.unlock()
         }
 
-        func get(_ identifier: String) -> SupportBundlePlan? {
+        func get(_ identifier: String) -> IssuedPlan? {
             lock.lock()
             defer { lock.unlock() }
             return plans[identifier]
@@ -290,7 +428,7 @@ final class SupportBundleEngine: @unchecked Sendable {
 
     func preview() -> SupportBundlePlan {
         let generatedAt = clock.now
-        let descriptors = sources
+        let originals = sources
             .flatMap { $0.describeEntries() }
             .filter { !Self.isExcludedSensitiveCategory($0.category) }
             .sorted {
@@ -299,6 +437,25 @@ final class SupportBundleEngine: @unchecked Sendable {
                 }
                 return $0.logicalID < $1.logicalID
             }
+        var publishedLogicalIDs = Set<String>()
+        var publishedSourceIDs = Set<String>()
+        let issuedEntries = originals.enumerated().map { index, original in
+            let logicalID = uniquePublishedValue(redactor.redact(original.logicalID), index: index, used: &publishedLogicalIDs)
+            let sourceID = uniquePublishedValue(redactor.redact(original.sourceID), index: index, used: &publishedSourceIDs)
+            return IssuedEntry(
+                original: original,
+                published: SupportBundleEntryPlan(
+                    sourceID: sourceID,
+                    logicalID: logicalID,
+                    archivePath: redactor.redactedPath(original.archivePath),
+                    category: redactor.redact(original.category),
+                    reason: redactor.redact(original.reason),
+                    expectedRedaction: redactor.redact(original.expectedRedaction),
+                    approximateSizeBytes: original.approximateSizeBytes
+                )
+            )
+        }
+        let descriptors = issuedEntries.map(\.published)
         let redactionSummary = SupportBundleRedactionSummary()
         let fingerprint = SupportBundlePlan(
             planIdentifier: "placeholder",
@@ -308,22 +465,39 @@ final class SupportBundleEngine: @unchecked Sendable {
             redactionSummary: redactionSummary
         ).catalogFingerprint
         let plan = SupportBundlePlan(
-            planIdentifier: "support-v1-\(fingerprint)",
+            planIdentifier: "support-v1-\(UUID().uuidString)",
             generatedAt: generatedAt,
             entries: descriptors,
             excludedSensitiveCategories: redactionSummary.excludedSensitiveCategories,
             redactionSummary: redactionSummary,
             catalogFingerprint: fingerprint
         )
-        issuedPlans.insert(plan)
+        issuedPlans.insert(IssuedPlan(
+            plan: plan,
+            entriesByPublishedLogicalID: Dictionary(uniqueKeysWithValues: issuedEntries.map { ($0.published.logicalID, $0) })
+        ))
         return plan
+    }
+
+    private func uniquePublishedValue(_ value: String, index: Int, used: inout Set<String>) -> String {
+        guard !used.contains(value) else {
+            var candidate = "\(value)-\(index)"
+            var suffix = index
+            while !used.insert(candidate).inserted {
+                suffix += 1
+                candidate = "\(value)-\(suffix)"
+            }
+            return candidate
+        }
+        used.insert(value)
+        return value
     }
 
     private static func isExcludedSensitiveCategory(_ category: String) -> Bool {
         let normalized = category
             .filter { $0.isLetter || $0.isNumber }
             .lowercased()
-        return [
+        let exact = [
             "credential",
             "credentials",
             "keychain",
@@ -335,9 +509,48 @@ final class SupportBundleEngine: @unchecked Sendable {
             "requestbodies",
             "responsebody",
             "responsebodies",
+            "requestresponsebody",
+            "requestresponsebodies",
+            "mcpbody",
+            "mcpbodies",
+            "mcprequestbody",
+            "mcprequestbodies",
+            "mcpresponsebody",
+            "mcpresponsebodies",
+            "mcprequestresponsebodies",
             "userdocument",
-            "userdocuments"
-        ].contains(normalized)
+            "userdocuments",
+            "browserdata",
+            "browserhistory",
+            "shellbrowserdata",
+            "connectorurl",
+            "connectortoken",
+            "connectorsecret",
+            "secretmaterial",
+            "ngrokcredential",
+            "ngrokcredentials",
+            "ngrokauthtoken",
+            "shellbrowserhistory"
+        ]
+        return exact.contains(normalized) || [
+            "credential",
+            "keychain",
+            "clipboard",
+            "shellhistory",
+            "shellbrowser",
+            "browser",
+            "userdocument",
+            "requestbody",
+            "responsebody",
+            "requestresponse",
+            "mcpbody",
+            "connectorurl",
+            "connectortoken",
+            "connectorsecret",
+            "secretmaterial",
+            "ngrokcredential",
+            "ngrokauthtoken"
+        ].contains(where: normalized.contains)
     }
 
     @discardableResult
@@ -346,23 +559,18 @@ final class SupportBundleEngine: @unchecked Sendable {
             throw SupportBundleError.invalidPlan("plan was not issued by this engine")
         }
         try validate(plan: plan, against: issued)
-        guard !FileManager.default.fileExists(atPath: destination.path) else {
-            throw SupportBundleError.archiveAlreadyExists(destination.path)
-        }
         try validateDestination(destination)
 
         let stagingDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("MacOrchestrator-support-\(UUID().uuidString)", isDirectory: true)
-        defer {
-            try? FileManager.default.removeItem(at: stagingDirectory)
-        }
+        var result: Result<URL, Error>
         do {
             try FileManager.default.createDirectory(
                 at: stagingDirectory,
                 withIntermediateDirectories: false,
                 attributes: [.posixPermissions: 0o700]
             )
-            _ = chmod(stagingDirectory.path, mode_t(0o700))
+            try setSecurePermissions(stagingDirectory, mode: 0o700)
 
             let archiveEntries = try collect(plan: plan, issued: issued, into: stagingDirectory)
             try archiveWriter.write(
@@ -370,24 +578,28 @@ final class SupportBundleEngine: @unchecked Sendable {
                 entries: archiveEntries,
                 to: destination
             )
-            return destination
+            result = .success(destination)
         } catch let error as SupportBundleError {
-            throw error
+            result = .failure(error)
         } catch {
+            result = .failure(SupportBundleError.archiveWriteFailed)
+        }
+        guard (try? FileManager.default.removeItem(at: stagingDirectory)) != nil else {
             throw SupportBundleError.archiveWriteFailed
         }
+        return try result.get()
     }
 
-    private func validate(plan: SupportBundlePlan, against issued: SupportBundlePlan) throws {
-        guard plan.planIdentifier == issued.planIdentifier,
-              plan.generatedAt == issued.generatedAt,
-              plan.catalogFingerprint == issued.catalogFingerprint,
-              plan.excludedSensitiveCategories == issued.excludedSensitiveCategories,
-              plan.redactionSummary == issued.redactionSummary else {
+    private func validate(plan: SupportBundlePlan, against issued: IssuedPlan) throws {
+        guard plan.planIdentifier == issued.plan.planIdentifier,
+              plan.generatedAt == issued.plan.generatedAt,
+              plan.catalogFingerprint == issued.plan.catalogFingerprint,
+              plan.excludedSensitiveCategories == issued.plan.excludedSensitiveCategories,
+              plan.redactionSummary == issued.plan.redactionSummary else {
             throw SupportBundleError.invalidPlan("plan metadata was altered")
         }
 
-        let allEntries = issued.entries
+        let allEntries = issued.plan.entries
         let expectedEntries: [SupportBundleEntryPlan]
         if let selected = plan.selectedLogicalIDs {
             guard selected == Array(Set(selected)).sorted(),
@@ -421,7 +633,7 @@ final class SupportBundleEngine: @unchecked Sendable {
 
     private func collect(
         plan: SupportBundlePlan,
-        issued: SupportBundlePlan,
+        issued: IssuedPlan,
         into stagingDirectory: URL
     ) throws -> [SupportBundleArchiveEntry] {
         let sourcesByID = Dictionary(grouping: sources, by: \.sourceID)
@@ -429,22 +641,23 @@ final class SupportBundleEngine: @unchecked Sendable {
         var archivePaths = Set<String>()
 
         for entry in plan.entries {
-            guard let source = sourcesByID[entry.sourceID], source.count == 1,
+            guard let issuedEntry = issued.entriesByPublishedLogicalID[entry.logicalID],
+                  let source = sourcesByID[issuedEntry.original.sourceID], source.count == 1,
                   let source = source.first else {
                 throw SupportBundleError.sourceUnavailable(entry.logicalID)
             }
             let collected: SupportBundleCollectedEntry
             do {
-                collected = try source.collect(logicalID: entry.logicalID)
+                collected = try source.collect(logicalID: issuedEntry.original.logicalID)
             } catch {
                 throw SupportBundleError.sourceUnavailable(entry.logicalID)
             }
-            guard collected.archivePath == entry.archivePath else {
+            guard redactor.redactedPath(collected.archivePath) == entry.archivePath else {
                 throw SupportBundleError.invalidPlan("collector returned an unapproved archive path")
             }
             try validateSource(collected)
 
-            let archivePath = try validatedArchivePath(redactor.redact(entry.archivePath))
+            let archivePath = try validatedArchivePath(entry.archivePath)
             guard archivePaths.insert(archivePath).inserted else {
                 throw SupportBundleError.duplicateArchivePath(archivePath)
             }
@@ -455,8 +668,9 @@ final class SupportBundleEngine: @unchecked Sendable {
                 withIntermediateDirectories: true,
                 attributes: [.posixPermissions: 0o700]
             )
+            try setSecurePermissions(fileURL.deletingLastPathComponent(), mode: 0o700)
             try redactedData.write(to: fileURL, options: [.atomic])
-            _ = chmod(fileURL.path, mode_t(0o600))
+            try setSecurePermissions(fileURL, mode: 0o600)
             archiveEntries.append(SupportBundleArchiveEntry(archivePath: archivePath, data: redactedData))
         }
         return archiveEntries
@@ -473,6 +687,8 @@ final class SupportBundleEngine: @unchecked Sendable {
         guard let sourceURL = collected.sourceURL else { return }
         guard let approvedRoot = collected.approvedRoot,
               isWithin(sourceURL, root: approvedRoot),
+              isAbsoluteExistingDirectory(approvedRoot),
+              isAbsoluteExistingRegularFile(sourceURL),
               hasNoSymlinkComponents(sourceURL, through: approvedRoot) else {
             throw SupportBundleError.unsafeSource(sourceURL.path)
         }
@@ -480,12 +696,15 @@ final class SupportBundleEngine: @unchecked Sendable {
 
     private func validateDestination(_ destination: URL) throws {
         let parent = destination.deletingLastPathComponent()
-        var info = stat()
-        guard stat(parent.path, &info) == 0,
-              (info.st_mode & S_IFMT) == S_IFDIR,
-              !isSymlink(parent) else {
+        guard destination.path.hasPrefix("/"),
+              validateNoSymlinkExistingComponents(parent, requireDirectory: true) else {
             throw SupportBundleError.unsafeSource(parent.path)
         }
+        var info = stat()
+        if lstat(destination.path, &info) == 0 {
+            throw SupportBundleError.archiveAlreadyExists(destination.path)
+        }
+        guard errno == ENOENT else { throw SupportBundleError.unsafeSource(destination.path) }
     }
 
     private func validatedArchivePath(_ path: String) throws -> String {
@@ -514,18 +733,51 @@ final class SupportBundleEngine: @unchecked Sendable {
         let filePath = url.standardizedFileURL.path
         guard filePath.hasPrefix(rootPath + "/") else { return false }
         let relative = String(filePath.dropFirst(rootPath.count + 1))
+        guard validateNoSymlinkExistingComponents(URL(fileURLWithPath: rootPath), requireDirectory: true) else {
+            return false
+        }
         var current = URL(fileURLWithPath: rootPath, isDirectory: true)
-        if isSymlink(current) { return false }
         for component in relative.split(separator: "/") {
             current.appendPathComponent(String(component), isDirectory: false)
-            if isSymlink(current) { return false }
+            var info = stat()
+            guard lstat(current.path, &info) == 0,
+                  (info.st_mode & S_IFMT) != S_IFLNK else { return false }
         }
         return true
     }
 
-    private func isSymlink(_ url: URL) -> Bool {
+    private func validateNoSymlinkExistingComponents(_ url: URL, requireDirectory: Bool) -> Bool {
+        let path = url.standardizedFileURL.path
+        guard path.hasPrefix("/") else { return false }
+        var current = URL(fileURLWithPath: "/", isDirectory: true)
+        for component in path.split(separator: "/") {
+            current.appendPathComponent(String(component), isDirectory: true)
+            var info = stat()
+            guard lstat(current.path, &info) == 0,
+                  (info.st_mode & S_IFMT) != S_IFLNK else { return false }
+            if requireDirectory && (info.st_mode & S_IFMT) != S_IFDIR { return false }
+        }
+        return true
+    }
+
+    private func isAbsoluteExistingDirectory(_ url: URL) -> Bool {
+        guard url.path.hasPrefix("/"), validateNoSymlinkExistingComponents(url, requireDirectory: true) else { return false }
         var info = stat()
-        guard lstat(url.path, &info) == 0 else { return false }
-        return (info.st_mode & S_IFMT) == S_IFLNK
+        return lstat(url.path, &info) == 0 && (info.st_mode & S_IFMT) == S_IFDIR
+    }
+
+    private func isAbsoluteExistingRegularFile(_ url: URL) -> Bool {
+        guard url.path.hasPrefix("/") else { return false }
+        var info = stat()
+        return lstat(url.path, &info) == 0 && (info.st_mode & S_IFMT) == S_IFREG
+    }
+
+    private func setSecurePermissions(_ url: URL, mode: mode_t) throws {
+        guard chmod(url.path, mode) == 0 else { throw SupportBundleError.archiveWriteFailed }
+        var info = stat()
+        guard lstat(url.path, &info) == 0,
+              (info.st_mode & 0o777) == mode else {
+            throw SupportBundleError.archiveWriteFailed
+        }
     }
 }

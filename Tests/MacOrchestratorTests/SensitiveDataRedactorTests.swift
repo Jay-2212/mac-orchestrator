@@ -87,6 +87,18 @@ final class SensitiveDataRedactorTests: XCTestCase {
         )
     }
 
+    func testRedactsPlaintextSecretAssignmentsWithoutRemovingFieldContext() {
+        let redactor = SensitiveDataRedactor(exactSecrets: [], homeDirectory: "/Users/synthetic")
+        let output = redactor.redact("ngrok_authtoken=FAKE_NGROK_TOKEN password: fake-password authorization=Bearer fake-auth")
+
+        XCTAssertTrue(output.contains("ngrok_authtoken=<redacted>"))
+        XCTAssertTrue(output.contains("password: <redacted>"))
+        XCTAssertTrue(output.contains("authorization=Bearer <redacted>"))
+        XCTAssertFalse(output.contains("FAKE_NGROK_TOKEN"))
+        XCTAssertFalse(output.contains("fake-password"))
+        XCTAssertFalse(output.contains("fake-auth"))
+    }
+
     func testRotatingLogRedactsCurrentAndRotatedFilesAndPreservesPermissions() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("mac-orchestrator-redactor-\(UUID().uuidString)", isDirectory: true)

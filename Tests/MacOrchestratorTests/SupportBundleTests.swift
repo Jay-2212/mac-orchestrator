@@ -20,10 +20,16 @@ final class SupportBundleTests: XCTestCase {
         XCTAssertEqual(writer.writeCalls, 0)
         XCTAssertFalse(FileManager.default.fileExists(atPath: archiveURL.path))
         XCTAssertEqual(plan.excludedSensitiveCategories, [
+            "browser-data",
             "clipboard",
+            "connector-token",
+            "connector-url",
             "credentials",
             "keychain-values",
+            "mcp-request-response-bodies",
+            "ngrok-credentials",
             "request-response-bodies",
+            "shell-browser-data",
             "shell-history",
             "user-documents"
         ])
@@ -37,7 +43,7 @@ final class SupportBundleTests: XCTestCase {
             redactor: SensitiveDataRedactor(exactSecrets: [], homeDirectory: "/Users/synthetic")
         )
         let plan = engine.preview()
-        let selected = plan.selecting(logicalIDs: ["doctor-report"])
+        let selected = try plan.selecting(logicalIDs: ["doctor-report"])
         let archive = temporaryArchiveURL()
 
         _ = try engine.create(plan: selected, to: archive)
@@ -78,6 +84,63 @@ final class SupportBundleTests: XCTestCase {
 
         XCTAssertThrowsError(try engine.create(plan: altered, to: temporaryArchiveURL()))
         XCTAssertThrowsError(try engine.create(plan: unknown, to: temporaryArchiveURL()))
+        XCTAssertEqual(source.collectCalls, [])
+    }
+
+    func testUnknownSelectionAndRepeatedPreviewsAreRejectedOrIndependent() throws {
+        let source = RecordingBundleSource(entries: [.doctorReport])
+        let engine = SupportBundleEngine(sources: [source])
+
+        let first = engine.preview()
+        let second = engine.preview()
+
+        XCTAssertNotEqual(first.planIdentifier, second.planIdentifier)
+        XCTAssertThrowsError(try first.selecting(logicalIDs: ["not-issued"]))
+
+        _ = try engine.create(plan: first, to: temporaryArchiveURL())
+        _ = try engine.create(plan: second, to: temporaryArchiveURL())
+    }
+
+    func testPreviewMetadataIsRedactedAndSensitiveCategoriesAreExcluded() throws {
+        let connectorToken = "connector-secret-preview-123"
+        let ngrokToken = "ngrok_preview_token_1234567890"
+        let home = "/Users/synthetic/Documents/private"
+        let connectorURL = "https://connector.example.test/\(connectorToken)/mcp"
+        let source = RecordingBundleSource(entries: [
+            sourceEntry(
+                logicalID: "\(connectorToken)-logical",
+                archivePath: "logs/\(connectorToken).log",
+                category: "diagnostic",
+                reason: "url=\(connectorURL) home=\(home) ngrok_authtoken=\(ngrokToken)",
+                expectedRedaction: "secret=\(connectorToken)"
+            ),
+            sourceEntry(logicalID: "connector-url", archivePath: "connector.json", category: "connector-url"),
+            sourceEntry(logicalID: "mcp-body", archivePath: "body.json", category: "MCP request/response bodies"),
+            sourceEntry(logicalID: "browser", archivePath: "browser-data.json", category: "shell/browser data"),
+            sourceEntry(logicalID: "keychain", archivePath: "keychain-values.json", category: "keychain secret material")
+        ])
+        let engine = SupportBundleEngine(
+            sources: [source],
+            redactor: SensitiveDataRedactor(exactSecrets: [connectorToken, ngrokToken], homeDirectory: "/Users/synthetic")
+        )
+
+        let plan = engine.preview()
+        let publicText = String(decoding: try JSONEncoder().encode(plan), as: UTF8.self)
+
+        XCTAssertFalse(publicText.contains(connectorToken))
+        XCTAssertFalse(publicText.contains(connectorURL))
+        XCTAssertFalse(publicText.contains(ngrokToken))
+        XCTAssertFalse(publicText.contains(home))
+        XCTAssertEqual(plan.entries.map(\.logicalID), ["<redacted>-logical"])
+        XCTAssertEqual(source.collectCalls, [])
+    }
+
+    func testSensitiveEntryIsNotCollectedEvenWhenSelectedByPublishedID() throws {
+        let source = RecordingBundleSource(entries: [.doctorReport, .credential])
+        let engine = SupportBundleEngine(sources: [source])
+        let plan = engine.preview()
+
+        XCTAssertThrowsError(try plan.selecting(logicalIDs: ["credentials"]))
         XCTAssertEqual(source.collectCalls, [])
     }
 
@@ -142,6 +205,67 @@ final class SupportBundleTests: XCTestCase {
             plan: escapeEngine.preview(),
             to: temporaryArchiveURL()
         ))
+
+        let foreignParent = root.appendingPathComponent("foreign-parent", isDirectory: true)
+        let approved = root.appendingPathComponent("approved", isDirectory: true)
+        try FileManager.default.createDirectory(at: foreignParent, withIntermediateDirectories: false)
+        try FileManager.default.createDirectory(at: approved, withIntermediateDirectories: false)
+        let foreignSource = foreignParent.appendingPathComponent("foreign.txt")
+        try Data("foreign".utf8).write(to: foreignSource)
+        let symlinkedRoot = root.appendingPathComponent("symlinked-root", isDirectory: true)
+        try FileManager.default.createSymbolicLink(at: symlinkedRoot, withDestinationURL: foreignParent)
+        let ancestorEngine = SupportBundleEngine(sources: [RecordingBundleSource(entries: [
+            sourceEntry(
+                logicalID: "ancestor",
+                archivePath: "ancestor.txt",
+                sourceURL: symlinkedRoot.appendingPathComponent("foreign.txt"),
+                approvedRoot: symlinkedRoot
+            )
+        ])])
+        XCTAssertThrowsError(try ancestorEngine.create(
+            plan: ancestorEngine.preview(),
+            to: temporaryArchiveURL()
+        ))
+
+        let destinationParent = root.appendingPathComponent("destination", isDirectory: true)
+        try FileManager.default.createDirectory(at: destinationParent, withIntermediateDirectories: false)
+        let destinationTarget = root.appendingPathComponent("destination-target", isDirectory: true)
+        try FileManager.default.createDirectory(at: destinationTarget, withIntermediateDirectories: false)
+        let destinationLink = root.appendingPathComponent("destination-link", isDirectory: true)
+        try FileManager.default.createSymbolicLink(at: destinationLink, withDestinationURL: destinationTarget)
+        let destinationEngine = SupportBundleEngine(sources: [RecordingBundleSource(entries: [.doctorReport])])
+        XCTAssertThrowsError(try destinationEngine.create(
+            plan: destinationEngine.preview(),
+            to: destinationLink.appendingPathComponent("bundle.zip")
+        ))
+    }
+
+    func testArchiveWriterRejectsUnexpectedAndSymlinkedStagedEntries() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let staging = root.appendingPathComponent("staging", isDirectory: true)
+        try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: false)
+        let approved = staging.appendingPathComponent("approved.txt")
+        try Data("approved".utf8).write(to: approved)
+        let unexpected = staging.appendingPathComponent("unexpected.txt")
+        try Data("unexpected".utf8).write(to: unexpected)
+        let destination = root.appendingPathComponent("bundle.zip")
+
+        XCTAssertThrowsError(try DittoSupportBundleArchiveWriter().write(
+            stagingDirectory: staging,
+            entries: [SupportBundleArchiveEntry(archivePath: "approved.txt", data: Data("approved".utf8))],
+            to: destination
+        ))
+
+        try FileManager.default.removeItem(at: unexpected)
+        let outside = root.appendingPathComponent("outside.txt")
+        try Data("outside".utf8).write(to: outside)
+        try FileManager.default.createSymbolicLink(at: unexpected, withDestinationURL: outside)
+        XCTAssertThrowsError(try DittoSupportBundleArchiveWriter().write(
+            stagingDirectory: staging,
+            entries: [SupportBundleArchiveEntry(archivePath: "approved.txt", data: Data("approved".utf8))],
+            to: root.appendingPathComponent("second.zip")
+        ))
     }
 
     func testDecodedArchiveContainsNoPlantedSecretsOrPrivatePaths() throws {
@@ -198,6 +322,9 @@ final class SupportBundleTests: XCTestCase {
         logicalID: String,
         archivePath: String,
         data: Data = Data("fixture".utf8),
+        category: String = "diagnostic",
+        reason: String = "deterministic fixture",
+        expectedRedaction: String = "canonical redaction",
         sourceURL: URL? = nil,
         approvedRoot: URL? = nil
     ) -> FixtureEntry {
@@ -206,9 +333,9 @@ final class SupportBundleTests: XCTestCase {
                 sourceID: "recording",
                 logicalID: logicalID,
                 archivePath: archivePath,
-                category: "diagnostic",
-                reason: "deterministic fixture",
-                expectedRedaction: "canonical redaction",
+                category: category,
+                reason: reason,
+                expectedRedaction: expectedRedaction,
                 approximateSizeBytes: data.count
             ),
             data: data,
@@ -244,12 +371,13 @@ final class SupportBundleTests: XCTestCase {
         let enumerator = FileManager.default.enumerator(
             at: directory,
             includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
-            options: [.skipsHiddenFiles]
+            options: []
         )
         var result: [(name: String, data: Data)] = []
         while let url = enumerator?.nextObject() as? URL {
             let values = try url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
-            guard values.isDirectory != true, values.isSymbolicLink != true else { continue }
+            XCTAssertNotEqual(values.isSymbolicLink, true, "archive contains a symlink: \(url.path)")
+            guard values.isDirectory != true else { continue }
             let relative = String(url.path.dropFirst(directory.path.count + 1))
             result.append((relative, try Data(contentsOf: url)))
         }

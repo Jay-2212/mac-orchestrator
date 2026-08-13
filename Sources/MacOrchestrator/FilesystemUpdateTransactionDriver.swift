@@ -470,7 +470,9 @@ struct FilesystemUpdateTransactionDriver: UpdateTransactionDriver {
         guard !containsSymlink(replacement),
               !containsSymlink(destination),
               !containsSymlink(destination.deletingLastPathComponent()),
-              isOwned(destination.deletingLastPathComponent()) else {
+              isOwned(replacement),
+              isOwned(destination.deletingLastPathComponent()),
+              (!fileManager.fileExists(atPath: destination.path) || isOwned(destination)) else {
             throw FilesystemUpdateError.unsafePath
         }
         if fileManager.fileExists(atPath: destination.path) {

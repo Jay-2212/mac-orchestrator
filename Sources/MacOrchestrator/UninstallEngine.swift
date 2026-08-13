@@ -141,6 +141,16 @@ struct UninstallPathValidator {
               root.standardizedFileURL != fileManager.homeDirectoryForCurrentUser else {
             throw UninstallError.invalidRoot
         }
+        let home = fileManager.homeDirectoryForCurrentUser.standardizedFileURL
+        let broadLibrary = home.appendingPathComponent("Library", isDirectory: true).standardizedFileURL
+        let broadApplicationSupport = broadLibrary.appendingPathComponent("Application Support", isDirectory: true).standardizedFileURL
+        guard root.standardizedFileURL != broadLibrary,
+              root.standardizedFileURL != broadApplicationSupport,
+              let attributes = try? fileManager.attributesOfItem(atPath: root.path),
+              let type = attributes[.type] as? FileAttributeType,
+              type == .typeDirectory else {
+            throw UninstallError.invalidRoot
+        }
         guard !isSymlink(root) else { throw UninstallError.rootIsSymlink }
         var ancestor = root.standardizedFileURL
         while ancestor.path != "/" {
@@ -265,6 +275,9 @@ final class UninstallEngine {
             .appendingPathComponent("install", isDirectory: true)
             .appendingPathComponent("uninstall-receipt.json", isDirectory: false)
         try pathValidator.validateRoot(self.supportDirectory)
+        guard self.launchAgentURL.lastPathComponent == "com.jay.mac-orchestrator.plist" else {
+            throw UninstallError.invalidRoot
+        }
         guard pathValidator.safeRemovalPath(self.logsDirectory, inside: self.supportDirectory) else {
             throw UninstallError.invalidRoot
         }
@@ -333,12 +346,30 @@ final class UninstallEngine {
                 _ = try lifecycle.quiesce()
                 servicesQuiesced = true
             } catch {
-                outcomes.append(contentsOf: destructiveEntries.map {
+                let detail = "Maintenance could not be quiesced: \(error.localizedDescription)"
+                outcomes.append(contentsOf: plan.entries.map { entry in
+                    switch entry.intent {
+                    case .remove:
+                        return UninstallOutcome(
+                            kind: entry.kind,
+                            relativePath: entry.relativePath,
+                            status: .failedManualActionRequired,
+                            detail: detail
+                        )
+                    case .retain:
+                        return UninstallOutcome(kind: entry.kind, relativePath: entry.relativePath, status: .retained, detail: nil)
+                    case .notPresent:
+                        return UninstallOutcome(kind: entry.kind, relativePath: entry.relativePath, status: .notPresent, detail: nil)
+                    case .manualActionRequired:
+                        return UninstallOutcome(kind: entry.kind, relativePath: entry.relativePath, status: .failedManualActionRequired, detail: entry.reason)
+                    }
+                })
+                outcomes.append(contentsOf: plan.keychainItemsToDelete.map {
                     UninstallOutcome(
-                        kind: $0.kind,
-                        relativePath: $0.relativePath,
+                        kind: .configuration,
+                        relativePath: "Keychain/\($0.key)",
                         status: .failedManualActionRequired,
-                        detail: "Maintenance could not be quiesced: \(error.localizedDescription)"
+                        detail: "Credential deletion was not attempted because maintenance could not be quiesced."
                     )
                 })
             }

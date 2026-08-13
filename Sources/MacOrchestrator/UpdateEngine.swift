@@ -406,6 +406,7 @@ final class UpdateEngine {
         guard candidate.trust == .detachedSignature || candidate.trust == .externallyPinnedManifestSHA256 else {
             throw UpdateEngineError.updateNotAuthenticated
         }
+        try revalidateCandidate(candidate)
         let transaction = try ledger.begin(
             targetVersion: candidate.manifest.product.version,
             manifestSHA256: candidate.manifestSHA256,
@@ -543,6 +544,44 @@ final class UpdateEngine {
             expectedVersion: expectedVersion,
             trust: .detachedSignature
         )
+    }
+
+    private func revalidateCandidate(_ candidate: UpdateCandidate) throws {
+        let actualDigest = MaintenanceDigest.sha256(data: candidate.rawManifest)
+        guard actualDigest.caseInsensitiveCompare(candidate.manifestSHA256) == .orderedSame else {
+            throw UpdateEngineError.manifestDigestMismatch
+        }
+
+        let expectedVersion: SemanticVersion
+        do {
+            expectedVersion = try SemanticVersion(candidate.discovery.version)
+        } catch {
+            throw UpdateEngineError.discoveryVersionInvalid
+        }
+
+        switch candidate.trust {
+        case .detachedSignature:
+            guard let rawSignature = candidate.rawSignature else {
+                throw UpdateEngineError.signatureRequired
+            }
+            try verifier.verify(manifestBytes: candidate.rawManifest, signatureBytes: rawSignature)
+        case .externallyPinnedManifestSHA256:
+            if let rawSignature = candidate.rawSignature {
+                try verifier.verify(manifestBytes: candidate.rawManifest, signatureBytes: rawSignature)
+            }
+        }
+
+        let decoded = try decodeCandidate(
+            record: candidate.discovery,
+            rawManifest: candidate.rawManifest,
+            rawSignature: candidate.rawSignature,
+            expectedVersion: expectedVersion,
+            trust: candidate.trust
+        )
+        guard decoded.manifest == candidate.manifest,
+              decoded.manifestSHA256.caseInsensitiveCompare(candidate.manifestSHA256) == .orderedSame else {
+            throw UpdateEngineError.manifestDecodeFailed
+        }
     }
 
     private func validateAutomaticDiscoveryURLs(_ record: ReleaseDiscoveryRecord, version: SemanticVersion) throws {

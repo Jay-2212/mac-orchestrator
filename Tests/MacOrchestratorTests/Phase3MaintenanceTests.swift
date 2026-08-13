@@ -125,6 +125,17 @@ final class Phase3ManifestAuthenticationTests: XCTestCase {
 
         let candidate = try engine.checkForUpdate()
         XCTAssertEqual(candidate.trust, .detachedSignature)
+        let tamperedCandidate = UpdateCandidate(
+            discovery: candidate.discovery,
+            rawManifest: Data("{}".utf8),
+            rawSignature: candidate.rawSignature,
+            manifest: candidate.manifest,
+            manifestSHA256: candidate.manifestSHA256,
+            trust: candidate.trust
+        )
+        XCTAssertThrowsError(try engine.apply(tamperedCandidate)) { error in
+            XCTAssertEqual(error as? UpdateEngineError, .manifestDigestMismatch)
+        }
         fetcher.values[manifestURL] = Data("{}".utf8)
         XCTAssertThrowsError(try engine.checkForUpdate()) { error in
             XCTAssertEqual(error as? ManifestAuthenticationError, .invalidSignature)
@@ -392,6 +403,17 @@ final class Phase3KeychainAndUninstallTests: XCTestCase {
         XCTAssertTrue(plan.entries.contains { $0.kind == .configuration && $0.intent == .retain })
         XCTAssertTrue(plan.keychainItemsToDelete.isEmpty)
         XCTAssertTrue(plan.providerResourcesUntouched)
+    }
+
+    func testUninstallRejectsBroadApplicationSupportRoot() {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let validator = UninstallPathValidator()
+
+        XCTAssertThrowsError(
+            try validator.validateRoot(
+                home.appendingPathComponent("Library/Application Support", isDirectory: true)
+            )
+        )
     }
 
     func testUninstallRejectsSymlinkedRemovalRootAndStillReturnsReceipt() throws {

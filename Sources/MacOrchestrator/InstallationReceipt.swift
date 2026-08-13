@@ -208,7 +208,7 @@ final class InstallationReceiptStore {
         guard fileManager.fileExists(atPath: previousReceiptURL.path) else {
             throw InstallationReceiptError.unavailable
         }
-        guard !isSymlink(previousReceiptURL), !isSymlink(receiptURL) else {
+        guard !containsSymlinkInPath(previousReceiptURL), !containsSymlinkInPath(receiptURL), isOwned(previousReceiptURL) else {
             throw InstallationReceiptError.unavailable
         }
         let previous = try Data(contentsOf: previousReceiptURL)
@@ -224,7 +224,7 @@ final class InstallationReceiptStore {
     }
 
     private func ensureDirectory() throws {
-        guard !isSymlink(directoryURL) else { throw InstallationReceiptError.unavailable }
+        guard !containsSymlinkInPath(directoryURL) else { throw InstallationReceiptError.unavailable }
         var ancestor = directoryURL.standardizedFileURL
         while ancestor.path != "/" && !fileManager.fileExists(atPath: ancestor.path) {
             guard !isSymlink(ancestor) else { throw InstallationReceiptError.unavailable }
@@ -247,7 +247,7 @@ final class InstallationReceiptStore {
     }
 
     private func write(_ data: Data, to destination: URL) throws {
-        guard !isSymlink(destination), !isSymlink(directoryURL), isOwned(directoryURL) else {
+        guard !containsSymlinkInPath(destination), !containsSymlinkInPath(directoryURL), isOwned(directoryURL) else {
             throw InstallationReceiptError.unavailable
         }
         if fileManager.fileExists(atPath: destination.path), !isOwned(destination) {
@@ -266,6 +266,15 @@ final class InstallationReceiptStore {
 
     private func isSymlink(_ url: URL) -> Bool {
         (try? fileManager.destinationOfSymbolicLink(atPath: url.path)) != nil
+    }
+
+    private func containsSymlinkInPath(_ url: URL) -> Bool {
+        var current = url.standardizedFileURL
+        while current.path != "/" {
+            if isSymlink(current) { return true }
+            current.deleteLastPathComponent()
+        }
+        return false
     }
 
     private func isOwned(_ url: URL) -> Bool {

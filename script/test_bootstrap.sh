@@ -897,14 +897,39 @@ assert envelope["algorithm"] == "ed25519"
 assert envelope["keyID"] == "fixture-v1"
 pathlib.Path(sys.argv[2]).write_bytes(base64.b64decode(envelope["signature"], validate=True))
 PY
-  openssl pkey -in "$key" -pubout -out "$TEST_ROOT/fixture-signing-key.pub" >/dev/null 2>&1 || return 1
-  if openssl pkeyutl -help 2>&1 | grep -q -- '-rawin'; then
-    openssl pkeyutl -verify -rawin -pubin -inkey "$TEST_ROOT/fixture-signing-key.pub" \
-      -in "$manifest" -sigfile "$TEST_ROOT/signature.bin" >/dev/null 2>&1 || return 1
-  else
-    openssl pkeyutl -verify -pubin -inkey "$TEST_ROOT/fixture-signing-key.pub" \
-      -in "$manifest" -sigfile "$TEST_ROOT/signature.bin" >/dev/null 2>&1 || return 1
+  if ! openssl pkey -in "$key" -pubout -out "$TEST_ROOT/fixture-signing-key.pub" >/dev/null 2>&1; then
+    python3 - "$key" "$TEST_ROOT/private.der" <<'PY' || return 1
+import base64
+import pathlib
+import sys
+
+source, destination = sys.argv[1:]
+text = pathlib.Path(source).read_text(encoding="utf-8")
+body = text.split("-----BEGIN PRIVATE KEY-----", 1)[1].split("-----END PRIVATE KEY-----", 1)[0]
+pathlib.Path(destination).write_bytes(base64.b64decode("".join(body.split()), validate=True))
+PY
+    swift - "$TEST_ROOT/private.der" "$TEST_ROOT/fixture-signing-key.pub" <<'SWIFT' || return 1
+import CryptoKit
+import Foundation
+
+let arguments = CommandLine.arguments
+guard arguments.count == 3 else { exit(2) }
+let der = try Data(contentsOf: URL(fileURLWithPath: arguments[1]))
+let prefix = Data([0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20])
+guard der.count == 48, der.prefix(prefix.count) == prefix else { exit(3) }
+let privateKey = try Curve25519.Signing.PrivateKey(rawRepresentation: Data(der.suffix(32)))
+let publicPrefix = Data([0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00])
+let publicDER = publicPrefix + privateKey.publicKey.rawRepresentation
+let raw = publicDER.base64EncodedString(options: [.lineLength64Characters, .endLineWithLineFeed])
+let pem = "-----BEGIN PUBLIC KEY-----\n\(raw)-----END PUBLIC KEY-----\n"
+try pem.write(to: URL(fileURLWithPath: arguments[2]), atomically: true, encoding: .utf8)
+SWIFT
   fi
+  bash "$PROJECT_DIR/script/verify_release_manifest.sh" \
+    --manifest "$manifest" \
+    --signature "$signature" \
+    --public-key "$TEST_ROOT/fixture-signing-key.pub" \
+    --key-id fixture-v1 >/dev/null 2>&1 || return 1
   output="$(bash "$PROJECT_DIR/script/sign_release_manifest.sh" \
     --manifest "$manifest" \
     --private-key "$PROJECT_DIR/script/bootstrap.sh" \

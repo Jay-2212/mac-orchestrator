@@ -151,11 +151,21 @@ jobs:
           release_tmp="$RUNNER_TEMP/mac-orchestrator-release"
           /bin/mkdir -p "$release_tmp/core-source" "$release_tmp/output"
           signing_key="$RUNNER_TEMP/mac-orchestrator-manifest-signing-key.pem"
+          signing_private_der="$RUNNER_TEMP/mac-orchestrator-manifest-signing-key.der"
           signing_public="$RUNNER_TEMP/mac-orchestrator-manifest-signing-key.pub"
-          trap '/bin/rm -f "$signing_key" "$signing_public" "$release_tmp/manifest.sig.bin"' EXIT
+          trap '/bin/rm -f "$signing_key" "$signing_private_der" "$signing_public"' EXIT
           umask 077
           /usr/bin/printf '%s' "$MANIFEST_SIGNING_KEY_PEM" > "$signing_key"
-          /usr/bin/openssl pkey -in "$signing_key" -pubout -out "$signing_public" >/dev/null
+          python3 - "$signing_key" "$signing_private_der" <<'PY'
+          import base64
+          import pathlib
+          import sys
+
+          source, destination = sys.argv[1:]
+          text = pathlib.Path(source).read_text(encoding="utf-8")
+          body = text.split("-----BEGIN PRIVATE KEY-----", 1)[1].split("-----END PRIVATE KEY-----", 1)[0]
+          pathlib.Path(destination).write_bytes(base64.b64decode("".join(body.split()), validate=True))
+          PY
           embedded_public="$(python3 - <<'PY'
           import base64
           import re
@@ -167,8 +177,31 @@ jobs:
           print(match.group(1))
           PY
           )"
-          derived_public="$(/usr/bin/openssl pkey -in "$signing_key" -pubout -outform DER | python3 -c 'import base64,sys; print(base64.b64encode(sys.stdin.buffer.read()[-32:]).decode())')"
+          derived_public="$(swift - "$signing_private_der" <<'SWIFT'
+          import CryptoKit
+          import Foundation
+
+          let der = try Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[1]))
+          let prefix = Data([0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20])
+          guard der.count == 48, der.prefix(prefix.count) == prefix else { exit(2) }
+          let privateKey = try Curve25519.Signing.PrivateKey(rawRepresentation: Data(der.suffix(32)))
+          print(privateKey.publicKey.rawRepresentation.base64EncodedString())
+          SWIFT
+          )"
           test "$derived_public" = "$embedded_public" || { echo "The external signing key does not match the embedded trusted public key." >&2; exit 1; }
+          python3 - "$signing_public" "$derived_public" <<'PY'
+          import base64
+          import pathlib
+          import sys
+
+          raw = base64.b64decode(sys.argv[2], validate=True)
+          der = bytes.fromhex("302a300506032b6570032100") + raw
+          pem = base64.encodebytes(der).decode("ascii")
+          pathlib.Path(sys.argv[1]).write_text(
+              "-----BEGIN PUBLIC KEY-----\n" + pem + "-----END PUBLIC KEY-----\n",
+              encoding="ascii",
+          )
+          PY
           product_version="${RELEASE_TAG#v}"
           asset_base="https://github.com/Jay-2212/mac-orchestrator/releases/download/${RELEASE_TAG}"
           manifest_url="$asset_base/manifest.json"
@@ -238,8 +271,11 @@ jobs:
           }
           pathlib.Path(sys.argv[2]).write_bytes(base64.b64decode(envelope["signature"], validate=True))
           PY
-          /usr/bin/openssl pkeyutl -verify -rawin -pubin -inkey "$signing_public" \
-            -in "$release_tmp/output/manifest.json" -sigfile "$release_tmp/manifest.sig.bin" >/dev/null
+          bash script/verify_release_manifest.sh \
+            --manifest "$release_tmp/output/manifest.json" \
+            --signature "$release_tmp/output/manifest.sig" \
+            --public-key "$signing_public" \
+            --key-id production-v1
           test -x "$release_tmp/output/install-command.sh"
           test -f "$release_tmp/output/release-body.md"
           test -f "$release_tmp/output/SHA256SUMS"

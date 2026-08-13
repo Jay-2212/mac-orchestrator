@@ -347,9 +347,14 @@ struct DittoSupportBundleArchiveWriter: SupportBundleArchiveWriting {
         for component in path.split(separator: "/") {
             current.appendPathComponent(String(component), isDirectory: true)
             var info = stat()
-            guard lstat(current.path, &info) == 0,
-                  (info.st_mode & S_IFMT) != S_IFLNK else {
+            guard lstat(current.path, &info) == 0 else {
                 throw SupportBundleError.archiveWriteFailed
+            }
+            if (info.st_mode & S_IFMT) == S_IFLNK {
+                guard VerifiedMacOSSystemAlias.isAllowed(current) else {
+                    throw SupportBundleError.archiveWriteFailed
+                }
+                continue
             }
             if requireDirectory {
                 guard (info.st_mode & S_IFMT) == S_IFDIR else {
@@ -399,6 +404,23 @@ struct DittoSupportBundleArchiveWriter: SupportBundleArchiveWriting {
             throw SupportBundleError.unsafeArchivePath(path)
         }
         return components.joined(separator: "/")
+    }
+}
+
+private enum VerifiedMacOSSystemAlias {
+    static func isAllowed(_ url: URL) -> Bool {
+        let path = url.standardizedFileURL.path
+        let expectedTarget: String
+        switch path {
+        case "/var":
+            expectedTarget = "/private/var"
+        case "/tmp":
+            expectedTarget = "/private/tmp"
+        default:
+            return false
+        }
+
+        return url.resolvingSymlinksInPath().standardizedFileURL.path == expectedTarget
     }
 }
 
@@ -804,8 +826,11 @@ final class SupportBundleEngine: @unchecked Sendable {
         for component in path.split(separator: "/") {
             current.appendPathComponent(String(component), isDirectory: true)
             var info = stat()
-            guard lstat(current.path, &info) == 0,
-                  (info.st_mode & S_IFMT) != S_IFLNK else { return false }
+            guard lstat(current.path, &info) == 0 else { return false }
+            if (info.st_mode & S_IFMT) == S_IFLNK {
+                guard VerifiedMacOSSystemAlias.isAllowed(current) else { return false }
+                continue
+            }
             if requireDirectory && (info.st_mode & S_IFMT) != S_IFDIR { return false }
         }
         return true

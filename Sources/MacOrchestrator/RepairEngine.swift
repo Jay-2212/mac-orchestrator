@@ -376,7 +376,10 @@ private enum NonFollowingPathGuard {
             if lstat(current.path, &metadata) == 0 {
                 let mode = UInt32(metadata.st_mode)
                 if mode & UInt32(S_IFMT) == UInt32(S_IFLNK) {
-                    return false
+                    guard VerifiedMacOSSystemAlias.isAllowed(current) else {
+                        return false
+                    }
+                    continue
                 }
                 if index < components.count - 1,
                    mode & UInt32(S_IFMT) != UInt32(S_IFDIR) {
@@ -392,6 +395,23 @@ private enum NonFollowingPathGuard {
         }
 
         return true
+    }
+}
+
+private enum VerifiedMacOSSystemAlias {
+    static func isAllowed(_ url: URL) -> Bool {
+        let path = url.standardizedFileURL.path
+        let expectedTarget: String
+        switch path {
+        case "/var":
+            expectedTarget = "/private/var"
+        case "/tmp":
+            expectedTarget = "/private/tmp"
+        default:
+            return false
+        }
+
+        return url.resolvingSymlinksInPath().standardizedFileURL.path == expectedTarget
     }
 }
 

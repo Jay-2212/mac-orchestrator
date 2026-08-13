@@ -62,6 +62,17 @@ final class SupportBundleTests: XCTestCase {
         XCTAssertEqual(extracted.map(\.name), ["doctor-report.json"])
     }
 
+    func testNormalTemporaryArchiveCreationAllowsVerifiedMacOSTemporaryAlias() throws {
+        let source = RecordingBundleSource(entries: [.doctorReport])
+        let engine = SupportBundleEngine(sources: [source])
+        let archive = temporaryArchiveURL()
+        defer { try? FileManager.default.removeItem(at: archive) }
+
+        _ = try engine.create(plan: engine.preview(), to: archive)
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: archive.path))
+    }
+
     func testAlteredAndUnknownPlansAreRejectedBeforeCollection() throws {
         let source = RecordingBundleSource(entries: [.doctorReport])
         let engine = SupportBundleEngine(sources: [source])

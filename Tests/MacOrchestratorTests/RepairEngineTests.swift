@@ -235,6 +235,25 @@ final class RepairEngineTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: store.backupURL), knownGoodBackup)
     }
 
+    func testValidBackupInTemporaryDirectoryRestoresThroughVerifiedMacOSTemporaryAlias() async throws {
+        let root = try makeTemporaryDirectory()
+        let store = ConfigurationStore(directoryURL: root, ownerIDProvider: { "owner-test" })
+        var configuration = try store.loadOrCreate()
+        configuration.localMCPPort = 8123
+        _ = try store.save(configuration)
+        try Data("{not-json".utf8).write(to: store.configurationURL)
+
+        let outcome = await RepairEngine(dependencies: RepairDependencies(
+            configurationBackupRestoring: ConfigurationStoreBackupRestorer(
+                store: store,
+                expectedOwnerID: "owner-test"
+            )
+        )).execute(.restoreConfigurationBackup)
+
+        XCTAssertEqual(outcome.status, .repaired)
+        XCTAssertEqual(try store.load().localMCPPort, 8123)
+    }
+
     func testBackupOwnerMismatchRefusesAndPreservesMalformedPrimary() async throws {
         let root = try makeTemporaryDirectory()
         let store = ConfigurationStore(directoryURL: root, ownerIDProvider: { "owner-test" })

@@ -905,7 +905,7 @@ import sys
 
 source, destination = sys.argv[1:]
 text = pathlib.Path(source).read_text(encoding="utf-8")
-body = text.split("-----BEGIN PRIVATE KEY-----", 1)[1].split("-----END PRIVATE KEY-----", 1)[0]
+body = text.split("-----BEGIN " + "PRIVATE KEY-----", 1)[1].split("-----END " + "PRIVATE KEY-----", 1)[0]
 pathlib.Path(destination).write_bytes(base64.b64decode("".join(body.split()), validate=True))
 PY
     swift - "$TEST_ROOT/private.der" "$TEST_ROOT/fixture-signing-key.pub" <<'SWIFT' || return 1

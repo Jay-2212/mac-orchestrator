@@ -247,7 +247,7 @@ struct DittoSupportBundleArchiveWriter: SupportBundleArchiveWriting {
             "-c",
             "-k",
             "--norsrc",
-            stagingDirectory.path,
+            stagingDirectory.appendingPathComponent(".", isDirectory: true).path,
             destination.path
         ]
         process.standardOutput = FileHandle.nullDevice

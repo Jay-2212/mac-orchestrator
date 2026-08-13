@@ -434,6 +434,27 @@ final class DiagnosticLiveProviderTests: XCTestCase {
         XCTAssertTrue(facts.pidReuseDetected)
     }
 
+    func testLifecycleRejectsOwnedStateWithOwnerButNoComponentPIDs() throws {
+        let fixture = try makeLifecycleFixture()
+        try JSONEncoder().encode(OwnedProcessState(ownerID: "owner-1", serverPID: nil, tunnelPID: nil))
+            .write(to: fixture.paths.ownedProcessesURL)
+        try writeSupportedLaunchAgent(to: fixture.paths.launchAgentURL, helper: fixture.paths.helperExecutableURL)
+        let provider = ReadOnlyLifecycleFactsProvider(
+            paths: fixture.paths,
+            ownerID: "owner-1",
+            commandRunner: launchctlRunner(),
+            processRunner: RecordingDiagnosticProcessRunner(processes: [])
+        )
+
+        let facts = try provider.inspect()
+
+        XCTAssertFalse(facts.ownershipMarkerPresent)
+        XCTAssertTrue(facts.pidReuseDetected)
+        XCTAssertEqual(facts.ownedProcessCount, 0)
+        XCTAssertNil(facts.serverPID)
+        XCTAssertNil(facts.tunnelPID)
+    }
+
     func testLifecycleRejectsMarkerWithoutOwnedProcessRecord() throws {
         let fixture = try makeLifecycleFixture()
         try writeSupportedLaunchAgent(to: fixture.paths.launchAgentURL, helper: fixture.paths.helperExecutableURL)
@@ -659,6 +680,46 @@ final class DiagnosticLiveProviderTests: XCTestCase {
 
         XCTAssertFalse(facts.helperPresent)
         XCTAssertFalse(facts.runtime.runtimePresent)
+        XCTAssertFalse(facts.runtime.structurallyValid)
+    }
+
+    func testInstalledReleaseProviderRejectsEmptyReleaseMarker() throws {
+        let fixture = try makeReleaseFixture()
+        try Data().write(to: fixture.paths.runtimeMarkerURL)
+
+        let facts = try ReadOnlyInstalledReleaseFactsProvider(
+            paths: fixture.paths,
+            commandRunner: releaseCommandRunner(paths: fixture.paths)
+        ).inspect()
+
+        XCTAssertFalse(facts.runtime.markerPresent)
+        XCTAssertNil(facts.releaseVersion)
+        XCTAssertFalse(facts.runtime.structurallyValid)
+    }
+
+    func testInstalledReleaseProviderRejectsEmptyRuntimePayload() throws {
+        let fixture = try makeReleaseFixture()
+        try Data().write(to: fixture.paths.runtimeScriptURL)
+
+        let facts = try ReadOnlyInstalledReleaseFactsProvider(
+            paths: fixture.paths,
+            commandRunner: releaseCommandRunner(paths: fixture.paths)
+        ).inspect()
+
+        XCTAssertFalse(facts.runtime.payloadPresent)
+        XCTAssertFalse(facts.runtime.structurallyValid)
+    }
+
+    func testInstalledReleaseProviderRejectsEmptyBundleMetadata() throws {
+        let fixture = try makeReleaseFixture()
+        try Data().write(to: fixture.paths.appURL.appendingPathComponent("Contents/Info.plist"))
+
+        let facts = try ReadOnlyInstalledReleaseFactsProvider(
+            paths: fixture.paths,
+            commandRunner: releaseCommandRunner(paths: fixture.paths)
+        ).inspect()
+
+        XCTAssertFalse(facts.helperPresent)
         XCTAssertFalse(facts.runtime.structurallyValid)
     }
 

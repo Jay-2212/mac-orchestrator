@@ -415,15 +415,20 @@ struct ReadOnlyInstalledReleaseFactsProvider: InstalledReleaseFactsProviding {
         let bundleIdentifier = (info?["CFBundleIdentifier"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
         let bundleVersion = (info?["CFBundleShortVersionString"] as? String ?? info?["CFBundleVersion"] as? String)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        let usableBundleMetadata = isRegularNonSymlinkFile(at: infoURL)
+        let usableBundleMetadata = isNonEmptyRegularNonSymlinkFile(at: infoURL)
             && bundleIdentifier?.isEmpty == false
             && bundleVersion?.isEmpty == false
         let helperPresent = isExecutableRegularFile(at: paths.helperExecutableURL) && usableBundleMetadata
-        let markerPresent = isRegularNonSymlinkFile(at: paths.runtimeMarkerURL)
+        let markerFilePresent = isNonEmptyRegularNonSymlinkFile(at: paths.runtimeMarkerURL)
         let runtimePresent = isExecutableRegularFile(at: paths.runtimePythonURL)
-        let payloadPresent = isRegularNonSymlinkFile(at: paths.runtimeScriptURL)
-        let releaseVersion = markerPresent ? try? String(contentsOf: paths.runtimeMarkerURL, encoding: .utf8)
-            .trimmingCharacters(in: .whitespacesAndNewlines) : nil
+        let payloadPresent = isNonEmptyRegularNonSymlinkFile(at: paths.runtimeScriptURL)
+        let releaseVersion = markerFilePresent
+            ? (try? String(contentsOf: paths.runtimeMarkerURL, encoding: .utf8)).flatMap {
+                let version = $0.trimmingCharacters(in: .whitespacesAndNewlines)
+                return version.isEmpty ? nil : version
+            }
+            : nil
+        let markerPresent = releaseVersion?.isEmpty == false
         let file = commandRunner.run(DiagnosticCommandRequest(
             executable: "/usr/bin/file",
             arguments: ["-b", paths.helperExecutableURL.path]
@@ -496,6 +501,13 @@ struct ReadOnlyInstalledReleaseFactsProvider: InstalledReleaseFactsProviding {
         guard lstat(url.path, &metadata) == 0 else { return false }
         let mode = UInt32(metadata.st_mode)
         return mode & UInt32(S_IFMT) == UInt32(S_IFREG)
+    }
+
+    private func isNonEmptyRegularNonSymlinkFile(at url: URL) -> Bool {
+        var metadata = stat()
+        guard lstat(url.path, &metadata) == 0 else { return false }
+        let mode = UInt32(metadata.st_mode)
+        return mode & UInt32(S_IFMT) == UInt32(S_IFREG) && metadata.st_size > 0
     }
 
     private func isExecutableRegularFile(at url: URL) -> Bool {
@@ -585,6 +597,7 @@ struct ReadOnlyLifecycleFactsProvider: LifecycleFactsProviding {
         let serverPID = state?.serverPID
         let tunnelPID = state?.tunnelPID
         let stateOwnerMatches = state?.ownerID == ownerID
+        let stateHasNoPIDs = state != nil && serverPID == nil && tunnelPID == nil
         let duplicateAssignment = serverPID != nil && serverPID == tunnelPID
         let serverAssignmentValid = serverPID.map { pid in
             serverProcesses.count == 1 && serverProcesses[0].pid == pid
@@ -593,6 +606,7 @@ struct ReadOnlyLifecycleFactsProvider: LifecycleFactsProviding {
             tunnelProcesses.count == 1 && tunnelProcesses[0].pid == pid
         } ?? true
         let pidReuse = stateResult.malformed
+            || stateHasNoPIDs
             || (state != nil && !stateOwnerMatches)
             || !serverAssignmentValid
             || !tunnelAssignmentValid
@@ -614,7 +628,7 @@ struct ReadOnlyLifecycleFactsProvider: LifecycleFactsProviding {
             ownedProcessCount: ownedCount,
             serverPID: serverPID,
             tunnelPID: tunnelPID,
-            ownershipMarkerPresent: stateOwnerMatches,
+            ownershipMarkerPresent: stateOwnerMatches && !stateHasNoPIDs,
             duplicateOwnedProcesses: duplicateOwnedProcesses,
             pidReuseDetected: pidReuse
         )

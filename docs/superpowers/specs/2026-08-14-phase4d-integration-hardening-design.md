@@ -1,8 +1,8 @@
 # Mac Orchestrator Phase 4D Integration and Hardening Design
 
-**Date:** 2026-08-14  
-**Repository:** `Jay-2212/mac-orchestrator`  
-**Canonical starting SHA:** `584259c44370d7d83f3a2764c94518b862a3c4ff`  
+**Date:** 2026-08-14
+**Repository:** `Jay-2212/mac-orchestrator`
+**Canonical starting SHA:** `584259c44370d7d83f3a2764c94518b862a3c4ff`
 **Integration branch:** `phase4/integration-hardening`
 
 ## Goal

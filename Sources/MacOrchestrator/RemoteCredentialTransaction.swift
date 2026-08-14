@@ -278,9 +278,14 @@ struct NgrokCredentialReplacementReceipt: Equatable, Sendable {
     let probe: RemoteConnectorProbe
 }
 
+protocol NgrokCredentialReplacementFinishing: Sendable {
+    func finishCandidateReplacement(restorePreviousSession: Bool) async throws
+}
+
 struct NgrokCredentialReplacementTransaction {
     private let keychain: KeychainStore
     private let hooks: any NgrokCredentialCandidateValidationHooks
+    private let finisher: (any NgrokCredentialReplacementFinishing)?
     private let failurePolicy: NgrokCredentialFailurePolicy
     private let stateStore: (any RemoteConnectorStatePersisting)?
     private let coordinator: RemoteCredentialOperationCoordinator
@@ -290,10 +295,12 @@ struct NgrokCredentialReplacementTransaction {
         hooks: any NgrokCredentialCandidateValidationHooks,
         failurePolicy: NgrokCredentialFailurePolicy,
         stateStore: (any RemoteConnectorStatePersisting)? = nil,
+        finisher: (any NgrokCredentialReplacementFinishing)? = nil,
         coordinator: RemoteCredentialOperationCoordinator = .shared
     ) {
         self.keychain = keychain
         self.hooks = hooks
+        self.finisher = finisher
         self.failurePolicy = failurePolicy
         self.stateStore = stateStore
         self.coordinator = coordinator
@@ -303,6 +310,18 @@ struct NgrokCredentialReplacementTransaction {
         try await coordinator.acquire()
         do {
             let receipt = try await executeUnlocked(candidate: candidate)
+            if let finisher {
+                do {
+                    try await finisher.finishCandidateReplacement(restorePreviousSession: true)
+                } catch {
+                    // The candidate is already canonical. Never restore the
+                    // previous provider credential after post-commit cleanup
+                    // fails.
+                    persistNgrokDegradedState()
+                    try? await finisher.finishCandidateReplacement(restorePreviousSession: false)
+                    throw NgrokCredentialReplacementError.commitFailed
+                }
+            }
             await coordinator.release()
             return receipt
         } catch {
@@ -361,6 +380,7 @@ struct NgrokCredentialReplacementTransaction {
             case .preserveExistingCredential:
                 if phase == .commit, candidateCommitted {
                     persistNgrokDegradedState()
+                    try? await finisher?.finishCandidateReplacement(restorePreviousSession: false)
                     safeError = .commitFailed
                 } else if phase == .commit {
                     try? await hooks.restorePriorProviderSession()
@@ -372,8 +392,10 @@ struct NgrokCredentialReplacementTransaction {
             case .failClosedIfCompromised:
                 do {
                     try keychain.deleteNgrokAuthtoken(expectedCurrent: currentValue)
+                    try? await finisher?.finishCandidateReplacement(restorePreviousSession: false)
                     safeError = .failedClosed
                 } catch {
+                    try? await finisher?.finishCandidateReplacement(restorePreviousSession: false)
                     safeError = .failClosedUnavailable
                 }
             }
@@ -388,6 +410,7 @@ struct NgrokCredentialReplacementTransaction {
     ) async -> NgrokCredentialReplacementError {
         if originalError == .commitAmbiguous {
             persistNgrokDegradedState()
+            try? await finisher?.finishCandidateReplacement(restorePreviousSession: false)
             currentValue = nil
             return originalError
         }
@@ -399,9 +422,11 @@ struct NgrokCredentialReplacementTransaction {
         case .failClosedIfCompromised:
             do {
                 try keychain.deleteNgrokAuthtoken(expectedCurrent: currentValue)
+                try? await finisher?.finishCandidateReplacement(restorePreviousSession: false)
                 currentValue = nil
                 return .failedClosed
             } catch {
+                try? await finisher?.finishCandidateReplacement(restorePreviousSession: false)
                 currentValue = nil
                 return .failClosedUnavailable
             }

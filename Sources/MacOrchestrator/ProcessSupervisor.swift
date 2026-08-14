@@ -167,6 +167,37 @@ final class ProcessSupervisor {
         }
     }
 
+    /// Copying the connector URL is an explicit credential handoff. The URL
+    /// exists only inside this action, and the nonsecret receipt is written
+    /// after NSPasteboard accepts the copy.
+    func copyConnectorURLRequested(
+        completion: @escaping (Result<RemoteClientHandoffClassification, Error>) -> Void = { _ in }
+    ) {
+        guard let configuration = activeContract?.configuration else {
+            completion(.failure(RemoteConnectorHandoffError.stateUnavailable))
+            return
+        }
+        let service = RemoteConnectorHandoffService(
+            configuration: configuration,
+            adapter: remoteConnectorAdapter,
+            stateStore: remoteConnectorStateStore
+        )
+        Task { @MainActor [weak self] in
+            guard self != nil else { return }
+            do {
+                let handoff = try await service.prepare()
+                guard NSPasteboard.general.clearContents() != 0,
+                      NSPasteboard.general.setString(handoff.url.absoluteString, forType: .string) else {
+                    throw RemoteConnectorHandoffError.recordFailed
+                }
+                let classification = try service.record(handoff)
+                completion(.success(classification))
+            } catch {
+                completion(.failure(error))
+            }
+        }
+    }
+
     func restartRequested() {
         Task { @MainActor [weak self] in
             guard let self else { return }
@@ -213,8 +244,6 @@ final class ProcessSupervisor {
     func retry(component: ManagedComponentID) {
         if component == .mcpServer {
             invalidateServerActivation()
-        } else {
-            snapshot.connectorURL = nil
         }
         lifecycle.retry(component: component)
     }
@@ -298,7 +327,6 @@ final class ProcessSupervisor {
     ) {
         invalidateServerActivation()
         activeContract = contract
-        snapshot.connectorURL = nil
         ownerID = contract.configuration.ownerID
         lifecycle.synchronizeDesiredStates(
             mcpServer: contract.configuration.process.serverDesired,
@@ -316,11 +344,7 @@ final class ProcessSupervisor {
     }
 
     private func applyLifecycleSnapshot(_ lifecycleSnapshot: LifecycleSnapshot) {
-        var projection = snapshot.projected(from: lifecycleSnapshot)
-        if lifecycleSnapshot.remoteConnector.lifecycle != .ready {
-            projection.connectorURL = nil
-        }
-        snapshot = projection
+        snapshot = snapshot.projected(from: lifecycleSnapshot)
     }
 
     private func handleLifecycleEffect(_ effect: LifecycleEffect) {
@@ -441,7 +465,6 @@ final class ProcessSupervisor {
             )
             return
         }
-        snapshot.connectorURL = nil
         let launchSpecification: RemoteConnectorLaunchSpecification
         do {
             launchSpecification = try remoteConnectorAdapter.makeLaunchSpecification(
@@ -476,7 +499,6 @@ final class ProcessSupervisor {
                       self.tunnelLaunchGeneration == launchGeneration else { return }
                 self.tunnelProcess = nil
                 self.persistState()
-                self.snapshot.connectorURL = nil
                 if !self.quitting && self.tunnelDesired && self.serverDesired {
                     self.lifecycle.recordFailure(
                         for: .remoteConnector,
@@ -520,12 +542,10 @@ final class ProcessSupervisor {
     private func stopTunnelProcess() {
         invalidateTunnelLaunch()
         guard let process = tunnelProcess else {
-            snapshot.connectorURL = nil
             verifiedRemoteOrigin = nil
             lifecycle.markStopped(for: .remoteConnector)
             return
         }
-        snapshot.connectorURL = nil
         verifiedRemoteOrigin = nil
         terminateOwned(process, group: tunnelProcessGroupOwned, label: "tunnel")
         tunnelProcessGroupOwned = false
@@ -731,7 +751,6 @@ final class ProcessSupervisor {
     private func beginTunnelLaunch() -> UInt64 {
         tunnelLaunchGeneration &+= 1
         verifiedRemoteOrigin = nil
-        snapshot.connectorURL = nil
         return tunnelLaunchGeneration
     }
 
@@ -744,7 +763,6 @@ final class ProcessSupervisor {
               let serverProcess, serverProcess.isRunning,
               let contract = activeContract,
               let connectorToken = contract.environment["MAC_ORCHESTRATOR_CONNECTOR_TOKEN"] else {
-            snapshot.connectorURL = nil
             lifecycle.markDegraded(
                 for: .remoteConnector,
                 reason: "Remote connector identity is unavailable."
@@ -776,7 +794,7 @@ final class ProcessSupervisor {
                 .expectations(for: contract.configuration)
                 .expectedTools,
             knownPublicOrigin: verifiedRemoteOrigin,
-            forceAuthenticatedProbe: forceAuthenticatedProbe || snapshot.connectorURL == nil
+            forceAuthenticatedProbe: forceAuthenticatedProbe
         )
 
         Task { @MainActor [weak self, fence] in
@@ -788,11 +806,10 @@ final class ProcessSupervisor {
                 return
             case let .unchanged(publicOrigin):
                 self.verifiedRemoteOrigin = publicOrigin
-            case let .authenticated(publicOrigin, connectorURL, _):
+            case let .authenticated(publicOrigin, _):
                 do {
                     try self.persistRemoteProbeSuccess(publicOrigin)
                 } catch {
-                    self.snapshot.connectorURL = nil
                     self.verifiedRemoteOrigin = nil
                     self.lifecycle.markDegraded(
                         for: .remoteConnector,
@@ -801,10 +818,8 @@ final class ProcessSupervisor {
                     return
                 }
                 self.verifiedRemoteOrigin = publicOrigin
-                self.snapshot.connectorURL = connectorURL
                 self.lifecycle.markReady(for: .remoteConnector)
             case let .failed(failure):
-                self.snapshot.connectorURL = nil
                 self.verifiedRemoteOrigin = nil
                 self.persistRemoteProbeFailure()
                 self.lifecycle.markDegraded(

@@ -29,7 +29,7 @@ enum RemoteProbeFailure: Error, Equatable, LocalizedError, Sendable {
     }
 }
 
-struct RemoteProbeRequest: Sendable {
+struct RemoteProbeRequest: Sendable, CustomStringConvertible, CustomDebugStringConvertible {
     let tunnelTarget: String
     let connectorToken: String
     let expectedTools: Set<String>?
@@ -49,6 +49,9 @@ struct RemoteProbeRequest: Sendable {
         self.knownPublicOrigin = knownPublicOrigin
         self.forceAuthenticatedProbe = forceAuthenticatedProbe
     }
+
+    var description: String { "RemoteProbeRequest" }
+    var debugDescription: String { description }
 }
 
 struct RemoteProbeFence: Equatable, Sendable {
@@ -81,7 +84,6 @@ enum RemoteProbeResult: Equatable, Sendable {
     case unchanged(publicOrigin: RemotePublicOrigin)
     case authenticated(
         publicOrigin: RemotePublicOrigin,
-        connectorURL: URL,
         details: RemoteActivationProbeDetails
     )
     case failed(RemoteProbeFailure)
@@ -171,7 +173,6 @@ actor RemoteProbeCoordinator {
         }
         return .authenticated(
             publicOrigin: publicOrigin,
-            connectorURL: connectorURL,
             details: details
         )
     }

@@ -27,11 +27,10 @@ final class RemoteProbeCoordinatorTests: XCTestCase {
             )
         )
 
-        guard case .authenticated(let origin, let connectorURL, _) = result else {
+        guard case .authenticated(let origin, _) = result else {
             return XCTFail("A current endpoint must proceed to authenticated readiness.")
         }
         XCTAssertEqual(origin.value, "https://remote.example")
-        XCTAssertEqual(connectorURL.absoluteString, "https://remote.example/connector-token/mcp")
     }
 
     func testStableOriginUsesAgentAPIInspectionWithoutRepeatingAuthenticatedActivation() async {

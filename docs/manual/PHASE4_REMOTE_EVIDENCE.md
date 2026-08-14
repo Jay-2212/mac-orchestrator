@@ -1,9 +1,10 @@
 # Phase 4 Remote Doctor / Client-Recovery Evidence Matrix
 
-This is a maintainer/manual test record for remote lifecycle behavior. It is
-not a claim that the current branch can perform the authenticated probe: the
-Phase 4C production seam reports that evidence as not run until a later stream
-binds the live provider.
+This is a maintainer/manual test record for remote lifecycle behavior. The
+Phase 4D implementation has deterministic adapter, lifecycle, handoff, and
+credential-transaction seams, but this file contains no fabricated live
+provider observations. Until a maintainer performs a row on a real dedicated
+Mac/account, mark that row `MANUAL EVIDENCE REQUIRED`.
 
 Record only public hostname observations and typed Doctor outcomes. Never paste
 a capability path, connector URL, capability credential, ngrok credential, MCP
@@ -24,6 +25,11 @@ category, not the secret-bearing value.
   only when a known/manual handoff receipt is available.
 
 ## Matrix
+
+Current status: all real provider/lifecycle rows below are
+`MANUAL EVIDENCE REQUIRED`. Hosted XCTest and deterministic fakes do not prove
+sleep/wake, reboot, network transitions, account replacement, or live ngrok
+domain behavior.
 
 | Case | Preconditions | Public hostname observation only | Expected Agent API classification | Expected authenticated MCP result | Expected client-handoff state | Result fields to fill |
 | --- | --- | --- | --- | --- | --- | --- |

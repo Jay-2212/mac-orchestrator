@@ -30,18 +30,22 @@ The helper should acknowledge storage without echoing the token. If it does not,
 stop and do not put the token in another command or file.
 
 Use **Copy Connector URL** in the menu-bar app, or use the helper's supported
-`--print-connector-url` mode. The helper queries the local ngrok Agent API
-`GET /api/endpoints` and returns only the current HTTPS endpoint whose upstream
-matches Mac Orchestrator's selected loopback port. The displayed URL is the
-value to give to the client:
+`--print-connector-url` mode. This is an explicit credential handoff: the
+helper first performs a fresh authenticated MCP readiness probe, then queries
+the loopback-only ngrok Agent API `GET /api/endpoints` through the shared
+adapter, and returns only the current HTTPS endpoint whose upstream matches
+Mac Orchestrator's selected loopback port. The URL is displayed/copied first;
+only its nonsecret generation, public origin, and timestamp are recorded
+afterward. Ordinary status, Doctor, logs, and support bundles never contain it.
+The displayed URL is the value to give to the client:
 
 ```text
 https://<live-ngrok-host>/<capability-token>/mcp
 ```
 
 Do not replace it with the bare ngrok hostname, `/mcp` without the capability
-path, the Agent API URL, or an old URL copied from a previous run. Re-query the
-live Agent API whenever the tunnel or its upstream is recreated. The current
+path, the Agent API URL, or an old URL copied from a previous run. Re-run the
+explicit handoff whenever the tunnel or its upstream is recreated. The current
 Free plan gives an account-specific automatically assigned development domain;
 the domain may remain the same across a lifecycle event or may change, and this
 repository has no empirical guarantee of persistence across reboot, network
@@ -58,13 +62,13 @@ state.
 
 ## Client registration boundary
 
-Phase 4C supports a generic Streamable HTTP handoff. Mac Orchestrator can show
+Phase 4D supports a generic Streamable HTTP handoff. Mac Orchestrator can show
 or copy the current connector URL for you to paste into a client field; that is
 different from automatic client registration. It does not inspect arbitrary
 client settings, identify an unrecorded client as stale, edit private client
 configuration files, or rewrite clients through UI automation. No named client
 has a supported automatic registration contract in this repository, so the
-Phase 4 automation count is zero.
+Phase 4 client automation count is zero.
 
 ## Generic Streamable HTTP clients
 
@@ -109,15 +113,18 @@ assume that an arbitrary client uses this JSON shape.
 
 Remote ingress is optional. A client running on the same Mac can use the
 local capability-path endpoint exposed by the managed Python server if the
-client supports an HTTP URL on loopback. The installer prints:
+client supports an HTTP URL on loopback. The installer prints readiness, not a
+credential-bearing local URL, and `--wait-for-local-activation` is a bounded
+confirmation-only command:
 
 ```text
-Local MCP URL: http://127.0.0.1:<selected-port>/<capability-token>/mcp
+Local activation confirmed. The credential-bearing local MCP URL was intentionally not printed.
 ```
 
-You can request the same bounded confirmation from the installed helper with
-`--wait-for-local-activation`. Use the exact URL shown for the current local
-port and capability path; do not guess port `8000` or remove authentication.
+Use only a client handoff path that you deliberately control for the current
+local port and capability path; do not guess port `8000` or remove
+authentication. Mac Orchestrator does not register arbitrary local clients or
+rewrite their private configuration.
 
 The server remains loopback-bound. The public URL, when enabled, is the ngrok
 forward to that loopback server; it is not a hosted Mac Orchestrator service.
@@ -154,8 +161,11 @@ different. Replacing the ngrok credential does not by itself rotate the
 connector capability credential. If a supported workflow rotates the connector
 capability credential, every previous full connector URL is invalid and the
 recorded clients must be configured manually with the new current URL.
-Phase 4C does not accept secret input, rotate credentials, inspect arbitrary
-clients, or edit private client files.
+Phase 4D accepts provider candidates only through hidden stdin and validates
+them before Keychain commit. It still does not inspect arbitrary clients or
+edit private client files. Connector-token rotation is explicit and leaves
+existing client handoff receipts stale until a new URL is deliberately copied
+or shown.
 
 Do not try to repair a leaked URL by editing only its hostname. The capability
 path contains the credential, and a fresh full URL is required after supported

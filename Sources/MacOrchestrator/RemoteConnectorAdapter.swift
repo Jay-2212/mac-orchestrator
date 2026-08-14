@@ -145,10 +145,13 @@ struct RemoteConnectorLaunchSpecification: Sendable, CustomStringConvertible, Cu
     }
 }
 
-enum RemoteConnectorAgentAPIInspection: Equatable, Sendable {
+enum RemoteConnectorAgentAPIInspection: Equatable, Sendable, CustomStringConvertible, CustomDebugStringConvertible {
     case available(endpoints: [NgrokEndpoint])
     case unavailable
     case invalidResponse
+
+    var description: String { "RemoteConnectorAgentAPIInspection" }
+    var debugDescription: String { description }
 }
 
 enum RemoteConnectorDiagnostic: String, Equatable, Sendable {

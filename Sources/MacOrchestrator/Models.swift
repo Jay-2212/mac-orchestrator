@@ -13,7 +13,6 @@ struct ServiceSnapshot {
     var server: ServiceState = .stopped
     var tunnel: ServiceState = .stopped
     var productReadiness: ProductReadinessState = .needsAttention
-    var connectorURL: URL?
     var error: String?
     var controlProfile: ControlProfile?
     var readyCapabilityCount: Int = 0
@@ -34,9 +33,6 @@ struct ServiceSnapshot {
         tunnel = Self.serviceState(for: lifecycle.remoteConnector)
         productReadiness = lifecycle.productReadiness
         error = lifecycle.mcpServer.reason ?? lifecycle.remoteConnector.reason
-        if lifecycle.remoteConnector.lifecycle != .ready {
-            connectorURL = nil
-        }
         if let capabilitySnapshot = effectiveCapabilitySnapshot {
             let projected = capabilitySnapshot.projected(from: lifecycle)
             effectiveCapabilitySnapshot = projected

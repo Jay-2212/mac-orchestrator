@@ -189,6 +189,120 @@ enum TerminalCommand {
         }
     }
 
+    /// Async command entrypoint used by main.swift. Remote readiness and
+    /// explicit handoff never block a caller with a semaphore or a run-loop
+    /// bridge.
+    static func runAsync(arguments: [String]) async -> Int32? {
+        guard let command = arguments.first else { return nil }
+
+        do {
+            switch command {
+            case "--enable-remote":
+                guard arguments.count == 1 else {
+                    throw TerminalCommandError.invalidArguments("--enable-remote does not accept additional arguments.")
+                }
+                let keychain = KeychainStore()
+                guard let token = try keychain.value(for: .ngrokAuthtoken),
+                      !token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    throw TerminalCommandError.tokenMissing
+                }
+                _ = try ConfigurationStore().update { configuration in
+                    configuration.process.serverDesired = true
+                    configuration.process.tunnelDesired = true
+                    configuration.desiredCapabilities["remote.connector"] = true
+                }
+                if try restartRunningSupervisorIfLoaded() {
+                    try await waitForRemoteConnectorAsync()
+                } else {
+                    print("Remote connector enabled; it will start after local activation succeeds.")
+                }
+                return 0
+
+            case "--disable-remote":
+                guard arguments.count == 1 else {
+                    throw TerminalCommandError.invalidArguments("--disable-remote does not accept additional arguments.")
+                }
+                _ = try ConfigurationStore().update { configuration in
+                    configuration.process.tunnelDesired = false
+                    configuration.desiredCapabilities["remote.connector"] = false
+                }
+                if try restartRunningSupervisorIfLoaded() {
+                    try await waitForRemoteConnectorToDisappearAsync()
+                } else {
+                    print("Remote connector disabled; it will remain stopped until explicitly enabled.")
+                }
+                return 0
+
+            case "--clear-ngrok-token-if-matches":
+                guard arguments.count == 1 else {
+                    throw TerminalCommandError.invalidArguments(
+                        "--clear-ngrok-token-if-matches reads the candidate value from hidden stdin input."
+                    )
+                }
+                let candidate = try readToken()
+                let removed = try clearNgrokToken(ifMatching: candidate)
+                if removed {
+                    try await waitForRemoteConnectorToDisappearAsync()
+                }
+                print(removed ? "Matching ngrok token removed from Keychain." : "No matching ngrok token was removed.")
+                return 0
+
+            case "--print-connector-url":
+                guard arguments.count == 1 else {
+                    throw TerminalCommandError.invalidArguments("--print-connector-url does not accept additional arguments.")
+                }
+                try await printConnectorURLAsync()
+                return 0
+
+            case "--wait-for-remote-connector":
+                guard arguments.count == 1 else {
+                    throw TerminalCommandError.invalidArguments(
+                        "--wait-for-remote-connector does not accept additional arguments."
+                    )
+                }
+                try await waitForRemoteConnectorAsync()
+                return 0
+
+            case "--rotate-connector-token", "--revoke-connector-token":
+                guard arguments.count == 1 else {
+                    throw TerminalCommandError.invalidArguments(
+                        "\(command) does not accept additional arguments."
+                    )
+                }
+                let receipt = try await rotateConnectorCredentialAsync()
+                print(
+                    "Connector credential rotated to generation \(receipt.generation); " +
+                    "clients require an explicit new handoff."
+                )
+                return 0
+
+            case "--replace-ngrok-token":
+                var failClosed = false
+                for argument in arguments.dropFirst() {
+                    guard argument == "--fail-closed-if-compromised", !failClosed else {
+                        throw TerminalCommandError.invalidArguments(
+                            "Usage: --replace-ngrok-token [--fail-closed-if-compromised]."
+                        )
+                    }
+                    failClosed = true
+                }
+                let candidate = try readToken()
+                try await replaceNgrokCredentialAsync(
+                    candidate: candidate,
+                    failurePolicy: failClosed ? .failClosedIfCompromised : .preserveExistingCredential
+                )
+                print("ngrok credential replacement validated; remote access is being reconciled.")
+                return 0
+
+            default:
+                return run(arguments: arguments)
+            }
+        } catch {
+            fputs("error: \(error.localizedDescription)\n", stderr)
+            return 1
+        }
+    }
+
     static func run(arguments: [String]) -> Int32? {
         guard let command = arguments.first else { return nil }
 
@@ -249,7 +363,7 @@ enum TerminalCommand {
                     configuration.desiredCapabilities["remote.connector"] = true
                 }
                 if try restartRunningSupervisorIfLoaded() {
-                    try waitForRemoteConnector()
+                    print("Remote connector enable request accepted; readiness will be confirmed by the supervisor.")
                 } else {
                     print("Remote connector enabled; it will start after local activation succeeds.")
                 }
@@ -260,11 +374,12 @@ enum TerminalCommand {
                     configuration.desiredCapabilities["remote.connector"] = false
                 }
                 _ = try restartRunningSupervisorIfLoaded()
-                try waitForRemoteConnectorToDisappear()
+                print("Remote connector disable request accepted.")
                 return 0
             case "--print-connector-url":
-                try printConnectorURL()
-                return 0
+                throw TerminalCommandError.invalidArguments(
+                    "--print-connector-url requires the asynchronous command path."
+                )
             case "--wait-for-local-activation":
                 guard arguments.count == 1 else {
                     throw TerminalCommandError.invalidArguments(
@@ -287,8 +402,9 @@ enum TerminalCommand {
                         "--wait-for-remote-connector does not accept additional arguments."
                     )
                 }
-                try waitForRemoteConnector()
-                return 0
+                throw TerminalCommandError.invalidArguments(
+                    "--wait-for-remote-connector requires the asynchronous command path."
+                )
             case "update":
                 return try runUpdate(arguments: Array(arguments.dropFirst()))
             case "uninstall":
@@ -323,10 +439,14 @@ enum TerminalCommand {
               --set-profile full        Select Full Control with --confirm-full-control.
               --enable-remote            Opt in to the ngrok connector after storing a token.
               --disable-remote           Stop requesting remote ingress.
-              --print-connector-url      Confirm the live connector without printing its credential-bearing URL.
+              --print-connector-url      Explicitly print the current authenticated credential-bearing URL and record handoff.
               --wait-for-local-activation Wait for the authenticated local MCP activation oracle.
-              --print-local-connector-url Confirm activation without printing the credential-bearing URL.
+              --print-local-connector-url Confirm local activation without printing the credential-bearing URL.
               --wait-for-remote-connector Wait for a confirmed live HTTPS connector without printing its URL.
+              --rotate-connector-token  Explicitly revoke the current connector credential and require a new handoff.
+              --revoke-connector-token  Alias for explicit connector credential rotation.
+              --replace-ngrok-token     Read a candidate from hidden stdin and validate it before Keychain commit.
+                                        Add --fail-closed-if-compromised for deliberate local fail-closed recovery.
               update [--check|--apply] Check or apply an authenticated release update.
               doctor [--json] [--repair ACTION] Run read-only diagnostics or one explicit bounded repair.
               support-bundle --preview|--create [--output PATH] Review or create a redacted support bundle.
@@ -862,7 +982,7 @@ enum TerminalCommand {
         return url
     }
 
-    private static func restartRunningSupervisorIfLoaded() throws -> Bool {
+    static func restartRunningSupervisorIfLoaded() throws -> Bool {
         if ProcessInfo.processInfo.environment["MAC_ORCHESTRATOR_SKIP_SUPERVISOR_RELOAD"] == "1" {
             return false
         }
@@ -934,11 +1054,6 @@ enum TerminalCommand {
         return trimmed
     }
 
-    private static func printConnectorURL() throws {
-        _ = try currentConnectorURL()
-        print("Remote connector confirmed. Its credential-bearing URL was intentionally not printed.")
-    }
-
     private static func waitForLocalActivation() throws {
         let configuration = try ConfigurationStore().load()
         let connectorToken = try KeychainStore().connectorTokenValue()
@@ -1008,47 +1123,98 @@ enum TerminalCommand {
         print("Use the installed authenticated client handoff to connect; credential-bearing URLs are not printed by the terminal.")
     }
 
-    private static func waitForRemoteConnector() throws {
+    private static func printConnectorURLAsync() async throws {
+        let configuration = try ConfigurationStore().load()
+        let service = RemoteConnectorHandoffService(configuration: configuration)
+        let handoff = try await service.prepare()
+
+        // This is the sole terminal path that deliberately displays the
+        // credential-bearing URL. Persist only the nonsecret receipt after
+        // the display action has happened.
+        print(handoff.url.absoluteString)
+        let classification = try service.record(handoff)
+        print("Connector handoff recorded: \(classification.rawValue).")
+    }
+
+    private static func rotateConnectorCredentialAsync() async throws -> ConnectorCredentialRotationReceipt {
+        let configuration = try ConfigurationStore().load()
+        let stateStore = RemoteConnectorStateStore()
+        let hooks = TerminalConnectorCredentialRotationHooks(
+            configuration: configuration,
+            stateStore: stateStore
+        )
+        return try await ConnectorCredentialRotationTransaction(
+            keychain: KeychainStore(),
+            stateStore: stateStore,
+            hooks: hooks
+        ).execute()
+    }
+
+    private static func replaceNgrokCredentialAsync(
+        candidate: String,
+        failurePolicy: NgrokCredentialFailurePolicy
+    ) async throws {
+        let configuration = try ConfigurationStore().load()
+        let keychain = KeychainStore()
+        let stateStore = RemoteConnectorStateStore()
+        let hooks = TerminalNgrokCredentialReplacementHooks(
+            configuration: configuration,
+            keychain: keychain
+        )
+        let transaction = NgrokCredentialReplacementTransaction(
+            keychain: keychain,
+            hooks: hooks,
+            failurePolicy: failurePolicy,
+            stateStore: stateStore,
+            finisher: hooks
+        )
+        _ = try await transaction.execute(candidate: candidate)
+    }
+
+    private static func waitForRemoteConnectorAsync() async throws {
+        let configuration = try ConfigurationStore().load()
+        let service = RemoteConnectorReadinessService(configuration: configuration)
         let deadline = Date().addingTimeInterval(90)
-        var lastError = "no confirmed HTTPS endpoint was available"
+        var lastError = "authenticated MCP readiness is not available"
         while Date() < deadline {
             do {
-                let url = try currentConnectorURL()
-                _ = url
-                print("Remote connector confirmed.")
-                printClientHandoff()
+                _ = try await service.probe()
+                print("Remote connector ready: authenticated MCP is available.")
                 return
             } catch {
                 lastError = error.localizedDescription
-                Thread.sleep(forTimeInterval: 1)
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
             }
         }
         throw TerminalCommandError.agentRequestFailed(
-            "remote connector did not become live within 90 seconds (\(lastError))."
+            "remote connector did not become ready within 90 seconds (\(lastError))."
         )
     }
 
-    private static func waitForRemoteConnectorToDisappear() throws {
+    private static func waitForRemoteConnectorToDisappearAsync() async throws {
+        let configuration = try ConfigurationStore().load()
+        let adapter = NgrokRemoteConnectorAdapter()
+        let target = "http://127.0.0.1:\(configuration.localMCPPort)"
         let deadline = Date().addingTimeInterval(30)
-        var lastError = "the Agent API did not confirm endpoint removal"
+        var lastError = "the connector endpoint is still present"
+
         while Date() < deadline {
-            do {
-                let data = try requestAgentEndpoints()
-                guard NgrokEndpointParser.isValidResponse(from: data) else {
-                    lastError = "the Agent API returned an invalid endpoint response"
-                    Thread.sleep(forTimeInterval: 1)
-                    continue
-                }
-                if !NgrokEndpointParser.hasLiveHTTPS(from: data) {
-                    print("Remote connector disabled; no live HTTPS endpoint remains.")
-                    return
-                }
-                lastError = "the previous HTTPS endpoint is still present"
-                Thread.sleep(forTimeInterval: 1)
-            } catch {
-                lastError = error.localizedDescription
-                Thread.sleep(forTimeInterval: 1)
+            let inspection = await adapter.inspectAgentAPI()
+            let reconciliation = adapter.reconcileEndpoint(from: inspection, matching: target)
+            switch reconciliation {
+            case .missing, .foreign:
+                print("Remote connector disabled; no matching live HTTPS endpoint remains.")
+                return
+            case .current:
+                lastError = "the matching HTTPS endpoint is still present"
+            case .ambiguous:
+                lastError = "matching HTTPS endpoints are still ambiguous"
+            case .agentAPIUnavailable:
+                lastError = "the local Agent API is unavailable"
+            case .invalidAgentAPIResponse:
+                lastError = "the local Agent API returned an invalid response"
             }
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
         }
         throw TerminalCommandError.agentRequestFailed(
             "remote connector shutdown was not confirmed within 30 seconds (\(lastError))."
@@ -1082,68 +1248,6 @@ enum TerminalCommand {
         }
     }
 
-    private static func currentConnectorURL() throws -> URL {
-        let configuration = try ConfigurationStore().load()
-        let data = try requestAgentEndpoints()
-        let connectorToken = try KeychainStore().connectorTokenValue()
-        guard let publicURL = NgrokEndpointParser.publicURL(
-            from: data,
-            matching: "http://127.0.0.1:\(configuration.localMCPPort)"
-        ),
-        let connectorURL = ConnectorURLBuilder.make(
-            publicURL: publicURL.absoluteString,
-            capabilityToken: connectorToken
-        ) else {
-            throw TerminalCommandError.noLiveConnector
-        }
-        return connectorURL
-    }
-
-    private static func requestAgentEndpoints() throws -> Data {
-        var request = URLRequest(url: URL(string: "http://127.0.0.1:4040/api/endpoints")!)
-        request.timeoutInterval = 3
-
-        let semaphore = DispatchSemaphore(value: 0)
-        let resultLock = NSLock()
-        var result: Result<Data, Error>?
-        NoRedirectURLSession.make().dataTask(with: request) { data, response, error in
-            defer { semaphore.signal() }
-            if let error {
-                resultLock.lock()
-                result = .failure(error)
-                resultLock.unlock()
-                return
-            }
-            guard let httpResponse = response as? HTTPURLResponse,
-                  httpResponse.url == request.url,
-                  httpResponse.statusCode == 200,
-                  let data else {
-                let status = (response as? HTTPURLResponse)?.statusCode ?? -1
-                resultLock.lock()
-                result = .failure(
-                    TerminalCommandError.agentRequestFailed("HTTP status \(status)")
-                )
-                resultLock.unlock()
-                return
-            }
-            resultLock.lock()
-            result = .success(data)
-            resultLock.unlock()
-        }.resume()
-
-        guard semaphore.wait(timeout: .now() + 4) == .success else {
-            throw TerminalCommandError.agentRequestFailed("request timed out")
-        }
-        resultLock.lock()
-        let completedResult = result
-        resultLock.unlock()
-        guard let completedResult else {
-            throw TerminalCommandError.agentRequestFailed("request returned no result")
-        }
-        let data = try completedResult.get()
-        return data
-    }
-
     private static func clearNgrokToken(ifMatching candidate: String) throws -> Bool {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
@@ -1167,9 +1271,7 @@ enum TerminalCommand {
             configuration.desiredCapabilities["remote.connector"] = false
         }
         let supervisorWasReloaded = try restartRunningSupervisorIfLoaded()
-        if supervisorWasReloaded {
-            try waitForRemoteConnectorToDisappear()
-        }
+        _ = supervisorWasReloaded
 
         let deleteQuery: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,

@@ -46,8 +46,9 @@ The installer prints `Local connection ready.` only after the helper has
 passed the exact health, authenticated initialize, tools/list, and safe
 `get_session_state` probe. When Guided Control's UI capability is desired, the
 managed Python requester must also confirm Accessibility, Automation / Apple
-Events, an active console session, and an unlocked screen. It prints the
-confirmed local MCP URL in the terminal. Continue with
+Events, an active console session, and an unlocked screen. Startup/status
+output does not print a credential-bearing URL; use an explicit supported
+client handoff after Remote is authenticated. Continue with
 [client setup](docs/CLIENT_SETUP.md) after that message.
 
 ## Where the installation lives
@@ -91,10 +92,13 @@ the helper requires all of these before publishing the service as running:
 3. a safe authenticated `get_session_state` call.
 
 Only after that probe succeeds may remote ingress start. When remote mode is
-enabled, the helper asks ngrok's local Agent API at `/api/endpoints`, selects a
-live HTTPS endpoint whose upstream matches the owned loopback port, and builds
-the current connector URL from that endpoint. It does not use the deprecated
-`/api/tunnels` route or display a stale URL.
+enabled, the adapter asks ngrok's loopback-only Agent API at `/api/endpoints`,
+selects exactly one live HTTPS endpoint whose upstream matches the owned
+loopback port, and performs an authenticated MCP probe. The probe uses a
+transient credential-bearing request internally and discards it; the URL is
+exposed or recorded as a client handoff only inside the explicit Copy/Show
+action. It does not use the deprecated `/api/tunnels` route or publish a stale
+URL through ordinary status, Doctor, logs, or support bundles.
 
 The connector URL contains the capability token and is a password-like
 credential. It is stored in Keychain, redacted from logs, and never passed in
@@ -155,13 +159,17 @@ interrupted promotion for the next invocation to recover.
 - If UI tools report missing permissions, unlock the Mac, confirm the active
   console session, grant access to the exact installed helper, and verify the
   resulting state. Replacing an ad-hoc helper may require granting it again.
-- If the connector stops working after restart or network change, request the
-  current URL again. Free ngrok endpoints can change, and only the live
-  `/api/endpoints` result is authoritative.
-- If the connector URL may have leaked, disable remote mode immediately. Phase 2
-  does not expose connector credential rotation or revocation; treat the URL as
-  compromised, remove it from every client and trusted copy, and wait for the
-  later supported rotation workflow before re-enabling remote access.
+- If the connector stops working after restart or network change, wait for the
+  authenticated Remote state to recover and use **Copy Connector URL** or
+  `--print-connector-url` again. Free ngrok endpoints can change, and only the
+  live adapter reconciliation is authoritative.
+- If the connector URL may have leaked, disable Remote immediately, remove the
+  old URL from trusted clients, and run the explicit
+  `--rotate-connector-token` action. Then perform a new deliberate handoff.
+- If the ngrok account credential needs replacement, pipe a candidate through
+  hidden stdin with `--replace-ngrok-token`; the candidate is validated before
+  it is committed to Keychain. Use `--fail-closed-if-compromised` only when
+  the old provider credential must not be restored.
 
 Logs are stored under `~/Library/Logs/Mac Orchestrator/`. Redact connector URLs,
 tokens, local file contents, and personal paths before sharing diagnostics.
@@ -187,12 +195,13 @@ For component boundaries, see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 For release gates and the exact publication boundary, see
 [`docs/RELEASING.md`](docs/RELEASING.md).
 
-## Deferred work
+## Release boundary
 
-Phase 2 intentionally does not provide Developer ID signing or notarization,
-DMG packaging, Intel support, Meridian/provider changes, a new retry state
-machine, a doctor, a full updater/rollback product, or mature remote recovery.
-Those are Phase 3/4 or later decisions, not hidden guarantees of this release.
+The Phase 2 release boundary intentionally does not provide Developer ID
+signing or notarization, DMG packaging, Intel support, Meridian/provider
+changes, or provider-side destructive operations. Doctor, authenticated remote
+recovery, and explicit credential transactions are repository Phase 3/4 source
+workflows; a tagged Phase 2 release must not be assumed to contain them.
 
 ## Project documents
 

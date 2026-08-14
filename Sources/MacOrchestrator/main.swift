@@ -1,11 +1,11 @@
 import AppKit
 import Darwin
 
-if let exitCode = TerminalCommand.run(arguments: Array(CommandLine.arguments.dropFirst())) {
+if let exitCode = await TerminalCommand.runAsync(arguments: Array(CommandLine.arguments.dropFirst())) {
     exit(exitCode)
 }
 
-MainActor.assumeIsolated {
+await MainActor.run {
     let application = NSApplication.shared
     let delegate = AppDelegate()
     application.delegate = delegate

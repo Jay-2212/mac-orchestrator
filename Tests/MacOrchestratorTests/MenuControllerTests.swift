@@ -7,7 +7,6 @@ final class MenuControllerTests: XCTestCase {
         let snapshot = ServiceSnapshot(
             server: .running,
             tunnel: .stopped,
-            connectorURL: nil,
             error: "Configuration could not be loaded",
             controlProfile: .full,
             readyCapabilityCount: 7,
@@ -45,7 +44,6 @@ final class MenuControllerTests: XCTestCase {
         var snapshot = ServiceSnapshot(
             server: .running,
             tunnel: .stopped,
-            connectorURL: nil,
             error: nil,
             controlProfile: .guided,
             readyCapabilityCount: 2,

@@ -4,13 +4,19 @@ private struct NgrokEndpointResponse: Decodable {
     let endpoints: [NgrokEndpoint]
 }
 
-struct NgrokEndpoint: Decodable, Equatable, Sendable {
+struct NgrokEndpoint: Decodable, Equatable, Sendable, CustomStringConvertible, CustomDebugStringConvertible {
     let url: String
     let upstream: NgrokEndpointUpstream
+
+    var description: String { "NgrokEndpoint" }
+    var debugDescription: String { description }
 }
 
-struct NgrokEndpointUpstream: Decodable, Equatable, Sendable {
+struct NgrokEndpointUpstream: Decodable, Equatable, Sendable, CustomStringConvertible, CustomDebugStringConvertible {
     let url: String
+
+    var description: String { "NgrokEndpointUpstream" }
+    var debugDescription: String { description }
 }
 
 enum RemoteEndpointReconciliation: Equatable, Sendable {

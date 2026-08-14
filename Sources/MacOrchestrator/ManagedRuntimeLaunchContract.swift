@@ -17,7 +17,7 @@ enum ManagedRuntimeLaunchContractError: Error, LocalizedError, Sendable {
     }
 }
 
-struct ManagedRuntimeLaunchContract: Sendable {
+struct ManagedRuntimeLaunchContract: Sendable, CustomStringConvertible, CustomDebugStringConvertible {
     private static let inheritedNonsecretNames = [
         "PATH",
         "HOME",
@@ -42,6 +42,9 @@ struct ManagedRuntimeLaunchContract: Sendable {
     let environment: [String: String]
     let redactedSecrets: [String]
     let ngrokAuthtoken: String?
+
+    var description: String { "ManagedRuntimeLaunchContract" }
+    var debugDescription: String { description }
 
     var healthURL: URL {
         URL(string: "http://127.0.0.1:\(port)/__mac_orchestrator_health")!

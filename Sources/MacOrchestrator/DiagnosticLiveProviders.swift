@@ -1038,7 +1038,8 @@ struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
                 managedProcessState: processState
             ), ngrokAuthtokenPresence: authPresence)
         }
-        let url = URL(string: "http://127.0.0.1:4040/api/endpoints")!
+        let url = NgrokRemoteConnectorAdapter.defaultAgentAPIBaseURL
+            .appendingPathComponent("endpoints")
         guard let response = try? httpRunner.get(url), response.status == 200, response.url == url else {
             return RemoteConnectorInspection(facts: RemoteConnectorFacts(
                 desired: true,

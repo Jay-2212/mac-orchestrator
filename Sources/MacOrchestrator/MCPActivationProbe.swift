@@ -77,10 +77,47 @@ enum MCPActivationProtocolError: Error, Equatable, Sendable {
     case interactiveUIUnavailable
 }
 
+extension MCPActivationProtocolError: CustomStringConvertible, CustomDebugStringConvertible {
+    var description: String {
+        switch self {
+        case .transport:
+            return "MCPActivationProtocolError.transport"
+        case .redirectedResponse:
+            return "MCPActivationProtocolError.redirectedResponse"
+        case let .requestFailed(method, status):
+            return "MCPActivationProtocolError.requestFailed(\(method), \(status))"
+        case let .responseInvalid(method):
+            return "MCPActivationProtocolError.responseInvalid(\(method))"
+        case let .mcpError(method, _):
+            return "MCPActivationProtocolError.mcpError(\(method))"
+        case .missingSessionID:
+            return "MCPActivationProtocolError.missingSessionID"
+        case .invalidSessionID:
+            return "MCPActivationProtocolError.invalidSessionID"
+        case .missingRequiredTool:
+            return "MCPActivationProtocolError.missingRequiredTool"
+        case .unexpectedToolInventory:
+            return "MCPActivationProtocolError.unexpectedToolInventory"
+        case .safeCallFailed:
+            return "MCPActivationProtocolError.safeCallFailed"
+        case .interactiveUIUnavailable:
+            return "MCPActivationProtocolError.interactiveUIUnavailable"
+        }
+    }
+
+    var debugDescription: String {
+        description
+    }
+}
+
 struct MCPActivationProtocolEngine: Sendable {
     private static let protocolVersion = "2025-06-18"
     private static let clientName = "mac-orchestrator-bootstrap"
     private static let clientVersion = "2.0"
+    private static let maximumResponseBytes = 1_048_576
+    private static let integerJSONNumberTypes: Set<String> = [
+        "i", "s", "l", "q", "I", "S", "L", "Q",
+    ]
 
     private let configuration: MCPActivationProtocolConfiguration
 
@@ -219,6 +256,9 @@ struct MCPActivationProtocolEngine: Sendable {
             guard httpResponse.url == configuration.endpoint else {
                 throw MCPActivationProtocolError.redirectedResponse
             }
+            guard data.count <= Self.maximumResponseBytes else {
+                throw MCPActivationProtocolError.responseInvalid(method: method)
+            }
             var headers: [String: String] = [:]
             for (key, value) in httpResponse.allHeaderFields {
                 guard let key = key as? String, let value = value as? String else { continue }
@@ -262,8 +302,7 @@ struct MCPActivationProtocolEngine: Sendable {
             throw MCPActivationProtocolError.responseInvalid(method: method)
         }
         guard object["jsonrpc"] as? String == "2.0",
-              let responseID = object["id"] as? NSNumber,
-              responseID.intValue == expectedID else {
+              Self.hasExactIntegerID(object["id"], matching: expectedID) else {
             throw MCPActivationProtocolError.responseInvalid(method: method)
         }
         if let error = object["error"] as? [String: Any] {
@@ -291,8 +330,7 @@ struct MCPActivationProtocolEngine: Sendable {
             throw MCPActivationProtocolError.responseInvalid(method: "tools/call")
         }
         guard object["jsonrpc"] as? String == "2.0",
-              let responseID = object["id"] as? NSNumber,
-              responseID.intValue == expectedID else {
+              Self.hasExactIntegerID(object["id"], matching: expectedID) else {
             throw MCPActivationProtocolError.responseInvalid(method: "tools/call")
         }
         if let error = object["error"] as? [String: Any] {
@@ -336,8 +374,7 @@ struct MCPActivationProtocolEngine: Sendable {
             throw MCPActivationProtocolError.responseInvalid(method: "tools/list")
         }
         guard object["jsonrpc"] as? String == "2.0",
-              let responseID = object["id"] as? NSNumber,
-              responseID.intValue == expectedID else {
+              Self.hasExactIntegerID(object["id"], matching: expectedID) else {
             throw MCPActivationProtocolError.responseInvalid(method: "tools/list")
         }
         if let error = object["error"] as? [String: Any] {
@@ -371,6 +408,16 @@ struct MCPActivationProtocolEngine: Sendable {
             }
         }
         return names
+    }
+
+    private static func hasExactIntegerID(_ value: Any?, matching expected: Int) -> Bool {
+        guard let number = value as? NSNumber,
+              integerJSONNumberTypes.contains(String(cString: number.objCType)),
+              number.intValue == expected,
+              number.doubleValue == Double(expected) else {
+            return false
+        }
+        return true
     }
 
     private static func jsonObject(from data: Data) -> [String: Any]? {

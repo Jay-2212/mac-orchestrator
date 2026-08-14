@@ -26,7 +26,7 @@ final class RemoteConnectorAdapterTests: XCTestCase {
     }
 
     func testCustomAgentAPIBaseAddressIsUsedForEndpointInspection() async throws {
-        let customBase = URL(string: "http://127.0.0.1:5050/custom/api")!
+        let customBase = URL(string: "http://127.0.0.1:5050/api")!
         ConnectorAgentAPIURLProtocol.handler = { request in
             XCTAssertEqual(request.url, customBase.appendingPathComponent("endpoints"))
             XCTAssertEqual(request.httpMethod, "GET")
@@ -76,6 +76,88 @@ final class RemoteConnectorAdapterTests: XCTestCase {
         let inspection = await adapter.inspectAgentAPI()
 
         XCTAssertEqual(inspection, .invalidResponse)
+    }
+
+    func testRejectsNonLoopbackAgentAPIHosts() {
+        for value in [
+            "http://attacker.example/api",
+            "http://192.168.1.8:4040/api",
+        ] {
+            XCTAssertThrowsError(try AgentAPIAddress(URL(string: value)!))
+        }
+    }
+
+    func testAcceptsLoopbackAgentAPIWithCustomPort() throws {
+        let address = try AgentAPIAddress(URL(string: "http://127.0.0.1:5050/api")!)
+
+        XCTAssertEqual(address.url.absoluteString, "http://127.0.0.1:5050/api")
+    }
+
+    func testRejectsAgentAPIUserinfoQueryFragmentAndForeignPath() {
+        for value in [
+            "http://user:password@127.0.0.1/api",
+            "http://127.0.0.1/api?token=secret",
+            "http://127.0.0.1/api#fragment",
+            "http://127.0.0.1/other",
+        ] {
+            XCTAssertThrowsError(try AgentAPIAddress(URL(string: value)!))
+        }
+    }
+
+    func testRejectsPublicOriginUserinfoPathQueryAndFragment() {
+        for value in [
+            "https://user:password@example.ngrok.app",
+            "https://example.ngrok.app/mcp",
+            "https://example.ngrok.app?token=secret",
+            "https://example.ngrok.app#fragment",
+        ] {
+            XCTAssertThrowsError(try RemotePublicOrigin(value))
+        }
+    }
+
+    func testInjectedAgentAPISessionCannotFollowRedirects() async {
+        ConnectorAgentAPIURLProtocol.handler = { request in
+            .init(
+                status: 200,
+                body: Data(#"{"endpoints":[]}"#.utf8),
+                responseURL: URL(string: "http://attacker.example/api/endpoints")
+            )
+        }
+
+        let inspection = await NgrokRemoteConnectorAdapter(session: Self.makeSession()).inspectAgentAPI()
+
+        XCTAssertEqual(inspection, .unavailable)
+    }
+
+    func testOversizedAgentAPIResponseIsRejectedBeforeDecoding() async {
+        ConnectorAgentAPIURLProtocol.handler = { _ in
+            .init(status: 200, body: Data(repeating: 0x20, count: 1_048_577))
+        }
+
+        let inspection = await NgrokRemoteConnectorAdapter(session: Self.makeSession()).inspectAgentAPI()
+
+        XCTAssertEqual(inspection, .invalidResponse)
+    }
+
+    func testSecretBearingAdapterInputsHaveSafeDescriptions() {
+        let canary = "adapter-secret-canary"
+        let prerequisite = RemoteConnectorPrerequisiteInput(
+            executableURL: URL(fileURLWithPath: "/support/ngrok"),
+            configurationURL: URL(fileURLWithPath: "/support/ngrok.yml"),
+            authenticationToken: canary
+        )
+        let launch = RemoteConnectorLaunchInput(
+            executableURL: URL(fileURLWithPath: "/support/ngrok"),
+            configurationURL: URL(fileURLWithPath: "/support/ngrok.yml"),
+            tunnelTarget: "http://127.0.0.1:8000",
+            ownerID: "owner-123",
+            environment: ["TOKEN": canary],
+            authenticationToken: canary
+        )
+
+        for value in [String(describing: prerequisite), String(reflecting: prerequisite), String(describing: launch), String(reflecting: launch)] {
+            XCTAssertFalse(value.contains(canary))
+        }
     }
 
     func testLaunchSpecificationPreservesNgrokProductionInputsWithoutLifecycleOwnership() throws {

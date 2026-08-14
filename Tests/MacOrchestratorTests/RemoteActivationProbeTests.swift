@@ -111,6 +111,49 @@ final class RemoteActivationProbeTests: XCTestCase {
         XCTAssertEqual(outcome.error, .invalidSessionID)
     }
 
+    func testBooleanJSONRPCIDFailsReadiness() async {
+        RemoteActivationURLProtocol.handler = { _ in
+            .init(
+                status: 200,
+                body: Self.rpcResult(["protocolVersion": "2025-06-18"], id: true),
+                headers: ["Mcp-Session-Id": "remote-session"]
+            )
+        }
+
+        let outcome = await makeProbe().runOutcome()
+
+        XCTAssertEqual(outcome.phase, .initialize)
+        XCTAssertEqual(outcome.error, .mcpResponseInvalid(method: "initialize"))
+    }
+
+    func testFractionalJSONRPCIDFailsReadiness() async {
+        RemoteActivationURLProtocol.handler = { _ in
+            .init(
+                status: 200,
+                body: Self.rpcResult(["protocolVersion": "2025-06-18"], id: 1.5),
+                headers: ["Mcp-Session-Id": "remote-session"]
+            )
+        }
+
+        let outcome = await makeProbe().runOutcome()
+
+        XCTAssertEqual(outcome.phase, .initialize)
+        XCTAssertEqual(outcome.error, .mcpResponseInvalid(method: "initialize"))
+    }
+
+    func testOversizedMCPResponseFailsReadiness() async {
+        RemoteActivationURLProtocol.handler = { request in
+            let payload = try XCTUnwrap(Self.jsonBody(from: request))
+            XCTAssertEqual(payload["method"] as? String, "initialize")
+            return .init(status: 200, body: Data(repeating: 0x20, count: 1_048_577), headers: ["Mcp-Session-Id": "remote-session"])
+        }
+
+        let outcome = await makeProbe().runOutcome()
+
+        XCTAssertEqual(outcome.phase, .initialize)
+        XCTAssertEqual(outcome.error, .mcpResponseInvalid(method: "initialize"))
+    }
+
     func testInitializedNonSuccessFailsReadiness() async {
         RemoteActivationURLProtocol.handler = { request in
             let payload = try XCTUnwrap(Self.jsonBody(from: request))
@@ -322,7 +365,7 @@ final class RemoteActivationProbeTests: XCTestCase {
         return try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
     }
 
-    private static func rpcResult(_ result: [String: Any], id: Int) -> Data {
+    private static func rpcResult(_ result: [String: Any], id: Any) -> Data {
         try! JSONSerialization.data(withJSONObject: [
             "jsonrpc": "2.0",
             "id": id,

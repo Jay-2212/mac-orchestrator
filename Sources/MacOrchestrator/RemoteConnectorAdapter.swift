@@ -4,7 +4,63 @@ enum RemoteConnectorProvider: String, Codable, Equatable, Sendable {
     case ngrok
 }
 
-struct RemoteConnectorPrerequisiteInput: Sendable {
+enum AgentAPIAddressError: Error, Equatable, LocalizedError, Sendable {
+    case invalid
+
+    var errorDescription: String? {
+        "The remote connector Agent API address is invalid."
+    }
+}
+
+/// A validated, loopback-only address for the local ngrok Agent API.
+struct AgentAPIAddress: Equatable, Hashable, Sendable, CustomStringConvertible, CustomDebugStringConvertible {
+    let url: URL
+
+    init(_ url: URL) throws {
+        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              components.scheme?.lowercased() == "http",
+              let host = components.host,
+              Self.isLoopbackHost(host),
+              components.user == nil,
+              components.password == nil,
+              components.query == nil,
+              components.fragment == nil,
+              components.path == "/api",
+              components.percentEncodedPath == "/api",
+              components.port == nil || (1...65_535).contains(components.port ?? 0),
+              let sanitizedURL = components.url else {
+            throw AgentAPIAddressError.invalid
+        }
+        self.url = sanitizedURL
+    }
+
+    var description: String {
+        "AgentAPIAddress"
+    }
+
+    var debugDescription: String {
+        description
+    }
+
+    private static func isLoopbackHost(_ host: String) -> Bool {
+        let normalized = host
+            .lowercased()
+            .trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+        if normalized == "localhost" || normalized == "::1" {
+            return true
+        }
+
+        let octets = normalized.split(separator: ".")
+        guard octets.count == 4,
+              octets.allSatisfy({ $0.allSatisfy(\.isNumber) }),
+              let first = Int(octets[0]) else {
+            return false
+        }
+        return first == 127 && octets.dropFirst().allSatisfy { Int($0) != nil && (0...255).contains(Int($0)!) }
+    }
+}
+
+struct RemoteConnectorPrerequisiteInput: Sendable, CustomStringConvertible, CustomDebugStringConvertible {
     let executableURL: URL
     let configurationURL: URL
     let authenticationToken: String?
@@ -17,6 +73,14 @@ struct RemoteConnectorPrerequisiteInput: Sendable {
         self.executableURL = executableURL
         self.configurationURL = configurationURL
         self.authenticationToken = authenticationToken
+    }
+
+    var description: String {
+        "RemoteConnectorPrerequisiteInput"
+    }
+
+    var debugDescription: String {
+        description
     }
 }
 
@@ -34,7 +98,7 @@ struct RemoteConnectorPrerequisiteReport: Equatable, Sendable {
     }
 }
 
-struct RemoteConnectorLaunchInput: Sendable {
+struct RemoteConnectorLaunchInput: Sendable, CustomStringConvertible, CustomDebugStringConvertible {
     let executableURL: URL
     let configurationURL: URL
     let tunnelTarget: String
@@ -56,6 +120,14 @@ struct RemoteConnectorLaunchInput: Sendable {
         self.ownerID = ownerID
         self.environment = environment
         self.authenticationToken = authenticationToken
+    }
+
+    var description: String {
+        "RemoteConnectorLaunchInput"
+    }
+
+    var debugDescription: String {
+        description
     }
 }
 
@@ -133,15 +205,16 @@ protocol RemoteConnectorAdapter: Sendable {
 
 struct NgrokRemoteConnectorAdapter: RemoteConnectorAdapter, Sendable {
     static let defaultAgentAPIBaseURL = URL(string: "http://127.0.0.1:4040/api")!
+    static let maximumAgentAPIResponseBytes = 1_048_576
 
-    let agentAPIBaseURL: URL
+    private let agentAPIAddress: AgentAPIAddress?
     private let session: URLSession
 
     init(
         agentAPIBaseURL: URL = Self.defaultAgentAPIBaseURL,
         session: URLSession = NoRedirectURLSession.make()
     ) {
-        self.agentAPIBaseURL = agentAPIBaseURL
+        self.agentAPIAddress = try? AgentAPIAddress(agentAPIBaseURL)
         self.session = session
     }
 
@@ -156,7 +229,7 @@ struct NgrokRemoteConnectorAdapter: RemoteConnectorAdapter, Sendable {
             configurationAvailable: input.configurationURL.isFileURL
                 && FileManager.default.fileExists(atPath: input.configurationURL.path),
             authenticationConfigured: Self.hasValue(input.authenticationToken),
-            agentAPIBaseURLValid: Self.isValidAgentAPIBaseURL(agentAPIBaseURL)
+            agentAPIBaseURLValid: agentAPIAddress != nil
         )
     }
 
@@ -195,10 +268,10 @@ struct NgrokRemoteConnectorAdapter: RemoteConnectorAdapter, Sendable {
     }
 
     func inspectAgentAPI() async -> RemoteConnectorAgentAPIInspection {
-        guard Self.isValidAgentAPIBaseURL(agentAPIBaseURL) else {
+        guard let agentAPIAddress else {
             return .unavailable
         }
-        let endpointURL = agentAPIBaseURL.appendingPathComponent("endpoints")
+        let endpointURL = agentAPIAddress.url.appendingPathComponent("endpoints")
         var request = URLRequest(url: endpointURL)
         request.httpMethod = "GET"
         request.timeoutInterval = 1
@@ -210,6 +283,9 @@ struct NgrokRemoteConnectorAdapter: RemoteConnectorAdapter, Sendable {
                   httpResponse.url == endpointURL,
                   httpResponse.statusCode == 200 else {
                 return .unavailable
+            }
+            guard data.count <= Self.maximumAgentAPIResponseBytes else {
+                return .invalidResponse
             }
             guard let endpoints = NgrokEndpointParser.endpoints(from: data) else {
                 return .invalidResponse
@@ -293,20 +369,5 @@ struct NgrokRemoteConnectorAdapter: RemoteConnectorAdapter, Sendable {
     private static func hasValue(_ value: String?) -> Bool {
         guard let value else { return false }
         return !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    }
-
-    private static func isValidAgentAPIBaseURL(_ url: URL) -> Bool {
-        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
-              let scheme = components.scheme?.lowercased(),
-              scheme == "http" || scheme == "https",
-              let host = components.host,
-              !host.isEmpty,
-              components.user == nil,
-              components.password == nil,
-              components.query == nil,
-              components.fragment == nil else {
-            return false
-        }
-        return true
     }
 }

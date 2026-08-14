@@ -55,6 +55,20 @@ final class NgrokSupportTests: XCTestCase {
         )
     }
 
+    func testEndpointWithTwoExactMatchesIsAmbiguousEvenWhenOneURLIsInvalid() {
+        let data = Data(
+            #"{"endpoints":[{"url":"not-a-url","upstream":{"url":"http://127.0.0.1:8000"}},{"url":"https://two.ngrok.app","upstream":{"url":"http://127.0.0.1:8000"}}]}"#.utf8
+        )
+
+        XCTAssertEqual(
+            NgrokEndpointParser.reconcile(
+                from: data,
+                matching: "http://127.0.0.1:8000"
+            ),
+            .ambiguous
+        )
+    }
+
     func testEndpointReconciliationReturnsInvalidForMalformedAgentAPIResponse() {
         XCTAssertEqual(
             NgrokEndpointParser.reconcile(

@@ -32,29 +32,28 @@ struct RemotePublicOrigin: Codable, Equatable, Hashable, Sendable {
             throw RemotePublicOriginError.invalid
         }
 
-        if trimmed.contains("://") {
-            guard let url = URL(string: trimmed),
-                  url.scheme?.lowercased() == "https",
-                  let host = url.host, !host.isEmpty,
-                  url.user == nil,
-                  url.password == nil,
-                  url.query == nil,
-                  url.fragment == nil,
-                  url.path.isEmpty || url.path == "/",
-                  host.contains("."),
-                  !trimmed.contains("@") else {
-                throw RemotePublicOriginError.invalid
-            }
-        } else {
-            guard trimmed.contains("."),
-                  trimmed.range(
-                of: #"^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,250}[A-Za-z0-9])?$"#,
-                options: .regularExpression
-            ) != nil else {
-                throw RemotePublicOriginError.invalid
-            }
+        guard let components = URLComponents(string: trimmed),
+              components.scheme?.lowercased() == "https",
+              let host = components.host,
+              !host.isEmpty,
+              host.contains("."),
+              components.user == nil,
+              components.password == nil,
+              components.query == nil,
+              components.fragment == nil,
+              components.path.isEmpty || components.path == "/",
+              components.percentEncodedPath.isEmpty || components.percentEncodedPath == "/",
+              components.port == nil || components.port == 443,
+              components.url != nil else {
+            throw RemotePublicOriginError.invalid
         }
-        self.value = trimmed
+
+        var canonical = components
+        canonical.scheme = "https"
+        canonical.host = host.lowercased()
+        canonical.path = ""
+        canonical.percentEncodedPath = ""
+        self.value = canonical.url?.absoluteString ?? trimmed
     }
 
     init(from decoder: Decoder) throws {

@@ -93,16 +93,26 @@ enum PortSafetyPolicy {
 
 enum ConnectorURLBuilder {
     static func make(publicURL: String, capabilityToken: String) -> URL? {
-        guard publicURL.hasPrefix("https://"),
-              let base = URL(string: publicURL),
+        guard let origin = try? RemotePublicOrigin(publicURL) else {
+            return nil
+        }
+        return make(publicOrigin: origin, capabilityToken: capabilityToken)
+    }
+
+    static func make(publicOrigin: RemotePublicOrigin, capabilityToken: String) -> URL? {
+        let allowedTokenCharacters = CharacterSet.alphanumerics
+            .union(CharacterSet(charactersIn: "-_.~"))
+        guard !capabilityToken.isEmpty,
+              capabilityToken.unicodeScalars.allSatisfy(allowedTokenCharacters.contains),
               var components = URLComponents(
-                  url: base,
-                  resolvingAgainstBaseURL: false
+                  string: publicOrigin.value
               ) else {
             return nil
         }
 
         components.path = "/\(capabilityToken)/mcp"
+        components.query = nil
+        components.fragment = nil
         return components.url
     }
 }

@@ -23,21 +23,25 @@ enum RemoteEndpointReconciliation: Equatable, Sendable {
 }
 
 enum NgrokEndpointParser {
+    static let maximumResponseBytes = 1_048_576
+
     static func isValidResponse(from data: Data) -> Bool {
-        (try? JSONDecoder().decode(NgrokEndpointResponse.self, from: data)) != nil
+        guard data.count <= maximumResponseBytes else { return false }
+        return (try? JSONDecoder().decode(NgrokEndpointResponse.self, from: data)) != nil
     }
 
     static func endpoints(from data: Data) -> [NgrokEndpoint]? {
-        try? JSONDecoder().decode(NgrokEndpointResponse.self, from: data).endpoints
+        guard data.count <= maximumResponseBytes else { return nil }
+        return try? JSONDecoder().decode(NgrokEndpointResponse.self, from: data).endpoints
     }
 
     static func hasLiveHTTPS(from data: Data) -> Bool {
+        guard data.count <= maximumResponseBytes else { return false }
         guard let response = try? JSONDecoder().decode(NgrokEndpointResponse.self, from: data) else {
             return false
         }
         return response.endpoints.contains { endpoint in
-            guard let url = URL(string: endpoint.url) else { return false }
-            return url.scheme?.lowercased() == "https" && url.host != nil
+            (try? RemotePublicOrigin(endpoint.url)) != nil
         }
     }
 
@@ -45,6 +49,9 @@ enum NgrokEndpointParser {
         from data: Data,
         matching target: String
     ) -> RemoteEndpointReconciliation {
+        guard data.count <= maximumResponseBytes else {
+            return .invalidAgentAPIResponse
+        }
         guard let response = try? JSONDecoder().decode(NgrokEndpointResponse.self, from: data) else {
             return .invalidAgentAPIResponse
         }
@@ -67,19 +74,15 @@ enum NgrokEndpointParser {
             return .foreign
         }
 
-        let publicURLs = matching.compactMap { endpoint -> URL? in
-            guard let url = URL(string: endpoint.url),
-                  url.scheme?.lowercased() == "https",
-                  url.host != nil else {
-                return nil
-            }
-            return url
-        }
-        guard publicURLs.count == matching.count else {
-            return .invalidAgentAPIResponse
-        }
-        guard publicURLs.count == 1, let publicURL = publicURLs.first else {
+        // Ambiguity is established from the complete exact-upstream match set
+        // before validating public URLs. One malformed match must not make a
+        // second exact match look like a unique current endpoint.
+        guard matching.count == 1, let endpoint = matching.first else {
             return .ambiguous
+        }
+        guard let origin = try? RemotePublicOrigin(endpoint.url),
+              let publicURL = URL(string: origin.value) else {
+            return .invalidAgentAPIResponse
         }
         return .current(publicURL: publicURL)
     }
@@ -100,8 +103,6 @@ enum NgrokEndpointParser {
         components.scheme = components.scheme?.lowercased()
         components.host = components.host?.lowercased()
         components.path = components.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        components.query = nil
-        components.fragment = nil
         return components.string ?? address
     }
 }

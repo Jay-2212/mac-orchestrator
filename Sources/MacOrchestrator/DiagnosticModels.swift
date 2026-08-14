@@ -22,6 +22,22 @@ enum RepairActionID: String, Codable, Sendable {
     case reconfigureRemoteClients
 }
 
+struct RemoteConnectorIdentityFacts: Codable, Equatable, Sendable {
+    let connectorCredentialGeneration: UInt64
+    let verifiedPublicOrigin: RemotePublicOrigin?
+    let clientHandoff: RemoteClientHandoffClassification
+
+    init(
+        connectorCredentialGeneration: UInt64 = 0,
+        verifiedPublicOrigin: RemotePublicOrigin? = nil,
+        clientHandoff: RemoteClientHandoffClassification = .notAvailable
+    ) {
+        self.connectorCredentialGeneration = connectorCredentialGeneration
+        self.verifiedPublicOrigin = verifiedPublicOrigin
+        self.clientHandoff = clientHandoff
+    }
+}
+
 struct RepairActionDescriptor: Codable, Equatable, Sendable {
     let id: RepairActionID
     let title: String

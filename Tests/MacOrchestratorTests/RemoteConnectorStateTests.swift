@@ -23,10 +23,14 @@ final class RemoteConnectorStateTests: XCTestCase {
         let store = RemoteConnectorStateStore(directoryURL: directory)
         var state = try store.loadOrCreate(provider: .ngrok)
         state.connectorCredentialGeneration = 1
-        state.lastConnectorHandoffGeneration = 1
         state.lastRemoteResult = .ready
         state.lastVerifiedPublicOrigin = try RemotePublicOrigin("https://example.ngrok.app")
         state.lastSuccessfulRemoteProbeAt = Date(timeIntervalSince1970: 1_700_000_000)
+        state.handoffReceipt = RemoteConnectorHandoffReceipt(
+            connectorCredentialGeneration: 1,
+            publicOrigin: try RemotePublicOrigin("https://example.ngrok.app"),
+            handedOffAt: Date(timeIntervalSince1970: 1_700_000_001)
+        )
 
         try store.save(state)
         let loaded = try XCTUnwrap(try store.load())
@@ -129,15 +133,69 @@ final class RemoteConnectorStateTests: XCTestCase {
         let store = RemoteConnectorStateStore(directoryURL: directory)
         var first = try store.loadOrCreate(provider: .ngrok)
         first.connectorCredentialGeneration = 2
-        first.lastConnectorHandoffGeneration = 2
         try store.save(first)
         var lower = first
         lower.connectorCredentialGeneration = 1
-        lower.lastConnectorHandoffGeneration = 1
 
         XCTAssertThrowsError(try store.save(lower)) { error in
             XCTAssertEqual(error as? RemoteConnectorStateStoreError, .generationRegression)
         }
+    }
+
+    func testFreshStateHasNoReceiptAndReadyDoesNotRequireCurrentHandoff() throws {
+        let fresh = RemoteConnectorStateV1.fresh(provider: .ngrok)
+        XCTAssertEqual(fresh.connectorCredentialGeneration, 0)
+        XCTAssertNil(fresh.handoffReceipt)
+        XCTAssertEqual(fresh.clientHandoffClassification, .notAvailable)
+
+        var ready = fresh
+        ready.connectorCredentialGeneration = 1
+        ready.lastVerifiedPublicOrigin = try RemotePublicOrigin("https://example.ngrok.app")
+        ready.lastSuccessfulRemoteProbeAt = Date(timeIntervalSince1970: 1_700_000_000)
+        ready.lastRemoteResult = .ready
+
+        XCTAssertNoThrow(try ready.validated())
+        XCTAssertEqual(ready.clientHandoffClassification, .notAvailable)
+    }
+
+    func testReceiptClassificationTracksGenerationAndOriginIndependentlyOfReadiness() throws {
+        let firstOrigin = try RemotePublicOrigin("https://one.ngrok.app")
+        let secondOrigin = try RemotePublicOrigin("https://two.ngrok.app")
+        let receipt = RemoteConnectorHandoffReceipt(
+            connectorCredentialGeneration: 1,
+            publicOrigin: firstOrigin,
+            handedOffAt: Date(timeIntervalSince1970: 1_700_000_000)
+        )
+        var state = try RemoteConnectorStateV1(
+            provider: .ngrok,
+            connectorCredentialGeneration: 1,
+            lastVerifiedPublicOrigin: firstOrigin,
+            lastSuccessfulRemoteProbeAt: Date(timeIntervalSince1970: 1_700_000_001),
+            lastRemoteResult: .ready,
+            handoffReceipt: receipt
+        )
+
+        XCTAssertEqual(state.clientHandoffClassification, .unchanged)
+
+        state.connectorCredentialGeneration = 2
+        XCTAssertEqual(state.clientHandoffClassification, .changed)
+
+        state.connectorCredentialGeneration = 1
+        state.lastVerifiedPublicOrigin = secondOrigin
+        XCTAssertEqual(state.clientHandoffClassification, .changed)
+        XCTAssertNoThrow(try state.validated())
+    }
+
+    func testLegacyScalarHandoffDecodesAsNoReceipt() throws {
+        let data = Data(
+            #"{"schemaVersion":1,"provider":"ngrok","connectorCredentialGeneration":2,"pendingConnectorCredentialGeneration":null,"recoveryPhase":"stable","lastVerifiedPublicOrigin":"https://example.ngrok.app","lastSuccessfulRemoteProbeAt":"2023-11-14T22:13:20Z","lastRemoteResult":"ready","lastConnectorHandoffGeneration":2}"#.utf8
+        )
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let state = try decoder.decode(RemoteConnectorStateV1.self, from: data)
+
+        XCTAssertNil(state.handoffReceipt)
+        XCTAssertEqual(state.clientHandoffClassification, .notAvailable)
     }
 
     private func makeTemporaryDirectory(file: StaticString = #filePath, line: UInt = #line) throws -> URL {

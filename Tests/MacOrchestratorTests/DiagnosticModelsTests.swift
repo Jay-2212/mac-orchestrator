@@ -149,6 +149,22 @@ final class DiagnosticModelsTests: XCTestCase {
         XCTAssertEqual(RemoteAuthenticatedMCPFacts().state, .notRun)
     }
 
+    func testRemoteConnectorIdentityFactsKeepServiceAndHandoffIndependent() throws {
+        let identity = RemoteConnectorIdentityFacts(
+            connectorCredentialGeneration: 3,
+            verifiedPublicOrigin: try RemotePublicOrigin("https://example.ngrok.app"),
+            clientHandoff: .changed
+        )
+
+        let decoded = try JSONDecoder().decode(
+            RemoteConnectorIdentityFacts.self,
+            from: JSONEncoder().encode(identity)
+        )
+
+        XCTAssertEqual(decoded, identity)
+        XCTAssertEqual(decoded.clientHandoff, .changed)
+    }
+
     func testRemoteFactsSerializeOnlyTypedNonsecretEvidence() throws {
         let token = "capability-secret-123456789"
         let url = "https://assigned.ngrok-free.app/capability-secret-123456789/mcp"

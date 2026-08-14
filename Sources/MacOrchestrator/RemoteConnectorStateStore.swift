@@ -9,6 +9,7 @@ enum RemoteConnectorStateStoreError: Error, Equatable, LocalizedError, Sendable 
     case unsafePermissions
     case providerMismatch
     case generationRegression
+    case staleHandoff
     case readFailed
     case writeFailed
 
@@ -28,6 +29,8 @@ enum RemoteConnectorStateStoreError: Error, Equatable, LocalizedError, Sendable 
             return "Remote connector state belongs to a different provider."
         case .generationRegression:
             return "Remote connector state generation would move backwards."
+        case .staleHandoff:
+            return "The connector handoff does not match current authenticated state."
         case .readFailed:
             return "Remote connector state could not be read safely."
         case .writeFailed:
@@ -41,6 +44,40 @@ protocol RemoteConnectorStatePersisting {
     func loadOrCreate(provider: RemoteConnectorProvider) throws -> RemoteConnectorStateV1
     @discardableResult
     func save(_ state: RemoteConnectorStateV1) throws -> RemoteConnectorStateV1
+    @discardableResult
+    func recordHandoff(
+        generation: UInt64,
+        origin: RemotePublicOrigin,
+        at date: Date
+    ) throws -> RemoteConnectorStateV1
+}
+
+extension RemoteConnectorStatePersisting {
+    @discardableResult
+    func recordHandoff(
+        generation: UInt64,
+        origin: RemotePublicOrigin,
+        at date: Date
+    ) throws -> RemoteConnectorStateV1 {
+        throw RemoteConnectorStateStoreError.staleHandoff
+    }
+
+    @discardableResult
+    func recordHandoff(
+        generation: UInt64,
+        origin: RemotePublicOrigin
+    ) throws -> RemoteConnectorStateV1 {
+        try recordHandoff(generation: generation, origin: origin, at: Date())
+    }
+
+    @discardableResult
+    func recordHandoff(
+        connectorCredentialGeneration: UInt64,
+        publicOrigin: RemotePublicOrigin,
+        handedOffAt date: Date = Date()
+    ) throws -> RemoteConnectorStateV1 {
+        try recordHandoff(generation: connectorCredentialGeneration, origin: publicOrigin, at: date)
+    }
 }
 
 final class RemoteConnectorStateStore: RemoteConnectorStatePersisting {
@@ -106,6 +143,40 @@ final class RemoteConnectorStateStore: RemoteConnectorStatePersisting {
         let existing = try loadUnlocked()
         try persistUnlocked(candidate, existing: existing)
         return candidate
+    }
+
+    @discardableResult
+    func recordHandoff(
+        generation: UInt64,
+        origin: RemotePublicOrigin,
+        at date: Date = Date()
+    ) throws -> RemoteConnectorStateV1 {
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard let current = try loadUnlocked(),
+              current.recoveryPhase == .stable,
+              current.pendingConnectorCredentialGeneration == nil,
+              current.lastRemoteResult == .ready,
+              current.lastSuccessfulRemoteProbeAt != nil,
+              current.connectorCredentialGeneration == generation,
+              current.lastVerifiedPublicOrigin == origin else {
+            throw RemoteConnectorStateStoreError.staleHandoff
+        }
+
+        var candidate = current
+        candidate.handoffReceipt = RemoteConnectorHandoffReceipt(
+            connectorCredentialGeneration: generation,
+            publicOrigin: origin,
+            handedOffAt: date
+        )
+        let validatedCandidate = try validated(candidate)
+        try persistUnlocked(
+            validatedCandidate,
+            existing: current,
+            allowHandoffReplacement: true
+        )
+        return validatedCandidate
     }
 
     @discardableResult
@@ -194,14 +265,26 @@ final class RemoteConnectorStateStore: RemoteConnectorStatePersisting {
 
     private func persistUnlocked(
         _ state: RemoteConnectorStateV1,
-        existing: RemoteConnectorStateV1?
+        existing: RemoteConnectorStateV1?,
+        allowHandoffReplacement: Bool = false
     ) throws {
         guard existing?.provider == nil || existing?.provider == state.provider else {
             throw RemoteConnectorStateStoreError.providerMismatch
         }
         if let existing,
            state.connectorCredentialGeneration < existing.connectorCredentialGeneration
-            || state.lastConnectorHandoffGeneration < existing.lastConnectorHandoffGeneration {
+            || (existing.pendingConnectorCredentialGeneration != nil
+                && state.pendingConnectorCredentialGeneration == nil
+                && state.connectorCredentialGeneration < (existing.pendingConnectorCredentialGeneration ?? 0))
+            || (existing.pendingConnectorCredentialGeneration != nil
+                && state.pendingConnectorCredentialGeneration != nil
+                && (state.pendingConnectorCredentialGeneration ?? 0)
+                    < (existing.pendingConnectorCredentialGeneration ?? 0))
+            || handoffRegresses(
+                state.handoffReceipt,
+                from: existing.handoffReceipt,
+                allowReplacement: allowHandoffReplacement
+            ) {
             throw RemoteConnectorStateStoreError.generationRegression
         }
 
@@ -222,6 +305,25 @@ final class RemoteConnectorStateStore: RemoteConnectorStatePersisting {
             }
         }
         try atomicWrite(data)
+    }
+
+    private func handoffRegresses(
+        _ candidate: RemoteConnectorHandoffReceipt?,
+        from existing: RemoteConnectorHandoffReceipt?,
+        allowReplacement: Bool
+    ) -> Bool {
+        guard let existing else { return false }
+        guard let candidate else { return true }
+        if candidate.connectorCredentialGeneration < existing.connectorCredentialGeneration {
+            return true
+        }
+        if candidate.connectorCredentialGeneration > existing.connectorCredentialGeneration {
+            return !allowReplacement
+        }
+        if candidate.publicOrigin != existing.publicOrigin {
+            return !allowReplacement
+        }
+        return candidate.handedOffAt < existing.handedOffAt
     }
 
     private func ensureDirectory() throws {

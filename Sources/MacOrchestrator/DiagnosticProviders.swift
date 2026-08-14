@@ -639,11 +639,7 @@ enum RemoteAuthenticatedMCPState: String, Codable, Equatable, Sendable {
     case ready
 }
 
-enum RemoteClientHandoffState: String, Codable, Equatable, Sendable {
-    case notAvailable
-    case unchanged
-    case changed
-}
+typealias RemoteClientHandoffState = RemoteClientHandoffClassification
 
 struct RemoteAuthenticatedMCPFacts: Codable, Equatable, Sendable {
     let probeAvailable: Bool
@@ -737,6 +733,7 @@ struct RemoteConnectorFacts: Codable, Equatable, Sendable {
     let endpointState: RemoteEndpointState
     let localMCPPrerequisite: RemoteLocalMCPPrerequisiteState
     let authenticatedReadiness: RemoteAuthenticatedMCPFacts
+    let identity: RemoteConnectorIdentityFacts?
 
     init(
         desired: Bool = false,
@@ -752,7 +749,8 @@ struct RemoteConnectorFacts: Codable, Equatable, Sendable {
         agentAPIState: RemoteAgentAPIState = .notObserved,
         endpointState: RemoteEndpointState? = nil,
         localMCPPrerequisite: RemoteLocalMCPPrerequisiteState = .notObserved,
-        authenticatedReadiness: RemoteAuthenticatedMCPFacts = .notRun
+        authenticatedReadiness: RemoteAuthenticatedMCPFacts = .notRun,
+        identity: RemoteConnectorIdentityFacts? = nil
     ) {
         self.desired = desired
         self.binaryPresent = binaryPresent
@@ -770,6 +768,7 @@ struct RemoteConnectorFacts: Codable, Equatable, Sendable {
             ?? (endpointAvailable ? .established : .notObserved)
         self.localMCPPrerequisite = localMCPPrerequisite
         self.authenticatedReadiness = authenticatedReadiness
+        self.identity = identity
     }
 
     func with(
@@ -789,7 +788,8 @@ struct RemoteConnectorFacts: Codable, Equatable, Sendable {
             agentAPIState: agentAPIState,
             endpointState: endpointState,
             localMCPPrerequisite: localMCPPrerequisite,
-            authenticatedReadiness: authenticatedReadiness
+            authenticatedReadiness: authenticatedReadiness,
+            identity: identity
         )
     }
 
@@ -810,7 +810,8 @@ struct RemoteConnectorFacts: Codable, Equatable, Sendable {
             agentAPIState: agentAPIState,
             endpointState: endpointState,
             localMCPPrerequisite: localMCPPrerequisite,
-            authenticatedReadiness: authenticatedReadiness
+            authenticatedReadiness: authenticatedReadiness,
+            identity: identity
         )
     }
 }

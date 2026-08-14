@@ -281,7 +281,8 @@ struct MeridianIndexerProgressEvent: Codable, Equatable, Sendable {
             allowed = ["protocol_version", "type", "source_id", "relative_path", "generation"]
         default: return nil
         }
-        guard Set(dictionary.keys) == allowed else { return nil }
+        guard Set(dictionary.keys) == allowed,
+              allowed.allSatisfy({ !(dictionary[$0] is NSNull) }) else { return nil }
         guard let decoded = try? JSONDecoder().decode(Self.self, from: data) else { return nil }
         guard decoded.protocolVersion == "1.0.0" else { return nil }
         if let status = decoded.status,
@@ -301,6 +302,8 @@ struct MeridianIndexerProgressEvent: Codable, Equatable, Sendable {
            let totalChunks = decoded.totalChunks,
            uploadedChunks > totalChunks { return nil }
         if let counts = decoded.counts {
+            guard let countsDictionary = dictionary["counts"] as? [String: Any],
+                  Set(countsDictionary.keys) == ["discovered", "unchanged", "committed", "skipped", "failed", "cancelled", "reconciliation_required"] else { return nil }
             let values = [counts.discovered, counts.unchanged, counts.committed, counts.skipped, counts.failed, counts.cancelled, counts.reconciliationRequired]
             guard values.allSatisfy({ (0...1_000_000_000).contains($0) }),
                   counts.unchanged + counts.committed + counts.skipped + counts.failed + counts.cancelled + counts.reconciliationRequired <= counts.discovered else { return nil }

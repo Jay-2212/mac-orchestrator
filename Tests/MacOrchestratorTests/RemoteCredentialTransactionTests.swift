@@ -512,6 +512,7 @@ final class RemoteCredentialTransactionTests: XCTestCase {
 
         func read(service: String, account: String) throws -> String? {
             if simulateNgrokReadBackMismatch,
+               !updateCalls.isEmpty,
                service == KeychainItem.ngrokAuthtoken.service,
                account == KeychainItem.ngrokAuthtoken.account {
                 simulateNgrokReadBackMismatch = false

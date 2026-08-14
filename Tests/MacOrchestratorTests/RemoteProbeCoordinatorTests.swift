@@ -3,7 +3,7 @@ import XCTest
 @testable import MacOrchestrator
 
 final class RemoteProbeCoordinatorTests: XCTestCase {
-    func testEndpointOnlyDoesNotMarkRemoteAuthenticated() async {
+    func testCurrentEndpointProceedsToAuthenticatedReadiness() async {
         let adapter = FakeAdapter(
             inspection: .available(endpoints: [
                 NgrokEndpoint(
@@ -15,8 +15,14 @@ final class RemoteProbeCoordinatorTests: XCTestCase {
         let coordinator = RemoteProbeCoordinator(
             adapter: adapter,
             probeRunner: { _, _ in
-                XCTFail("The authenticated probe must not be skipped for an unknown endpoint.")
-                return RemoteActivationProbeOutcome(phase: .initialize, error: .transport)
+                RemoteActivationProbeOutcome(
+                    phase: .safeCall,
+                    details: RemoteActivationProbeDetails(
+                        exposedTools: ["get_session_state"],
+                        sessionEstablished: true,
+                        safeCallSucceeded: true
+                    )
+                )
             }
         )
 

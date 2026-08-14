@@ -283,17 +283,22 @@ private final class ConnectorAgentAPIURLProtocol: URLProtocol {
 
     override func startLoading() {
         Self.requests.append(request)
+        guard let handler = Self.handler else {
+            client?.urlProtocol(self, didFailWithError: URLError(.resourceUnavailable))
+            return
+        }
         do {
-            let response = try XCTUnwrap(Self.handler?(request))
-            let responseURL = try XCTUnwrap(response.responseURL ?? request.url)
-            let httpResponse = try XCTUnwrap(
-                HTTPURLResponse(
-                    url: responseURL,
-                    statusCode: response.status,
-                    httpVersion: nil,
-                    headerFields: response.headers
-                )
-            )
+            let response = try handler(request)
+            guard let responseURL = response.responseURL ?? request.url,
+                  let httpResponse = HTTPURLResponse(
+                      url: responseURL,
+                      statusCode: response.status,
+                      httpVersion: nil,
+                      headerFields: response.headers
+                  ) else {
+                client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
+                return
+            }
             client?.urlProtocol(self, didReceive: httpResponse, cacheStoragePolicy: .notAllowed)
             client?.urlProtocol(self, didLoad: response.body)
             client?.urlProtocolDidFinishLoading(self)

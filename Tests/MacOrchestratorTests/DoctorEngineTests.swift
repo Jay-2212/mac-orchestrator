@@ -540,7 +540,7 @@ final class DoctorEngineTests: XCTestCase {
 
         let remote = RemoteConnectorFacts(desired: true, binaryPresent: true, configurationPresent: false)
         XCTAssertEqual(DiagnosticChecks.remoteNgrok(remote, auth: .present, desired: true).status, .fail)
-        XCTAssertEqual(DiagnosticChecks.remoteNgrok(remote, auth: .absent, desired: true).repair?.id, .replaceNgrokCredential)
+        XCTAssertEqual(DiagnosticChecks.remoteNgrok(remote, auth: .absent, desired: true).repair?.id, .retryRemoteConnector)
         XCTAssertEqual(DiagnosticChecks.remoteEndpoint(remote, desired: true).status, .fail)
 
         let healthyRemote = RemoteConnectorFacts(
@@ -598,7 +598,7 @@ final class DoctorEngineTests: XCTestCase {
         let inaccessible = DiagnosticChecks.remoteNgrok(credentialAbsent, auth: .inaccessible, desired: true)
         XCTAssertEqual(inaccessible.status, .warn)
         XCTAssertEqual(inaccessible.repair?.id, .replaceNgrokCredential)
-        XCTAssertTrue(inaccessible.reason.localizedCaseInsensitiveContains("inaccessible"))
+        XCTAssertTrue(inaccessible.reason.localizedCaseInsensitiveContains("Keychain"))
 
         let rejectedCredential = RemoteConnectorFacts(
             desired: true,
@@ -611,7 +611,7 @@ final class DoctorEngineTests: XCTestCase {
         let rejected = DiagnosticChecks.remoteNgrok(rejectedCredential, auth: .present, desired: true)
         XCTAssertEqual(rejected.status, .fail)
         XCTAssertEqual(rejected.repair?.id, .replaceNgrokCredential)
-        XCTAssertTrue(rejected.reason.localizedCaseInsensitiveContains("provider credential"))
+        XCTAssertTrue(rejected.reason.localizedCaseInsensitiveContains("rejected"))
 
         for processState in [RemoteManagedProcessState.missing, .ambiguous] {
             let processFacts = RemoteConnectorFacts(

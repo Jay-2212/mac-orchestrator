@@ -285,7 +285,7 @@ private final class ConnectorAgentAPIURLProtocol: URLProtocol {
         Self.requests.append(request)
         do {
             let response = try XCTUnwrap(Self.handler?(request))
-            let responseURL = response.responseURL ?? XCTUnwrap(request.url)
+            let responseURL = try XCTUnwrap(response.responseURL ?? request.url)
             let httpResponse = try XCTUnwrap(
                 HTTPURLResponse(
                     url: responseURL,

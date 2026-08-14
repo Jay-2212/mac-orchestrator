@@ -633,8 +633,8 @@ final class DoctorEngineTests: XCTestCase {
                 desired: true,
                 binaryPresent: true,
                 configurationPresent: true,
-                endpointState: .notObserved,
                 agentAPIState: agentState,
+                endpointState: .notObserved,
                 localMCPPrerequisite: .available
             )
             let endpoint = DiagnosticChecks.remoteEndpoint(agentFacts, desired: true)
@@ -651,8 +651,8 @@ final class DoctorEngineTests: XCTestCase {
                 desired: true,
                 binaryPresent: true,
                 configurationPresent: true,
-                endpointState: endpointState,
                 agentAPIState: .available,
+                endpointState: endpointState,
                 localMCPPrerequisite: .available
             )
             XCTAssertEqual(DiagnosticChecks.remoteEndpoint(endpointFacts, desired: true).status, .fail)
@@ -701,8 +701,8 @@ final class DoctorEngineTests: XCTestCase {
                 desired: true,
                 binaryPresent: true,
                 configurationPresent: true,
-                endpointState: .established,
                 agentAPIState: .available,
+                endpointState: .established,
                 authenticatedReadiness: authenticated,
                 localMCPPrerequisite: .available
             )
@@ -711,8 +711,8 @@ final class DoctorEngineTests: XCTestCase {
 
         let mismatch = RemoteConnectorFacts(
             desired: true,
-            endpointState: .established,
             agentAPIState: .available,
+            endpointState: .established,
             authenticatedReadiness: authenticatedCases[2].0,
             localMCPPrerequisite: .available
         )
@@ -721,8 +721,8 @@ final class DoctorEngineTests: XCTestCase {
         let readyChanged = RemoteConnectorFacts(
             desired: true,
             endpointAvailable: true,
-            endpointState: .established,
             agentAPIState: .available,
+            endpointState: .established,
             authenticatedReadiness: RemoteAuthenticatedMCPFacts(
                 probeAvailable: true,
                 probeRun: true,
@@ -747,8 +747,8 @@ final class DoctorEngineTests: XCTestCase {
         let unchanged = RemoteConnectorFacts(
             desired: true,
             endpointAvailable: true,
-            endpointState: .established,
             agentAPIState: .available,
+            endpointState: .established,
             authenticatedReadiness: RemoteAuthenticatedMCPFacts(
                 probeAvailable: true,
                 probeRun: true,
@@ -769,8 +769,8 @@ final class DoctorEngineTests: XCTestCase {
         let noReceipt = RemoteConnectorFacts(
             desired: true,
             endpointAvailable: true,
-            endpointState: .established,
             agentAPIState: .available,
+            endpointState: .established,
             authenticatedReadiness: RemoteAuthenticatedMCPFacts(
                 probeAvailable: true,
                 probeRun: true,
@@ -791,8 +791,8 @@ final class DoctorEngineTests: XCTestCase {
 
         let localUnavailable = RemoteConnectorFacts(
             desired: true,
-            endpointState: .established,
             agentAPIState: .available,
+            endpointState: .established,
             localMCPPrerequisite: .unavailable
         )
         for result in [
@@ -1176,9 +1176,9 @@ private struct DoctorFixture {
             portProvider: FixturePortProvider(facts: PortFacts(port: configuration.localMCPPort)),
             localMCPProvider: local,
             asyncLocalMCPProvider: asyncLocalMCPProvider,
-            remoteAuthenticatedMCPProvider: remoteAuthenticatedProvider,
             lifecycleProvider: lifecycle,
             remoteConnectorProvider: remote,
+            remoteAuthenticatedMCPProvider: remoteAuthenticatedProvider,
             diskSpaceProvider: FixtureDiskProvider(facts: DiskSpaceFacts(filesystemAccessible: true, availableBytes: 10_000)),
             updateProvider: FixtureUpdateProvider(facts: UpdateAvailabilityFacts()),
             thresholds: DoctorThresholds(lowDiskBytes: 1_000),

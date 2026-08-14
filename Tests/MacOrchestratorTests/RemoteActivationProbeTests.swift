@@ -242,7 +242,7 @@ final class RemoteActivationProbeTests: XCTestCase {
             .init(
                 status: 500,
                 body: Data(
-                    "server body \(credentialURL.absoluteString) \(connectorToken)".utf8
+                    "server body \(credentialURL.absoluteString) \(self.connectorToken)".utf8
                 )
             )
         }
@@ -404,7 +404,7 @@ private final class RemoteActivationURLProtocol: URLProtocol {
         Self.requests.append(request)
         do {
             let response = try XCTUnwrap(Self.handler?(request))
-            let responseURL = response.responseURL ?? XCTUnwrap(request.url)
+            let responseURL = try XCTUnwrap(response.responseURL ?? request.url)
             let httpResponse = try XCTUnwrap(
                 HTTPURLResponse(
                     url: responseURL,

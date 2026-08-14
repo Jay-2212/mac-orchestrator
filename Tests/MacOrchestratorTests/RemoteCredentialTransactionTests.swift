@@ -517,7 +517,7 @@ final class RemoteCredentialTransactionTests: XCTestCase {
                 simulateNgrokReadBackMismatch = false
                 return "old-authtoken"
             }
-            values[KeychainItem.key(service: service, account: account)]
+            return values[KeychainItem.key(service: service, account: account)]
         }
 
         func create(value: String, service: String, account: String) throws {

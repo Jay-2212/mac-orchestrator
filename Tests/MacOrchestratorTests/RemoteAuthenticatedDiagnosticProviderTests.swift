@@ -55,8 +55,8 @@ final class RemoteAuthenticatedDiagnosticProviderTests: XCTestCase {
         let remoteFacts = RemoteConnectorFacts(
             desired: true,
             endpointAvailable: true,
-            endpointState: .established,
             agentAPIState: .available,
+            endpointState: .established,
             localMCPPrerequisite: .available,
             authenticatedReadiness: facts
         )

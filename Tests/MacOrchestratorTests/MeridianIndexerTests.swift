@@ -55,10 +55,12 @@ final class MeridianIndexerTests: XCTestCase {
 
         let data = try invocation.encoded()
         let json = String(decoding: data, as: UTF8.self)
-        XCTAssertTrue(json.contains("\"baseUrl\":\"https://meridian.example\""))
-        XCTAssertTrue(json.contains("\"sourceId\":\"scope\""))
-        XCTAssertTrue(json.contains("\"rootPath\":\"/Users/example/Notes\""))
-        XCTAssertTrue(json.contains("\"rebuild\":true"))
+        let object = try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(object["baseUrl"] as? String, "https://meridian.example")
+        let source = try XCTUnwrap((object["sources"] as? [[String: Any]])?.first)
+        XCTAssertEqual(source["sourceId"] as? String, "scope")
+        XCTAssertEqual(source["rootPath"] as? String, "/Users/example/Notes")
+        XCTAssertEqual(source["rebuild"] as? Bool, true)
         XCTAssertFalse(json.contains("MERIDIAN_CORE_TOKEN"))
         XCTAssertFalse(json.contains("Bearer"))
     }

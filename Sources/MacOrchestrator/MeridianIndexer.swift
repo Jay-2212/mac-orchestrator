@@ -588,7 +588,7 @@ final class MeridianIndexerCoordinator {
         outputBuffer.removeAll(keepingCapacity: false)
     }
 
-    private func scheduleNext(at date: Date) {
+    private func scheduleNext(at date: Date, preserveStatus: Bool = false) {
         guard let configuration else { return }
         let next = scheduler.schedule(at: date, label: "meridian-indexer") { [weak self] in
             self?.scheduleHandle = nil
@@ -596,7 +596,7 @@ final class MeridianIndexerCoordinator {
         }
         scheduleHandle = next
         snapshot.nextRunAt = date
-        snapshot.status = .scheduled
+        if !preserveStatus { snapshot.status = .scheduled }
         snapshot.desired = true
         publish()
         _ = configuration
@@ -699,14 +699,17 @@ final class MeridianIndexerCoordinator {
             : snapshot.lastErrorCode
         publish(desired: true, status: status, error: errorCode)
         if let configuration {
-            scheduleRetry(after: configuration.intervalMinutes)
+            scheduleRetry(after: configuration.intervalMinutes, preserveStatus: status == .cancelled)
         }
     }
 
-    private func scheduleRetry(after minutes: Int) {
+    private func scheduleRetry(after minutes: Int, preserveStatus: Bool = false) {
         scheduleHandle?.cancel()
         scheduleHandle = nil
-        scheduleNext(at: scheduler.now.addingTimeInterval(TimeInterval(minutes * 60)))
+        scheduleNext(
+            at: scheduler.now.addingTimeInterval(TimeInterval(minutes * 60)),
+            preserveStatus: preserveStatus
+        )
     }
 
     private func publish(

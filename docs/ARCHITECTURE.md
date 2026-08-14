@@ -80,8 +80,9 @@ The Swift helper is the lifecycle and configuration plane:
 - `RotatingLog.swift` writes local restricted logs and redacts capability
   credentials.
 - `MenuController.swift` and `AppDelegate.swift` expose profile, permission
-  guidance, remote, restart, and current-URL controls. Opening Settings is
-  guidance only; the managed Python probe remains the permission oracle.
+  guidance, remote, restart, and explicit Copy Connector URL controls. Opening
+  Settings is guidance only; the managed Python probe remains the permission
+  oracle. Ordinary status has no credential-bearing URL field.
 
 Fresh or interrupted setup selects and persists the first free port in the
 bounded `8000...8100` range. A completed or genuine legacy installation keeps
@@ -108,8 +109,9 @@ Only after all four stages and a fresh required-capability readiness evaluation
 pass does the supervisor publish the local service as running, start remote
 ingress, and mark onboarding complete. Installation payload promotion,
 onboarding completion, local activation, and optional remote setup remain
-distinct facts. Later health polls remain lightweight lifecycle checks; a
-larger retry/doctor/recovery design is deferred.
+distinct facts. Later health polls remain lightweight lifecycle checks;
+authenticated remote revalidation is lifecycle-controlled after endpoint,
+network, wake, restart, and recovery transitions.
 
 ## Remote endpoint and credential flow
 
@@ -124,15 +126,41 @@ Trusted MCP client
 
 The helper reads the ngrok authtoken from Keychain and passes it only through
 the owned child environment as `NGROK_AUTHTOKEN`; it is never put in argv. Once
-the agent is running, the helper queries `GET /api/endpoints`, selects a live
-HTTPS endpoint whose upstream matches the configured loopback target, and
-constructs the connector URL from that result plus the capability token. The
-deprecated `/api/tunnels` route and cached/stale endpoint display are not part
-of the contract.
+the agent is running, the shared adapter queries its loopback-only
+`GET /api/endpoints` boundary, selects exactly one live canonical HTTPS origin
+whose upstream matches the configured loopback target, and the lifecycle then
+requires authenticated MCP readiness before marking Remote ready. The probe
+uses a transient credential-bearing request but returns only typed readiness
+facts. The full URL is exposed or recorded only by an explicit Copy/Show
+handoff, after which the state journal stores generation, origin, and time.
+The deprecated `/api/tunnels` route and cached/stale endpoint display are not
+part of the contract.
 
 The connector URL is a password-like capability. Possession grants the enabled
 tool surface without a second approval prompt per action. Logs, diagnostics,
 client configuration, support requests, and screenshots must redact it.
+
+## Phase 4D remote Doctor boundary
+
+Doctor keeps remote evidence in separate layers:
+
+1. local MCP prerequisite readiness;
+2. ngrok binary/configuration, provider-credential, managed-process, and Agent
+   API observations;
+3. expected-upstream endpoint classification;
+4. an injectable authenticated remote MCP probe covering authentication,
+   initialize/session, inventory, and a safe application call; and
+5. a receipt-backed client-handoff comparison.
+
+An Agent API endpoint match can pass its own endpoint check but can never stand
+in for authenticated remote MCP readiness. A changed connector identity with a
+healthy current probe is a manual client-reconfiguration warning. Without a
+known handoff receipt, Doctor does not inspect arbitrary clients or assert that
+any particular client is stale. Doctor and ProcessSupervisor consume the same
+adapter/parser classifications, while the authenticated probe remains
+read-only. Connector-token rotation and ngrok candidate replacement are
+serialized async transactions; neither restores an old connector token after
+cutover, and provider replacement never performs provider-side deletion.
 
 ## Dependency boundary
 
@@ -178,8 +206,10 @@ non-required job.
 ## Deferred boundaries
 
 Phase 2 does not add Developer ID/notarization, DMG packaging, Intel support,
-Meridian or provider changes, a new retry state machine, a doctor, a full
-updater/rollback product, or mature remote recovery. Those remain Phase 3/4 or
-later work. The current architecture also remains single-user and local-first;
+Meridian or provider changes, a new retry state machine, or a full
+updater/rollback product. Phase 4D binds the authenticated remote probe and
+credential-recovery seams described above, while live provider lifecycle
+behavior remains subject to the manual evidence matrix. The current
+architecture also remains single-user and local-first;
 OAuth, accounts, roles, hosted deployment, and enterprise management are not
 implicit roadmap guarantees.

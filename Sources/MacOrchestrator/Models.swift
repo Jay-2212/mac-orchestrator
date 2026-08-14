@@ -13,13 +13,13 @@ struct ServiceSnapshot {
     var server: ServiceState = .stopped
     var tunnel: ServiceState = .stopped
     var productReadiness: ProductReadinessState = .needsAttention
-    var connectorURL: URL?
     var error: String?
     var controlProfile: ControlProfile?
     var readyCapabilityCount: Int = 0
     var totalCapabilityCount: Int = CapabilityRegistry.capabilityIDs.count
     var pendingPermissions: [String] = []
     var clientRefreshRequired: Bool = false
+    var effectiveCapabilitySnapshot: CapabilitySnapshot?
 
     var isHealthy: Bool {
         if productReadiness == .ready {
@@ -33,6 +33,12 @@ struct ServiceSnapshot {
         tunnel = Self.serviceState(for: lifecycle.remoteConnector)
         productReadiness = lifecycle.productReadiness
         error = lifecycle.mcpServer.reason ?? lifecycle.remoteConnector.reason
+        if let capabilitySnapshot = effectiveCapabilitySnapshot {
+            let projected = capabilitySnapshot.projected(from: lifecycle)
+            effectiveCapabilitySnapshot = projected
+            readyCapabilityCount = projected.capabilities.values.filter(\.ready).count
+            totalCapabilityCount = projected.capabilities.count
+        }
     }
 
     func projected(from lifecycle: LifecycleSnapshot) -> ServiceSnapshot {
@@ -69,6 +75,7 @@ struct ServiceSnapshot {
         requiresClientRefresh: Bool
     ) {
         controlProfile = contract.capabilitySnapshot.controlProfile
+        effectiveCapabilitySnapshot = contract.capabilitySnapshot
         readyCapabilityCount = contract.capabilitySnapshot.capabilities.values.filter(\.ready).count
         totalCapabilityCount = contract.capabilitySnapshot.capabilities.count
         pendingPermissions = Self.pendingPermissions(in: contract.capabilitySnapshot)

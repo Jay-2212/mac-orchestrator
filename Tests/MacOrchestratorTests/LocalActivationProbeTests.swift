@@ -60,11 +60,11 @@ final class LocalActivationProbeTests: XCTestCase {
                         ], id: 3)
                     )
                 default:
-                    XCTFail("Unexpected MCP request: \(payload)")
+                    XCTFail("Unexpected MCP request in the local activation fixture.")
                     return .init(status: 500, body: Data())
                 }
             default:
-                XCTFail("Unexpected URL: \(request.url?.absoluteString ?? "nil")")
+                XCTFail("Unexpected URL in the local activation fixture.")
                 return .init(status: 404, body: Data())
             }
         }
@@ -79,13 +79,17 @@ final class LocalActivationProbeTests: XCTestCase {
             requiresInteractiveUI: true
         )
 
-        XCTAssertEqual(ActivationProbeURLProtocol.requests.map { $0.url?.path }, [
-            "/__mac_orchestrator_health",
-            "/connector-token/mcp",
-            "/connector-token/mcp",
-            "/connector-token/mcp",
-            "/connector-token/mcp",
-        ])
+        let requestPaths = ActivationProbeURLProtocol.requests.map { $0.url?.path }
+        XCTAssertTrue(
+            requestPaths == [
+                "/__mac_orchestrator_health",
+                "/connector-token/mcp",
+                "/connector-token/mcp",
+                "/connector-token/mcp",
+                "/connector-token/mcp",
+            ],
+            "The local activation request sequence was unexpected."
+        )
         let mcpRequests = ActivationProbeURLProtocol.requests.dropFirst()
         XCTAssertTrue(mcpRequests.allSatisfy {
             $0.value(forHTTPHeaderField: "Authorization") == nil
@@ -137,11 +141,11 @@ final class LocalActivationProbeTests: XCTestCase {
                         ], id: 3)
                     )
                 default:
-                    XCTFail("Unexpected MCP request: \(payload)")
+                    XCTFail("Unexpected MCP request in the local activation fixture.")
                     return .init(status: 500, body: Data())
                 }
             default:
-                XCTFail("Unexpected URL: \(request.url?.absoluteString ?? "nil")")
+                XCTFail("Unexpected URL in the local activation fixture.")
                 return .init(status: 404, body: Data())
             }
         }
@@ -219,11 +223,11 @@ final class LocalActivationProbeTests: XCTestCase {
                         ], id: 3)
                     )
                 default:
-                    XCTFail("Unexpected MCP request: \(payload)")
+                    XCTFail("Unexpected MCP request in the local activation fixture.")
                     return .init(status: 500, body: Data())
                 }
             default:
-                XCTFail("Unexpected URL: \(request.url?.absoluteString ?? "nil")")
+                XCTFail("Unexpected URL in the local activation fixture.")
                 return .init(status: 404, body: Data())
             }
         }
@@ -262,7 +266,7 @@ final class LocalActivationProbeTests: XCTestCase {
             XCTFail("A noncanonical health response must not activate the runtime.")
         } catch let error as LocalActivationProbeError {
             guard case let .healthCheckFailed(status, body) = error else {
-                XCTFail("Unexpected probe error: \(error)")
+                XCTFail("Unexpected local activation probe error.")
                 return
             }
             XCTAssertEqual(status, 200)
@@ -283,7 +287,7 @@ final class LocalActivationProbeTests: XCTestCase {
                     responseURL: URL(string: "http://127.0.0.1:8001/redirected")
                 )
             default:
-                XCTFail("Unexpected URL: \(request.url?.absoluteString ?? "nil")")
+                XCTFail("Unexpected URL in the local activation fixture.")
                 return .init(status: 404, body: Data())
             }
         }
@@ -311,7 +315,7 @@ final class LocalActivationProbeTests: XCTestCase {
                     headers: ["Mcp-Session-Id": "session-123"]
                 )
             default:
-                XCTFail("Unexpected URL: \(request.url?.absoluteString ?? "nil")")
+                XCTFail("Unexpected URL in the local activation fixture.")
                 return .init(status: 404, body: Data())
             }
         }
@@ -336,7 +340,7 @@ final class LocalActivationProbeTests: XCTestCase {
             case "/wrong-token/mcp":
                 return .init(status: 401, body: Data())
             default:
-                XCTFail("Unexpected URL: \(request.url?.absoluteString ?? "nil")")
+                XCTFail("Unexpected URL in the local activation fixture.")
                 return .init(status: 404, body: Data())
             }
         }
@@ -376,11 +380,11 @@ final class LocalActivationProbeTests: XCTestCase {
                     )
                     return .init(status: 409, body: Data())
                 default:
-                    XCTFail("Unexpected MCP request: \(payload)")
+                    XCTFail("Unexpected MCP request in the local activation fixture.")
                     return .init(status: 500, body: Data())
                 }
             default:
-                XCTFail("Unexpected URL: \(request.url?.absoluteString ?? "nil")")
+                XCTFail("Unexpected URL in the local activation fixture.")
                 return .init(status: 404, body: Data())
             }
         }
@@ -419,11 +423,11 @@ final class LocalActivationProbeTests: XCTestCase {
                         body: Self.rpcResult(["tools": [["name": "not_safe"]]], id: 2)
                     )
                 default:
-                    XCTFail("Unexpected MCP request: \(payload)")
+                    XCTFail("Unexpected MCP request in the local activation fixture.")
                     return .init(status: 500, body: Data())
                 }
             default:
-                XCTFail("Unexpected URL: \(request.url?.absoluteString ?? "nil")")
+                XCTFail("Unexpected URL in the local activation fixture.")
                 return .init(status: 404, body: Data())
             }
         }
@@ -471,11 +475,11 @@ final class LocalActivationProbeTests: XCTestCase {
                         ], id: 3)
                     )
                 default:
-                    XCTFail("Unexpected MCP request: \(payload)")
+                    XCTFail("Unexpected MCP request in the local activation fixture.")
                     return .init(status: 500, body: Data())
                 }
             default:
-                XCTFail("Unexpected URL: \(request.url?.absoluteString ?? "nil")")
+                XCTFail("Unexpected URL in the local activation fixture.")
                 return .init(status: 404, body: Data())
             }
         }
@@ -525,11 +529,11 @@ final class LocalActivationProbeTests: XCTestCase {
                         body: Self.rpcResult(["content": []], id: 3)
                     )
                 default:
-                    XCTFail("Unexpected MCP request: \(payload)")
+                    XCTFail("Unexpected MCP request in the local activation fixture.")
                     return .init(status: 500, body: Data())
                 }
             default:
-                XCTFail("Unexpected URL: \(request.url?.absoluteString ?? "nil")")
+                XCTFail("Unexpected URL in the local activation fixture.")
                 return .init(status: 404, body: Data())
             }
         }

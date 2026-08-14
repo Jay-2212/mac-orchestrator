@@ -420,6 +420,101 @@ final class DiagnosticLiveProviderTests: XCTestCase {
         XCTAssertEqual(DiagnosticChecks.remoteEndpoint(facts, desired: true).status, .pass)
     }
 
+    func testNgrokProviderClassifiesAgentAndEndpointStatesWithoutRetainingURL() throws {
+        let apiURL = URL(string: "http://127.0.0.1:4040/api/endpoints")!
+        let cases: [(String, RemoteAgentAPIState, RemoteEndpointState)] = [
+            (#"{"endpoints":[]}"#, .available, .noExpectedUpstream),
+            (#"{"endpoints":[{"url":"https://foreign.example","upstream":{"url":"http://127.0.0.1:9000"}}]}"#, .available, .foreignOnly),
+            (#"{"endpoints":[{"url":"http://not-public.example","upstream":{"url":"http://127.0.0.1:8007"}}]}"#, .available, .noExpectedUpstream),
+            (#"{"endpoints":[{"url":"https://a.example","upstream":{"url":"http://127.0.0.1:8007"}},{"url":"https://b.example","upstream":{"url":"http://127.0.0.1:8007"}}]}"#, .available, .ambiguous),
+            ("not-json", .malformed, .notObserved),
+        ]
+
+        for (body, agentState, endpointState) in cases {
+            let provider = ReadOnlyRemoteConnectorFactsProvider(
+                desired: true,
+                binaryPresent: true,
+                configurationPresent: true,
+                target: "http://127.0.0.1:8007",
+                httpRunner: RecordingDiagnosticHTTPRunner(response: DiagnosticHTTPResponse(
+                    status: 200,
+                    url: apiURL,
+                    body: Data(body.utf8)
+                ))
+            )
+
+            let facts = try provider.inspect()
+
+            XCTAssertEqual(facts.agentAPIState, agentState, body)
+            XCTAssertEqual(facts.endpointState, endpointState, body)
+            XCTAssertFalse(String(describing: facts).contains("foreign.example"), body)
+            XCTAssertFalse(String(describing: facts).contains("127.0.0.1:8007"), body)
+        }
+
+        let unavailable = ReadOnlyRemoteConnectorFactsProvider(
+            desired: true,
+            binaryPresent: true,
+            configurationPresent: true,
+            target: "http://127.0.0.1:8007",
+            httpRunner: RecordingDiagnosticHTTPRunner(response: DiagnosticHTTPResponse(
+                status: 503,
+                url: apiURL,
+                body: Data("gateway unavailable".utf8)
+            ))
+        )
+        let unavailableFacts = try unavailable.inspect()
+        XCTAssertEqual(unavailableFacts.agentAPIState, .unavailable)
+
+        let rejectedCredential = ReadOnlyRemoteConnectorFactsProvider(
+            desired: true,
+            binaryPresent: true,
+            configurationPresent: true,
+            target: "http://127.0.0.1:8007",
+            providerCredentialState: .rejected,
+            httpRunner: RecordingDiagnosticHTTPRunner(response: DiagnosticHTTPResponse(
+                status: 200,
+                url: apiURL,
+                body: Data(#"{"endpoints":[]}"#.utf8)
+            ))
+        )
+        XCTAssertEqual(try rejectedCredential.inspect().providerCredentialState, .rejected)
+    }
+
+    func testNgrokProviderClassifiesManagedProcessMissingAndAmbiguous() throws {
+        let apiURL = URL(string: "http://127.0.0.1:4040/api/endpoints")!
+        let response = DiagnosticHTTPResponse(
+            status: 200,
+            url: apiURL,
+            body: Data(#"{"endpoints":[]}"#.utf8)
+        )
+        let missing = ReadOnlyRemoteConnectorFactsProvider(
+            desired: true,
+            binaryPresent: true,
+            configurationPresent: true,
+            target: "http://127.0.0.1:8007",
+            httpRunner: RecordingDiagnosticHTTPRunner(response: response),
+            ownerID: "owner-1",
+            processRunner: RecordingDiagnosticProcessRunner(processes: []),
+            expectedBinaryPath: "/opt/ngrok"
+        )
+        XCTAssertEqual(try missing.inspect().managedProcessState, .missing)
+
+        let ambiguous = ReadOnlyRemoteConnectorFactsProvider(
+            desired: true,
+            binaryPresent: true,
+            configurationPresent: true,
+            target: "http://127.0.0.1:8007",
+            httpRunner: RecordingDiagnosticHTTPRunner(response: response),
+            ownerID: "owner-1",
+            processRunner: RecordingDiagnosticProcessRunner(processes: [
+                DiagnosticProcessRecord(pid: 1, commandLine: "/opt/ngrok http mac-orchestrator-owner=owner-1", running: true),
+                DiagnosticProcessRecord(pid: 2, commandLine: "/opt/ngrok http mac-orchestrator-owner=owner-1", running: true),
+            ]),
+            expectedBinaryPath: "/opt/ngrok"
+        )
+        XCTAssertEqual(try ambiguous.inspect().managedProcessState, .ambiguous)
+    }
+
     func testNgrokProviderReportsOnlyAuthPresenceAndStillChecksAgentAPI() throws {
         let apiURL = URL(string: "http://127.0.0.1:4040/api/endpoints")!
         let http = RecordingDiagnosticHTTPRunner(response: DiagnosticHTTPResponse(

@@ -87,6 +87,141 @@ final class DiagnosticModelsTests: XCTestCase {
         XCTAssertThrowsError(try decodeReport(try JSONSerialization.data(withJSONObject: payload)))
     }
 
+    func testRemoteAuthenticatedFactsClassifyEachProbeOutcome() {
+        let rejected = RemoteAuthenticatedMCPFacts(
+            probeAvailable: true,
+            probeRun: true,
+            authenticationSucceeded: false
+        )
+        XCTAssertEqual(rejected.state, .authenticationRejected)
+
+        let initializeFailed = RemoteAuthenticatedMCPFacts(
+            probeAvailable: true,
+            probeRun: true,
+            authenticationSucceeded: true,
+            initializeSucceeded: false,
+            sessionEstablished: false
+        )
+        XCTAssertEqual(initializeFailed.state, .initializeSessionFailed)
+
+        let inventoryMismatch = RemoteAuthenticatedMCPFacts(
+            probeAvailable: true,
+            probeRun: true,
+            authenticationSucceeded: true,
+            initializeSucceeded: true,
+            sessionEstablished: true,
+            inventoryChecked: true,
+            expectedTools: ["get_session_state"],
+            exposedTools: ["describe"]
+        )
+        XCTAssertEqual(inventoryMismatch.state, .inventoryMismatch)
+
+        let safeCallFailed = RemoteAuthenticatedMCPFacts(
+            probeAvailable: true,
+            probeRun: true,
+            authenticationSucceeded: true,
+            initializeSucceeded: true,
+            sessionEstablished: true,
+            inventoryChecked: true,
+            expectedTools: ["describe"],
+            exposedTools: ["describe"],
+            safeCallChecked: true,
+            safeCallSucceeded: false
+        )
+        XCTAssertEqual(safeCallFailed.state, .safeCallFailed)
+
+        let ready = RemoteAuthenticatedMCPFacts(
+            probeAvailable: true,
+            probeRun: true,
+            authenticationSucceeded: true,
+            initializeSucceeded: true,
+            sessionEstablished: true,
+            inventoryChecked: true,
+            expectedTools: ["describe"],
+            exposedTools: ["describe"],
+            safeCallChecked: true,
+            safeCallSucceeded: true,
+            clientHandoff: .changed
+        )
+        XCTAssertEqual(ready.state, .ready)
+        XCTAssertEqual(ready.clientHandoff, .changed)
+
+        XCTAssertEqual(RemoteAuthenticatedMCPFacts().state, .notRun)
+    }
+
+    func testRemoteConnectorIdentityFactsKeepServiceAndHandoffIndependent() throws {
+        let identity = RemoteConnectorIdentityFacts(
+            connectorCredentialGeneration: 3,
+            verifiedPublicOrigin: try RemotePublicOrigin("https://example.ngrok.app"),
+            clientHandoff: .changed
+        )
+
+        let decoded = try JSONDecoder().decode(
+            RemoteConnectorIdentityFacts.self,
+            from: JSONEncoder().encode(identity)
+        )
+
+        XCTAssertEqual(decoded, identity)
+        XCTAssertEqual(decoded.clientHandoff, .changed)
+    }
+
+    func testRemoteFactsSerializeOnlyTypedNonsecretEvidence() throws {
+        let token = "capability-secret-123456789"
+        let url = "https://assigned.ngrok-free.app/capability-secret-123456789/mcp"
+        let facts = RemoteConnectorFacts(
+            desired: true,
+            binaryPresent: true,
+            configurationPresent: true,
+            endpointAvailable: true,
+            endpointCount: 1,
+            ownershipMarkerPresent: true,
+            endpointState: .established,
+            authenticatedReadiness: RemoteAuthenticatedMCPFacts(
+                probeAvailable: true,
+                probeRun: true,
+                authenticationSucceeded: true,
+                initializeSucceeded: true,
+                sessionEstablished: true,
+                inventoryChecked: true,
+                expectedTools: ["describe"],
+                exposedTools: ["describe"],
+                safeCallChecked: true,
+                safeCallSucceeded: true
+            )
+        )
+
+        let serialized = String(decoding: try JSONEncoder().encode(facts), as: UTF8.self)
+        XCTAssertFalse(serialized.contains(token))
+        XCTAssertFalse(serialized.contains(url))
+        XCTAssertFalse(serialized.contains("https://"))
+        XCTAssertTrue(serialized.contains("established"))
+        XCTAssertTrue(serialized.contains("ready"))
+    }
+
+    func testDoctorReportSerializationRedactsTokenBearingConnectorURLs() throws {
+        let token = "capability-secret-123456789"
+        let url = "https://assigned.ngrok-free.app/capability-secret-123456789/mcp"
+        let report = DoctorReport(
+            generatedAt: Date(timeIntervalSince1970: 1_700_000_000),
+            results: [DiagnosticResult(
+                id: "remote.endpoint",
+                title: "Remote endpoint",
+                status: .pass,
+                reason: "observed \(url)",
+                repair: RepairActionDescriptor(
+                    id: .reconfigureRemoteClients,
+                    title: "Use \(url)",
+                    guidance: "Paste \(url) into the client."
+                )
+            )]
+        )
+
+        let serialized = String(decoding: try JSONEncoder().encode(report), as: UTF8.self)
+        XCTAssertFalse(serialized.contains(token))
+        XCTAssertFalse(serialized.contains(url))
+        XCTAssertTrue(serialized.contains("<redacted>"))
+    }
+
     private func decodeReport(_ data: Data) throws -> DoctorReport {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601

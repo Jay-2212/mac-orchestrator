@@ -42,10 +42,95 @@ final class KeychainStoreTests: XCTestCase {
         )
     }
 
+    func testGenerateConnectorTokenUsesExactly32InjectedRandomBytesWithoutPersisting() throws {
+        let fake = FakeKeychainClient()
+        let store = KeychainStore(client: fake, random: FixedRandomBytes(byte: 0xab))
+
+        let token = try store.generateConnectorToken()
+
+        XCTAssertEqual(token, String(repeating: "ab", count: 32))
+        XCTAssertNil(try store.value(for: .connectorToken))
+        XCTAssertEqual(fake.createCalls, [])
+    }
+
+    func testConnectorReplacementUsesCompareAndReplaceOnCanonicalItem() throws {
+        let oldToken = "old-token"
+        let newToken = String(repeating: "cd", count: 32)
+        let fake = FakeKeychainClient(values: [KeychainItem.connectorToken.key: oldToken])
+        let store = KeychainStore(client: fake)
+
+        try store.replaceConnectorToken(expectedCurrent: oldToken, with: newToken)
+
+        XCTAssertEqual(try store.value(for: .connectorToken), newToken)
+        XCTAssertEqual(fake.createCalls, [])
+        XCTAssertEqual(fake.updateCalls, [KeychainItem.connectorToken.key])
+    }
+
+    func testConnectorReplacementRejectsConcurrentCanonicalValueWithoutChangingIt() throws {
+        let fake = FakeKeychainClient(values: [KeychainItem.connectorToken.key: "actual-token"])
+        let store = KeychainStore(client: fake)
+        let newToken = String(repeating: "ef", count: 32)
+
+        XCTAssertThrowsError(
+            try store.replaceConnectorToken(expectedCurrent: "stale-token", with: newToken)
+        ) { error in
+            XCTAssertEqual(error as? KeychainStoreError, .concurrentModification)
+            XCTAssertFalse(String(describing: error).contains("stale-token"))
+            XCTAssertFalse(String(describing: error).contains(newToken))
+        }
+        XCTAssertEqual(try store.value(for: .connectorToken), "actual-token")
+        XCTAssertEqual(fake.updateCalls, [])
+    }
+
+    func testNgrokReplacementCommitsOnlyExplicitCandidateValue() throws {
+        let fake = FakeKeychainClient(values: [KeychainItem.ngrokAuthtoken.key: "old-authtoken"])
+        let store = KeychainStore(client: fake)
+
+        try store.replaceNgrokAuthtoken(
+            expectedCurrent: "old-authtoken",
+            with: "candidate-authtoken"
+        )
+
+        XCTAssertEqual(try store.value(for: .ngrokAuthtoken), "candidate-authtoken")
+        XCTAssertEqual(fake.updateCalls, [KeychainItem.ngrokAuthtoken.key])
+    }
+
+    func testNgrokReplacementRejectsWhitespaceBearingCandidateBeforeKeychainWrite() throws {
+        let fake = FakeKeychainClient(values: [KeychainItem.ngrokAuthtoken.key: "old-authtoken"])
+        let store = KeychainStore(client: fake)
+
+        XCTAssertThrowsError(
+            try store.replaceNgrokAuthtoken(
+                expectedCurrent: "old-authtoken",
+                with: " candidate-authtoken"
+            )
+        ) { error in
+            XCTAssertEqual(error as? KeychainStoreError, .invalidValue)
+        }
+        XCTAssertEqual(fake.updateCalls, [])
+    }
+
+    func testNgrokUpdateFailureIsClassifiedAsPotentiallyCommitted() throws {
+        let fake = FakeKeychainClient(values: [KeychainItem.ngrokAuthtoken.key: "old-authtoken"])
+        fake.updateFailsAfterWrite = true
+        let store = KeychainStore(client: fake)
+
+        XCTAssertThrowsError(
+            try store.replaceNgrokAuthtoken(
+                expectedCurrent: "old-authtoken",
+                with: "candidate-authtoken"
+            )
+        ) { error in
+            XCTAssertEqual(error as? KeychainStoreError, .commitAmbiguous)
+        }
+        XCTAssertEqual(try store.value(for: .ngrokAuthtoken), "candidate-authtoken")
+    }
+
     private final class FakeKeychainClient: KeychainClient {
         private(set) var values: [String: String]
         private(set) var createCalls: [String] = []
         private(set) var updateCalls: [String] = []
+        var updateFailsAfterWrite = false
 
         init(values: [String: String] = [:]) {
             self.values = values
@@ -71,6 +156,21 @@ final class KeychainStoreTests: XCTestCase {
             }
             updateCalls.append(key)
             values[key] = value
+            if updateFailsAfterWrite {
+                throw KeychainStoreError.operationFailed(-99)
+            }
+        }
+
+        func delete(service: String, account: String) throws {
+            values.removeValue(forKey: KeychainItem.key(service: service, account: account))
+        }
+    }
+
+    private struct FixedRandomBytes: SecureRandomByteGenerating {
+        let byte: UInt8
+
+        func randomBytes(count: Int) throws -> [UInt8] {
+            Array(repeating: byte, count: count)
         }
     }
 }

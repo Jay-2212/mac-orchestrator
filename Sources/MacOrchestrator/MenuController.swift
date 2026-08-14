@@ -40,6 +40,9 @@ final class MenuController: NSObject {
         } else {
             menu.addItem(action("Enable Optional Remote Access", #selector(enableConnector)))
         }
+        let copyConnectorURL = action("Copy Connector URL", #selector(copyConnectorURL))
+        copyConnectorURL.isEnabled = snapshot.tunnel == .running
+        menu.addItem(copyConnectorURL)
         menu.addItem(action("Run Doctor", #selector(runDoctor)))
         menu.addItem(action("Repair Primary Failure", #selector(repairPrimaryFailure)))
         menu.addItem(action("Restart Services", #selector(restart)))
@@ -123,6 +126,23 @@ final class MenuController: NSObject {
     @objc private func stopServer() { supervisor.stopServerRequested() }
     @objc private func enableConnector() { supervisor.enableConnectorRequested() }
     @objc private func disableConnector() { supervisor.disableConnectorRequested() }
+    @objc private func copyConnectorURL() {
+        supervisor.copyConnectorURLRequested { [weak self] result in
+            switch result {
+            case let .success(classification):
+                let details: String
+                switch classification {
+                case .unchanged:
+                    details = "The current authenticated connector URL was copied. Existing client handoff is current."
+                case .changed, .notAvailable:
+                    details = "The current authenticated connector URL was copied. Give it only to a trusted client."
+                }
+                self?.show(message: "Connector URL copied", details: details)
+            case .failure:
+                self?.showFailure()
+            }
+        }
+    }
     @objc private func restart() { supervisor.restartRequested() }
     @objc private func runDoctor() {
         let operations = self.operations

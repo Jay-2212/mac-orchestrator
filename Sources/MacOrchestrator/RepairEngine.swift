@@ -51,6 +51,9 @@ extension RepairActionID: CaseIterable {
             .reassignLocalPort,
             .repairLaunchAgent,
             .rerunVerifiedBootstrap,
+            .replaceNgrokCredential,
+            .rotateConnectorCredential,
+            .reconfigureRemoteClients,
         ]
     }
 }
@@ -254,6 +257,8 @@ struct RepairEngine: Sendable {
                 for: action,
                 result: await adapter.handoffVerifiedBootstrap()
             )
+        case .replaceNgrokCredential, .rotateConnectorCredential, .reconfigureRemoteClients:
+            return outcome(for: action, status: .requiresUserAction)
         }
     }
 
@@ -340,6 +345,14 @@ private enum SafeRepairReasons {
                 return "Open the requested System Settings pane, grant access, then run Doctor again."
             case .rerunVerifiedBootstrap:
                 return "Verified bootstrap handoff is ready; follow the pinned release installation guidance."
+            case .replaceNgrokCredential:
+                return "Enter a replacement ngrok credential through the helper's protected input, then run Doctor again."
+            case .retryRemoteConnector:
+                return "Retry remote endpoint reconciliation and authenticated readiness before considering deliberate credential rotation."
+            case .rotateConnectorCredential:
+                return "Use connector-credential rotation only for compromise, revocation, or requested renewal, then update authorized clients manually."
+            case .reconfigureRemoteClients:
+                return "Copy the current connector URL into clients you have recorded; Mac Orchestrator does not inspect or rewrite client configuration."
             default:
                 return "User action is required; review Doctor guidance and run Doctor again."
             }

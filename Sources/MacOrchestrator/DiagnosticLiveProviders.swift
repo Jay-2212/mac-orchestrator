@@ -873,11 +873,13 @@ struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
     private let configurationPresent: Bool
     private let ownershipMarkerPresent: Bool
     private let target: String
+    private let providerCredentialState: RemoteProviderCredentialState
     private let httpRunner: any DiagnosticHTTPRunning
     private let keychainPresenceProvider: any SelectiveKeychainPresenceProviding
     private let ownerID: String?
     private let processRunner: (any DiagnosticProcessRunning)?
     private let expectedBinaryPath: String?
+    private let stateStore: any RemoteConnectorStatePersisting
 
     init(
         desired: Bool,
@@ -885,6 +887,7 @@ struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
         configurationPresent: Bool,
         target: String,
         ownershipMarkerPresent: Bool = false,
+        providerCredentialState: RemoteProviderCredentialState = .notObserved,
         httpRunner: any DiagnosticHTTPRunning,
         keychainPresenceProvider: any SelectiveKeychainPresenceProviding = ReadOnlySystemKeychainPresenceProvider(),
         binaryArchitecture: String? = nil,
@@ -892,6 +895,7 @@ struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
         ownerID: String? = nil,
         processRunner: (any DiagnosticProcessRunning)? = nil,
         expectedBinaryPath: String? = nil,
+        stateStore: any RemoteConnectorStatePersisting = RemoteConnectorStateStore(),
         pathsSafe: Bool = true
     ) {
         self.desired = desired
@@ -902,11 +906,13 @@ struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
         self.configurationPresent = configurationPresent
         self.ownershipMarkerPresent = ownershipMarkerPresent
         self.target = target
+        self.providerCredentialState = providerCredentialState
         self.httpRunner = httpRunner
         self.keychainPresenceProvider = keychainPresenceProvider
         self.ownerID = ownerID
         self.processRunner = processRunner
         self.expectedBinaryPath = expectedBinaryPath
+        self.stateStore = stateStore
     }
 
     init(
@@ -915,6 +921,7 @@ struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
         configurationURL: URL,
         target: String,
         ownershipMarkerPresent: Bool = false,
+        providerCredentialState: RemoteProviderCredentialState = .notObserved,
         httpRunner: any DiagnosticHTTPRunning,
         fileManager: FileManager = .default,
         keychainPresenceProvider: any SelectiveKeychainPresenceProviding = ReadOnlySystemKeychainPresenceProvider(),
@@ -933,6 +940,7 @@ struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
             configurationPresent: pathsSafe && fileManager.fileExists(atPath: configurationURL.path),
             target: target,
             ownershipMarkerPresent: ownershipMarkerPresent,
+            providerCredentialState: providerCredentialState,
             httpRunner: httpRunner,
             keychainPresenceProvider: keychainPresenceProvider,
             binaryArchitecture: binaryFacts.architecture,
@@ -949,6 +957,7 @@ struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
         paths: DiagnosticPathSet,
         target: String,
         ownershipMarkerPresent: Bool = false,
+        providerCredentialState: RemoteProviderCredentialState = .notObserved,
         httpRunner: any DiagnosticHTTPRunning,
         fileManager: FileManager = .default,
         keychainPresenceProvider: any SelectiveKeychainPresenceProviding = ReadOnlySystemKeychainPresenceProvider(),
@@ -962,6 +971,7 @@ struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
             configurationURL: paths.ngrokConfigURL,
             target: target,
             ownershipMarkerPresent: ownershipMarkerPresent,
+            providerCredentialState: providerCredentialState,
             httpRunner: httpRunner,
             fileManager: fileManager,
             keychainPresenceProvider: keychainPresenceProvider,
@@ -974,6 +984,7 @@ struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
     init(
         desired: Bool,
         target: String,
+        providerCredentialState: RemoteProviderCredentialState = .notObserved,
         httpRunner: any DiagnosticHTTPRunning,
         fileManager: FileManager = .default,
         keychainPresenceProvider: any SelectiveKeychainPresenceProviding = ReadOnlySystemKeychainPresenceProvider(),
@@ -985,6 +996,7 @@ struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
             desired: desired,
             paths: .defaultPaths(fileManager: fileManager),
             target: target,
+            providerCredentialState: providerCredentialState,
             httpRunner: httpRunner,
             fileManager: fileManager,
             keychainPresenceProvider: keychainPresenceProvider,
@@ -995,7 +1007,8 @@ struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
     }
 
     func inspect() throws -> RemoteConnectorFacts {
-        try inspectDetailed().facts
+        let inspection = try inspectDetailed()
+        return inspection.facts.with(identity: currentIdentityFacts())
     }
 
     func inspectDetailed() throws -> RemoteConnectorInspection {
@@ -1008,45 +1021,100 @@ struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
                 desired: true,
                 binaryPresent: false,
                 configurationPresent: false,
-                ownershipMarkerPresent: false
+                ownershipMarkerPresent: false,
+                providerCredentialState: providerCredentialState
             ), ngrokAuthtokenPresence: authPresence)
         }
-        let ownership = inspectOwnership()
-        guard !ownershipInspectionConfigured || ownership else {
+        let processState = inspectProcessState()
+        guard !ownershipInspectionConfigured || processState == .owned else {
             return RemoteConnectorInspection(facts: RemoteConnectorFacts(
                 desired: true,
                 binaryPresent: binaryPresent,
                 configurationPresent: configurationPresent,
                 ownershipMarkerPresent: false,
                 binaryArchitecture: binaryArchitecture,
-                originalVendorSigning: originalVendorSigning
+                originalVendorSigning: originalVendorSigning,
+                providerCredentialState: providerCredentialState,
+                managedProcessState: processState
             ), ngrokAuthtokenPresence: authPresence)
         }
-        let url = URL(string: "http://127.0.0.1:4040/api/endpoints")!
-        guard let response = try? httpRunner.get(url), response.status == 200, response.url == url else {
+        let endpointURL = NgrokRemoteConnectorAdapter.defaultAgentAPIEndpointURL
+        guard let response = try? httpRunner.get(endpointURL) else {
             return RemoteConnectorInspection(facts: RemoteConnectorFacts(
                 desired: true,
                 binaryPresent: binaryPresent,
                 configurationPresent: configurationPresent,
-                ownershipMarkerPresent: ownership,
+                ownershipMarkerPresent: processState == .owned || (!ownershipInspectionConfigured && ownershipMarkerPresent),
                 binaryArchitecture: binaryArchitecture,
-                originalVendorSigning: originalVendorSigning
+                originalVendorSigning: originalVendorSigning,
+                providerCredentialState: providerCredentialState,
+                managedProcessState: processState,
+                agentAPIState: .unavailable
             ), ngrokAuthtokenPresence: authPresence)
         }
-        let endpointCount = (try? JSONSerialization.jsonObject(with: response.body) as? [String: Any])
-            .flatMap { $0["endpoints"] as? [[String: Any]] }?.count ?? 0
-        let endpointAvailable = endpointCount > 0
-            && NgrokEndpointParser.publicURL(from: response.body, matching: target) != nil
+        let inspection = NgrokRemoteConnectorAdapter.inspectAgentAPIResponse(
+            status: response.status,
+            url: response.url,
+            body: response.body,
+            expectedURL: endpointURL
+        )
+        guard case let .available(endpoints) = inspection else {
+            let agentAPIState: RemoteAgentAPIState
+            switch inspection {
+            case .unavailable:
+                agentAPIState = .unavailable
+            case .invalidResponse:
+                agentAPIState = .malformed
+            case .available:
+                agentAPIState = .available
+            }
+            return RemoteConnectorInspection(facts: RemoteConnectorFacts(
+                desired: true,
+                binaryPresent: binaryPresent,
+                configurationPresent: configurationPresent,
+                ownershipMarkerPresent: processState == .owned || (!ownershipInspectionConfigured && ownershipMarkerPresent),
+                binaryArchitecture: binaryArchitecture,
+                originalVendorSigning: originalVendorSigning,
+                providerCredentialState: providerCredentialState,
+                managedProcessState: processState,
+                agentAPIState: agentAPIState
+            ), ngrokAuthtokenPresence: authPresence)
+        }
+        let endpointState: RemoteEndpointState
+        let reconciliation = NgrokRemoteConnectorAdapter().reconcileEndpoint(
+            from: inspection,
+            matching: target
+        )
+        switch reconciliation {
+        case .current:
+            endpointState = .established
+        case .foreign:
+            endpointState = .foreignOnly
+        case .ambiguous:
+            endpointState = .ambiguous
+        case .missing:
+            endpointState = .noExpectedUpstream
+        case .invalidAgentAPIResponse:
+            endpointState = .noExpectedUpstream
+        case .agentAPIUnavailable:
+            endpointState = .noExpectedUpstream
+        }
+        let endpointAvailable = endpointState == .established
+        let ownershipMarker = processState == .owned || (!ownershipInspectionConfigured && ownershipMarkerPresent)
         return RemoteConnectorInspection(
             facts: RemoteConnectorFacts(
                 desired: true,
                 binaryPresent: binaryPresent,
                 configurationPresent: configurationPresent,
                 endpointAvailable: endpointAvailable,
-                endpointCount: endpointCount,
-                ownershipMarkerPresent: ownership,
+                endpointCount: endpoints.count,
+                ownershipMarkerPresent: ownershipMarker,
                 binaryArchitecture: binaryArchitecture,
-                originalVendorSigning: originalVendorSigning
+                originalVendorSigning: originalVendorSigning,
+                providerCredentialState: providerCredentialState,
+                managedProcessState: processState,
+                agentAPIState: .available,
+                endpointState: endpointState
             ),
             ngrokAuthtokenPresence: authPresence
         )
@@ -1056,16 +1124,37 @@ struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
         return (try? keychainPresenceProvider.inspect(items: [.ngrokAuthtoken]))?.presence(for: .ngrokAuthtoken) ?? .inaccessible
     }
 
-    private func inspectOwnership() -> Bool {
-        guard let ownerID, let processRunner else {
-            return ownershipMarkerPresent
+    private func currentIdentityFacts() -> RemoteConnectorIdentityFacts? {
+        do {
+            guard let state = try stateStore.load() else { return nil }
+            return RemoteConnectorIdentityFacts(
+                connectorCredentialGeneration: state.connectorCredentialGeneration,
+                verifiedPublicOrigin: state.lastVerifiedPublicOrigin,
+                clientHandoff: state.clientHandoffClassification
+            )
+        } catch {
+            return nil
         }
-        let matches = processRunner.snapshot().filter { process in
+    }
+
+    private func inspectProcessState() -> RemoteManagedProcessState {
+        guard let ownerID, let processRunner else {
+            return ownershipMarkerPresent ? .owned : .notObserved
+        }
+        let candidates = processRunner.snapshot().filter { process in
             process.running
                 && (expectedBinaryPath == nil || process.commandLine.split { $0 == " " || $0 == "\t" }.map(String.init).contains(expectedBinaryPath!))
-                && matchesExactOwnershipMarker(commandLine: process.commandLine, component: .tunnel, ownerID: ownerID)
         }
-        return matches.count == 1
+        let matches = candidates.filter { process in
+            matchesExactOwnershipMarker(commandLine: process.commandLine, component: .tunnel, ownerID: ownerID)
+        }
+        if matches.count == 1, candidates.count == 1 {
+            return .owned
+        }
+        if candidates.isEmpty {
+            return .missing
+        }
+        return .ambiguous
     }
 
     private var ownershipInspectionConfigured: Bool {
@@ -1101,6 +1190,93 @@ struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
         if lower.contains("arm64") { return "arm64" }
         if lower.contains("x86_64") { return "x86_64" }
         return nil
+    }
+
+}
+
+/// Read-only authenticated remote diagnostic provider. It shares the strict
+/// adapter, URL builder, current-core inventory, and activation probe used by
+/// the lifecycle supervisor. It never writes connector state or credentials.
+final class ReadOnlyRemoteAuthenticatedMCPDiagnosticProvider: @unchecked Sendable,
+    RemoteAuthenticatedMCPDiagnosticProviding {
+    private let configuration: AppConfiguration
+    private let keychain: KeychainStore
+    private let adapter: any RemoteConnectorAdapter
+    private let stateStore: any RemoteConnectorStatePersisting
+    private let session: URLSession
+    private let expectationsProvider: CurrentCoreMCPExpectationProvider
+
+    init(
+        configuration: AppConfiguration,
+        keychain: KeychainStore = KeychainStore(),
+        adapter: any RemoteConnectorAdapter = NgrokRemoteConnectorAdapter(),
+        stateStore: any RemoteConnectorStatePersisting = RemoteConnectorStateStore(),
+        session: URLSession = NoRedirectURLSession.make(),
+        expectationsProvider: CurrentCoreMCPExpectationProvider = CurrentCoreMCPExpectationProvider()
+    ) {
+        self.configuration = configuration
+        self.keychain = keychain
+        self.adapter = adapter
+        self.stateStore = stateStore
+        self.session = session
+        self.expectationsProvider = expectationsProvider
+    }
+
+    func inspect() async throws -> RemoteAuthenticatedMCPFacts {
+        let expectedTools = expectationsProvider
+            .expectations(for: configuration)
+            .expectedTools
+        let handoff = currentHandoffClassification()
+        let connectorToken: String
+        do {
+            guard let existing = try keychain.value(for: .connectorToken),
+                  !existing.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                return RemoteAuthenticatedMCPFacts(
+                    clientHandoff: handoff
+                )
+            }
+            connectorToken = existing
+        } catch {
+            return RemoteAuthenticatedMCPFacts(
+                clientHandoff: handoff
+            )
+        }
+
+        let inspection = await adapter.inspectAgentAPI()
+        let reconciliation = adapter.reconcileEndpoint(
+            from: inspection,
+            matching: "http://127.0.0.1:\(configuration.localMCPPort)"
+        )
+        guard case let .current(publicURL) = reconciliation,
+              let publicOrigin = try? RemotePublicOrigin(publicURL.absoluteString),
+              let connectorURL = ConnectorURLBuilder.make(
+                  publicOrigin: publicOrigin,
+                  capabilityToken: connectorToken
+              ) else {
+            return RemoteAuthenticatedMCPFacts(
+                clientHandoff: handoff
+            )
+        }
+
+        let outcome = await RemoteActivationProbe(
+            url: connectorURL,
+            expectedTools: expectedTools,
+            session: session
+        ).runOutcome()
+        return RemoteAuthenticatedMCPFacts.from(
+            probeAvailable: true,
+            expectedTools: expectedTools,
+            outcome: outcome,
+            clientHandoff: handoff
+        )
+    }
+
+    private func currentHandoffClassification() -> RemoteClientHandoffClassification {
+        do {
+            return try stateStore.load()?.clientHandoffClassification ?? .notAvailable
+        } catch {
+            return .notAvailable
+        }
     }
 }
 

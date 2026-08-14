@@ -180,6 +180,46 @@ struct CapabilitySnapshot: Codable, Equatable, Sendable {
             policy: try container.decode(CapabilityPolicySnapshot.self, forKey: .policy)
         )
     }
+
+    /// Projects live lifecycle readiness without changing the launch contract
+    /// or claiming that a startup capability probe authenticated the remote
+    /// connector. The remote capability remains dependent on the local core
+    /// session and the current lifecycle-owned remote readiness.
+    func projected(from lifecycle: LifecycleSnapshot) -> CapabilitySnapshot {
+        guard let remote = capabilities["remote.connector"],
+              remote.configured,
+              remote.desired else {
+            return self
+        }
+
+        var projectedCapabilities = capabilities
+        let coreReady = capabilities["core.session"]?.ready == true
+        let remoteReady = coreReady && lifecycle.remoteConnector.isReady
+        let reason: String?
+        if remoteReady {
+            reason = nil
+        } else if !coreReady {
+            reason = "Depends on core.session being ready."
+        } else {
+            reason = "Remote connector readiness has not been authenticated."
+        }
+        projectedCapabilities["remote.connector"] = CapabilityState(
+            desired: remote.desired,
+            configured: remote.configured,
+            ready: remoteReady,
+            health: remoteReady ? .ready : .degraded,
+            dependencies: remote.dependencies,
+            reason: reason
+        )
+
+        return CapabilitySnapshot(
+            snapshotSchemaVersion: snapshotSchemaVersion,
+            configGeneration: configGeneration,
+            controlProfile: controlProfile,
+            capabilities: projectedCapabilities,
+            policy: policy
+        )
+    }
 }
 
 enum CapabilitySnapshotCodec {

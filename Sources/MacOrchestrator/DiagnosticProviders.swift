@@ -596,6 +596,221 @@ protocol LocalMCPDiagnosticProviding {
     func inspect() throws -> LocalMCPFacts
 }
 
+enum RemoteLocalMCPPrerequisiteState: String, Codable, Equatable, Sendable {
+    case notObserved
+    case unavailable
+    case available
+}
+
+enum RemoteProviderCredentialState: String, Codable, Equatable, Sendable {
+    case notObserved
+    case accepted
+    case rejected
+}
+
+enum RemoteManagedProcessState: String, Codable, Equatable, Sendable {
+    case notObserved
+    case missing
+    case owned
+    case ambiguous
+}
+
+enum RemoteAgentAPIState: String, Codable, Equatable, Sendable {
+    case notObserved
+    case unavailable
+    case malformed
+    case available
+}
+
+enum RemoteEndpointState: String, Codable, Equatable, Sendable {
+    case notObserved
+    case noExpectedUpstream
+    case foreignOnly
+    case ambiguous
+    case established
+}
+
+enum RemoteAuthenticatedMCPState: String, Codable, Equatable, Sendable {
+    case notRun
+    case authenticationRejected
+    case initializeSessionFailed
+    case inventoryMismatch
+    case safeCallFailed
+    case ready
+}
+
+typealias RemoteClientHandoffState = RemoteClientHandoffClassification
+
+struct RemoteAuthenticatedMCPFacts: Codable, Equatable, Sendable {
+    let probeAvailable: Bool
+    let probeRun: Bool
+    let authenticationSucceeded: Bool
+    let initializeSucceeded: Bool
+    let sessionEstablished: Bool
+    let inventoryChecked: Bool
+    let expectedTools: Set<String>
+    let exposedTools: Set<String>
+    let safeCallChecked: Bool
+    let safeCallSucceeded: Bool
+    let clientHandoff: RemoteClientHandoffState
+    let state: RemoteAuthenticatedMCPState
+
+    init(
+        probeAvailable: Bool = false,
+        probeRun: Bool = false,
+        authenticationSucceeded: Bool = false,
+        initializeSucceeded: Bool = false,
+        sessionEstablished: Bool = false,
+        inventoryChecked: Bool = false,
+        expectedTools: Set<String> = [],
+        exposedTools: Set<String> = [],
+        safeCallChecked: Bool = false,
+        safeCallSucceeded: Bool = false,
+        clientHandoff: RemoteClientHandoffState = .notAvailable
+    ) {
+        self.probeAvailable = probeAvailable
+        self.probeRun = probeRun
+        self.authenticationSucceeded = authenticationSucceeded
+        self.initializeSucceeded = initializeSucceeded
+        self.sessionEstablished = sessionEstablished
+        self.inventoryChecked = inventoryChecked
+        self.expectedTools = expectedTools
+        self.exposedTools = exposedTools
+        self.safeCallChecked = safeCallChecked
+        self.safeCallSucceeded = safeCallSucceeded
+        self.clientHandoff = clientHandoff
+        self.state = Self.classify(
+            probeAvailable: probeAvailable,
+            probeRun: probeRun,
+            authenticationSucceeded: authenticationSucceeded,
+            initializeSucceeded: initializeSucceeded,
+            sessionEstablished: sessionEstablished,
+            inventoryChecked: inventoryChecked,
+            expectedTools: expectedTools,
+            exposedTools: exposedTools,
+            safeCallChecked: safeCallChecked,
+            safeCallSucceeded: safeCallSucceeded
+        )
+    }
+
+    static let notRun = RemoteAuthenticatedMCPFacts()
+
+    private static func classify(
+        probeAvailable: Bool,
+        probeRun: Bool,
+        authenticationSucceeded: Bool,
+        initializeSucceeded: Bool,
+        sessionEstablished: Bool,
+        inventoryChecked: Bool,
+        expectedTools: Set<String>,
+        exposedTools: Set<String>,
+        safeCallChecked: Bool,
+        safeCallSucceeded: Bool
+    ) -> RemoteAuthenticatedMCPState {
+        guard probeAvailable, probeRun else { return .notRun }
+        guard authenticationSucceeded else { return .authenticationRejected }
+        guard initializeSucceeded, sessionEstablished else { return .initializeSessionFailed }
+        guard inventoryChecked else { return .notRun }
+        guard expectedTools == exposedTools else { return .inventoryMismatch }
+        guard safeCallChecked else { return .notRun }
+        guard safeCallSucceeded else { return .safeCallFailed }
+        return .ready
+    }
+}
+
+extension RemoteAuthenticatedMCPFacts {
+    static func from(
+        probeAvailable: Bool,
+        expectedTools: Set<String>,
+        outcome: RemoteActivationProbeOutcome,
+        clientHandoff: RemoteClientHandoffState = .notAvailable
+    ) -> RemoteAuthenticatedMCPFacts {
+        if let details = outcome.details {
+            return RemoteAuthenticatedMCPFacts(
+                probeAvailable: probeAvailable,
+                probeRun: true,
+                authenticationSucceeded: true,
+                initializeSucceeded: true,
+                sessionEstablished: details.sessionEstablished,
+                inventoryChecked: true,
+                expectedTools: expectedTools,
+                exposedTools: details.exposedTools,
+                safeCallChecked: true,
+                safeCallSucceeded: details.safeCallSucceeded,
+                clientHandoff: clientHandoff
+            )
+        }
+
+        let error = outcome.error
+        let authenticationSucceeded: Bool
+        let initializeSucceeded: Bool
+        let sessionEstablished: Bool
+        let inventoryChecked: Bool
+        let safeCallChecked: Bool
+        switch error {
+        case .missingSessionID, .invalidSessionID:
+            authenticationSucceeded = true
+            initializeSucceeded = false
+            sessionEstablished = false
+            inventoryChecked = false
+            safeCallChecked = false
+        case .missingRequiredTool, .unexpectedToolInventory:
+            authenticationSucceeded = true
+            initializeSucceeded = true
+            sessionEstablished = true
+            inventoryChecked = true
+            safeCallChecked = false
+        case .safeCallFailed:
+            authenticationSucceeded = true
+            initializeSucceeded = true
+            sessionEstablished = true
+            inventoryChecked = true
+            safeCallChecked = true
+        case let .mcpRequestFailed(method, _):
+            let initializeRequest = method == "initialize"
+            authenticationSucceeded = !initializeRequest
+            initializeSucceeded = !initializeRequest && outcome.phase != .initialize
+            sessionEstablished = outcome.phase == .toolsList || outcome.phase == .safeCall
+            inventoryChecked = outcome.phase == .safeCall
+            safeCallChecked = outcome.phase == .safeCall
+        case let .mcpResponseInvalid(method):
+            let initializeResponse = method == "initialize"
+            authenticationSucceeded = !initializeResponse
+            initializeSucceeded = !initializeResponse
+            sessionEstablished = outcome.phase == .toolsList || outcome.phase == .safeCall
+            inventoryChecked = outcome.phase == .safeCall
+            safeCallChecked = outcome.phase == .safeCall
+        case let .mcpError(method):
+            let initializeError = method == "initialize"
+            authenticationSucceeded = !initializeError
+            initializeSucceeded = !initializeError
+            sessionEstablished = outcome.phase == .toolsList || outcome.phase == .safeCall
+            inventoryChecked = outcome.phase == .safeCall
+            safeCallChecked = outcome.phase == .safeCall
+        case .transport, .redirectedResponse, .invalidRemoteURL, nil:
+            authenticationSucceeded = false
+            initializeSucceeded = false
+            sessionEstablished = false
+            inventoryChecked = false
+            safeCallChecked = false
+        }
+
+        return RemoteAuthenticatedMCPFacts(
+            probeAvailable: probeAvailable,
+            probeRun: true,
+            authenticationSucceeded: authenticationSucceeded,
+            initializeSucceeded: initializeSucceeded,
+            sessionEstablished: sessionEstablished,
+            inventoryChecked: inventoryChecked,
+            expectedTools: expectedTools,
+            exposedTools: [],
+            safeCallChecked: safeCallChecked,
+            safeCallSucceeded: false,
+            clientHandoff: clientHandoff
+        )
+    }
+}
+
 struct RemoteConnectorFacts: Codable, Equatable, Sendable {
     let desired: Bool
     let binaryPresent: Bool
@@ -605,6 +820,13 @@ struct RemoteConnectorFacts: Codable, Equatable, Sendable {
     let endpointAvailable: Bool
     let endpointCount: Int
     let ownershipMarkerPresent: Bool
+    let providerCredentialState: RemoteProviderCredentialState
+    let managedProcessState: RemoteManagedProcessState
+    let agentAPIState: RemoteAgentAPIState
+    let endpointState: RemoteEndpointState
+    let localMCPPrerequisite: RemoteLocalMCPPrerequisiteState
+    let authenticatedReadiness: RemoteAuthenticatedMCPFacts
+    let identity: RemoteConnectorIdentityFacts?
 
     init(
         desired: Bool = false,
@@ -614,7 +836,14 @@ struct RemoteConnectorFacts: Codable, Equatable, Sendable {
         endpointCount: Int = 0,
         ownershipMarkerPresent: Bool = false,
         binaryArchitecture: String? = nil,
-        originalVendorSigning: Bool? = nil
+        originalVendorSigning: Bool? = nil,
+        providerCredentialState: RemoteProviderCredentialState = .notObserved,
+        managedProcessState: RemoteManagedProcessState? = nil,
+        agentAPIState: RemoteAgentAPIState = .notObserved,
+        endpointState: RemoteEndpointState? = nil,
+        localMCPPrerequisite: RemoteLocalMCPPrerequisiteState = .notObserved,
+        authenticatedReadiness: RemoteAuthenticatedMCPFacts = .notRun,
+        identity: RemoteConnectorIdentityFacts? = nil
     ) {
         self.desired = desired
         self.binaryPresent = binaryPresent
@@ -624,6 +853,95 @@ struct RemoteConnectorFacts: Codable, Equatable, Sendable {
         self.endpointAvailable = endpointAvailable
         self.endpointCount = endpointCount
         self.ownershipMarkerPresent = ownershipMarkerPresent
+        self.providerCredentialState = providerCredentialState
+        self.managedProcessState = managedProcessState
+            ?? (ownershipMarkerPresent ? .owned : .notObserved)
+        self.agentAPIState = agentAPIState
+        self.endpointState = endpointState
+            ?? (endpointAvailable ? .established : .notObserved)
+        self.localMCPPrerequisite = localMCPPrerequisite
+        self.authenticatedReadiness = authenticatedReadiness
+        self.identity = identity
+    }
+
+    func with(
+        localMCPPrerequisite: RemoteLocalMCPPrerequisiteState
+    ) -> RemoteConnectorFacts {
+        RemoteConnectorFacts(
+            desired: desired,
+            binaryPresent: binaryPresent,
+            configurationPresent: configurationPresent,
+            endpointAvailable: endpointAvailable,
+            endpointCount: endpointCount,
+            ownershipMarkerPresent: ownershipMarkerPresent,
+            binaryArchitecture: binaryArchitecture,
+            originalVendorSigning: originalVendorSigning,
+            providerCredentialState: providerCredentialState,
+            managedProcessState: managedProcessState,
+            agentAPIState: agentAPIState,
+            endpointState: endpointState,
+            localMCPPrerequisite: localMCPPrerequisite,
+            authenticatedReadiness: authenticatedReadiness,
+            identity: identity
+        )
+    }
+
+    func with(
+        authenticatedReadiness: RemoteAuthenticatedMCPFacts
+    ) -> RemoteConnectorFacts {
+        RemoteConnectorFacts(
+            desired: desired,
+            binaryPresent: binaryPresent,
+            configurationPresent: configurationPresent,
+            endpointAvailable: endpointAvailable,
+            endpointCount: endpointCount,
+            ownershipMarkerPresent: ownershipMarkerPresent,
+            binaryArchitecture: binaryArchitecture,
+            originalVendorSigning: originalVendorSigning,
+            providerCredentialState: providerCredentialState,
+            managedProcessState: managedProcessState,
+            agentAPIState: agentAPIState,
+            endpointState: endpointState,
+            localMCPPrerequisite: localMCPPrerequisite,
+            authenticatedReadiness: authenticatedReadiness,
+            identity: identity
+        )
+    }
+
+    func with(
+        identity: RemoteConnectorIdentityFacts?
+    ) -> RemoteConnectorFacts {
+        RemoteConnectorFacts(
+            desired: desired,
+            binaryPresent: binaryPresent,
+            configurationPresent: configurationPresent,
+            endpointAvailable: endpointAvailable,
+            endpointCount: endpointCount,
+            ownershipMarkerPresent: ownershipMarkerPresent,
+            binaryArchitecture: binaryArchitecture,
+            originalVendorSigning: originalVendorSigning,
+            providerCredentialState: providerCredentialState,
+            managedProcessState: managedProcessState,
+            agentAPIState: agentAPIState,
+            endpointState: endpointState,
+            localMCPPrerequisite: localMCPPrerequisite,
+            authenticatedReadiness: authenticatedReadiness,
+            identity: identity
+        )
+    }
+
+    var isInternallyConsistent: Bool {
+        guard endpointCount >= 0 else { return false }
+        switch endpointState {
+        case .established:
+            guard endpointAvailable else { return false }
+        case .notObserved, .noExpectedUpstream, .foreignOnly, .ambiguous:
+            guard !endpointAvailable else { return false }
+        }
+        if authenticatedReadiness.state == .ready {
+            guard endpointState == .established, endpointAvailable else { return false }
+        }
+        return true
     }
 }
 
@@ -684,6 +1002,10 @@ struct ReadOnlyLogDirectoryPermissionsProvider: LogDirectoryPermissionsProviding
 
 protocol RemoteConnectorFactsProviding {
     func inspect() throws -> RemoteConnectorFacts
+}
+
+protocol RemoteAuthenticatedMCPDiagnosticProviding: Sendable {
+    func inspect() async throws -> RemoteAuthenticatedMCPFacts
 }
 
 struct DiskSpaceFacts: Codable, Equatable, Sendable {

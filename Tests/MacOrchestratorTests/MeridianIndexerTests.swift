@@ -82,6 +82,10 @@ final class MeridianIndexerTests: XCTestCase {
             )
         )
         XCTAssertNil(MeridianIndexerProgressEvent.parse(line: String(repeating: "x", count: 17_000)))
+        XCTAssertEqual(
+            MeridianIndexerProgressEvent.parse(line: #"{"type":"error","code":"remote_url_invalid"}"#)?.code,
+            "remote_url_invalid"
+        )
     }
 
     func testOptionalToolInstallRejectsBadDigestWithoutReplacingKnownGood() throws {

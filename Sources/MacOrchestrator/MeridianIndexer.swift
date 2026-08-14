@@ -281,6 +281,8 @@ struct MeridianIndexerProgressEvent: Codable, Equatable, Sendable {
             allowed = ["protocol_version", "type", "source_id", "relative_path", "generation"]
         case "result":
             allowed = ["type", "status", "counts"]
+        case "error":
+            allowed = ["type", "code"]
         default: return nil
         }
         guard Set(dictionary.keys).isSubset(of: allowed) else { return nil }
@@ -293,6 +295,8 @@ struct MeridianIndexerProgressEvent: Codable, Equatable, Sendable {
         }
         if let generation = decoded.generation,
            generation.range(of: "^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$", options: .regularExpression) == nil { return nil }
+        if let code = decoded.code,
+           code.range(of: "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$", options: .regularExpression) == nil { return nil }
         return decoded
     }
 }
@@ -362,15 +366,21 @@ struct MeridianIndexerToolInstaller {
     var installedURL: URL { rootURL.appendingPathComponent("indexer", isDirectory: false) }
     var previousURL: URL { rootURL.appendingPathComponent("indexer.previous", isDirectory: false) }
 
+    static func isValidOwnedExecutable(at url: URL, fileManager: FileManager = .default) -> Bool {
+        guard fileManager.fileExists(atPath: url.path),
+              (try? fileManager.destinationOfSymbolicLink(atPath: url.path)) == nil,
+              fileManager.isExecutableFile(atPath: url.path),
+              (try? fileManager.attributesOfItem(atPath: url.path)[.type] as? FileAttributeType) == .typeRegular
+        else { return false }
+        return true
+    }
+
     @discardableResult
     func install(candidateURL: URL, expectedSHA256: String) throws -> URL {
         guard expectedSHA256.range(of: "^[A-Fa-f0-9]{64}$", options: .regularExpression) != nil else {
             throw MeridianIndexerError.invalidDigest
         }
-        guard fileManager.fileExists(atPath: candidateURL.path),
-              (try? fileManager.destinationOfSymbolicLink(atPath: candidateURL.path)) == nil,
-              fileManager.isExecutableFile(atPath: candidateURL.path),
-              (try? fileManager.attributesOfItem(atPath: candidateURL.path)[.type] as? FileAttributeType) == .typeRegular,
+        guard Self.isValidOwnedExecutable(at: candidateURL, fileManager: fileManager),
               let data = try? Data(contentsOf: candidateURL),
               MaintenanceDigest.sha256(data: data).caseInsensitiveCompare(expectedSHA256) == .orderedSame else {
             if let data = try? Data(contentsOf: candidateURL),
@@ -559,6 +569,10 @@ final class MeridianIndexerCoordinator {
         cancellationRequested = true
         process?.terminate()
         process = nil
+        configuration = nil
+        baseURL = nil
+        token = nil
+        rebuildOnNextRun = false
         outputBuffer.removeAll(keepingCapacity: false)
     }
 
@@ -592,7 +606,7 @@ final class MeridianIndexerCoordinator {
             publish(desired: true, status: .unavailable, error: "configuration_unavailable")
             return
         }
-        guard FileManager.default.isExecutableFile(atPath: toolURL.path) else {
+        guard MeridianIndexerToolInstaller.isValidOwnedExecutable(at: toolURL) else {
             publish(desired: true, status: .unavailable, error: "optional_indexer_unavailable")
             return
         }
@@ -642,6 +656,10 @@ final class MeridianIndexerCoordinator {
             } else if event.type == "run_finished" {
                 resultStatus = event.status.flatMap(MeridianIndexerRunStatus.init(rawValue:))
                 if let counts = event.counts { snapshot.counts = counts }
+            } else if event.type == "error" {
+                snapshot.lastErrorCode = event.code
+            } else if event.type == "source_failed" {
+                snapshot.lastErrorCode = event.code
             }
         }
     }
@@ -672,7 +690,10 @@ final class MeridianIndexerCoordinator {
         }
         snapshot.lastRunAt = scheduler.now
         snapshot.nextRunAt = nil
-        publish(desired: true, status: status, error: status == .failed ? "process_failed" : nil)
+        let errorCode = status == .failed
+            ? (snapshot.lastErrorCode ?? "process_failed")
+            : snapshot.lastErrorCode
+        publish(desired: true, status: status, error: errorCode)
         if let configuration {
             scheduleRetry(after: configuration.intervalMinutes)
         }

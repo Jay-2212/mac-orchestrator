@@ -65,7 +65,7 @@ The helper and runtime are owned by the installing macOS user:
 ├── remote/ngrok/ngrok.yml
 ├── meridian/indexer                 # optional separately installed tool
 ├── meridian/indexer.previous        # last-known-good optional tool
-└── meridian/index-state.json        # owned by Meridian's indexer
+├── meridian/index-state.json         # owned by Meridian's indexer
 └── install/{staging-*,runtime.previous/}
 ```
 

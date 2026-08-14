@@ -208,6 +208,7 @@ protocol RemoteConnectorAdapter: Sendable {
 
 struct NgrokRemoteConnectorAdapter: RemoteConnectorAdapter, Sendable {
     static let defaultAgentAPIBaseURL = URL(string: "http://127.0.0.1:4040/api")!
+    static let defaultAgentAPIEndpointURL = defaultAgentAPIBaseURL.appendingPathComponent("endpoints")
     static let maximumAgentAPIResponseBytes = 1_048_576
 
     private let agentAPIAddress: AgentAPIAddress?
@@ -274,7 +275,7 @@ struct NgrokRemoteConnectorAdapter: RemoteConnectorAdapter, Sendable {
         guard let agentAPIAddress else {
             return .unavailable
         }
-        let endpointURL = agentAPIAddress.url.appendingPathComponent("endpoints")
+        let endpointURL = Self.agentAPIEndpointURL(for: agentAPIAddress)
         var request = URLRequest(url: endpointURL)
         request.httpMethod = "GET"
         request.timeoutInterval = 1
@@ -282,21 +283,38 @@ struct NgrokRemoteConnectorAdapter: RemoteConnectorAdapter, Sendable {
 
         do {
             let (data, response) = try await session.data(for: request)
-            guard let httpResponse = response as? HTTPURLResponse,
-                  httpResponse.url == endpointURL,
-                  httpResponse.statusCode == 200 else {
+            guard let httpResponse = response as? HTTPURLResponse else {
                 return .unavailable
             }
-            guard data.count <= Self.maximumAgentAPIResponseBytes else {
-                return .invalidResponse
-            }
-            guard let endpoints = NgrokEndpointParser.endpoints(from: data) else {
-                return .invalidResponse
-            }
-            return .available(endpoints: endpoints)
+            return Self.inspectAgentAPIResponse(
+                status: httpResponse.statusCode,
+                url: httpResponse.url,
+                body: data,
+                expectedURL: endpointURL
+            )
         } catch {
             return .unavailable
         }
+    }
+
+    static func agentAPIEndpointURL(for address: AgentAPIAddress) -> URL {
+        address.url.appendingPathComponent("endpoints")
+    }
+
+    static func inspectAgentAPIResponse(
+        status: Int,
+        url: URL?,
+        body: Data,
+        expectedURL: URL
+    ) -> RemoteConnectorAgentAPIInspection {
+        guard status == 200, let url, url == expectedURL else {
+            return .unavailable
+        }
+        guard body.count <= Self.maximumAgentAPIResponseBytes,
+              let endpoints = NgrokEndpointParser.endpoints(from: body) else {
+            return .invalidResponse
+        }
+        return .available(endpoints: endpoints)
     }
 
     func reconcileEndpoint(

@@ -1038,9 +1038,8 @@ struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
                 managedProcessState: processState
             ), ngrokAuthtokenPresence: authPresence)
         }
-        let url = NgrokRemoteConnectorAdapter.defaultAgentAPIBaseURL
-            .appendingPathComponent("endpoints")
-        guard let response = try? httpRunner.get(url), response.status == 200, response.url == url else {
+        let endpointURL = NgrokRemoteConnectorAdapter.defaultAgentAPIEndpointURL
+        guard let response = try? httpRunner.get(endpointURL) else {
             return RemoteConnectorInspection(facts: RemoteConnectorFacts(
                 desired: true,
                 binaryPresent: binaryPresent,
@@ -1053,7 +1052,22 @@ struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
                 agentAPIState: .unavailable
             ), ngrokAuthtokenPresence: authPresence)
         }
-        guard let endpoints = NgrokEndpointParser.endpoints(from: response.body) else {
+        let inspection = NgrokRemoteConnectorAdapter.inspectAgentAPIResponse(
+            status: response.status,
+            url: response.url,
+            body: response.body,
+            expectedURL: endpointURL
+        )
+        guard case let .available(endpoints) = inspection else {
+            let agentAPIState: RemoteAgentAPIState
+            switch inspection {
+            case .unavailable:
+                agentAPIState = .unavailable
+            case .invalidResponse:
+                agentAPIState = .malformed
+            case .available:
+                agentAPIState = .available
+            }
             return RemoteConnectorInspection(facts: RemoteConnectorFacts(
                 desired: true,
                 binaryPresent: binaryPresent,
@@ -1063,12 +1077,12 @@ struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
                 originalVendorSigning: originalVendorSigning,
                 providerCredentialState: providerCredentialState,
                 managedProcessState: processState,
-                agentAPIState: .malformed
+                agentAPIState: agentAPIState
             ), ngrokAuthtokenPresence: authPresence)
         }
         let endpointState: RemoteEndpointState
-        let reconciliation = NgrokEndpointParser.reconcile(
-            endpoints: endpoints,
+        let reconciliation = NgrokRemoteConnectorAdapter().reconcileEndpoint(
+            from: inspection,
             matching: target
         )
         switch reconciliation {

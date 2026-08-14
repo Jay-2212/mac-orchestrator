@@ -32,17 +32,20 @@ enum RemoteProbeFailure: Error, Equatable, LocalizedError, Sendable {
 struct RemoteProbeRequest: Sendable {
     let tunnelTarget: String
     let connectorToken: String
+    let expectedTools: Set<String>?
     let knownPublicOrigin: RemotePublicOrigin?
     let forceAuthenticatedProbe: Bool
 
     init(
         tunnelTarget: String,
         connectorToken: String,
+        expectedTools: Set<String>? = nil,
         knownPublicOrigin: RemotePublicOrigin? = nil,
         forceAuthenticatedProbe: Bool = true
     ) {
         self.tunnelTarget = tunnelTarget
         self.connectorToken = connectorToken
+        self.expectedTools = expectedTools
         self.knownPublicOrigin = knownPublicOrigin
         self.forceAuthenticatedProbe = forceAuthenticatedProbe
     }
@@ -157,7 +160,10 @@ actor RemoteProbeCoordinator {
             return .failed(.invalidCredentialURL)
         }
 
-        let outcome = await probeRunner(connectorURL, expectedTools)
+        let outcome = await probeRunner(
+            connectorURL,
+            request.expectedTools ?? expectedTools
+        )
         guard let details = outcome.details else {
             return .failed(.activation(
                 outcome.error ?? .transport

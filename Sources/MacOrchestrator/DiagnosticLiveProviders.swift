@@ -864,10 +864,6 @@ struct RemoteConnectorInspection: Equatable, Sendable {
     let ngrokAuthtokenPresence: KeychainPresence?
 }
 
-private struct DiagnosticNgrokEndpointResponse: Decodable {
-    let endpoints: [NgrokEndpoint]
-}
-
 struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
     private let desired: Bool
     private let pathsSafe: Bool
@@ -883,6 +879,7 @@ struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
     private let ownerID: String?
     private let processRunner: (any DiagnosticProcessRunning)?
     private let expectedBinaryPath: String?
+    private let stateStore: any RemoteConnectorStatePersisting
 
     init(
         desired: Bool,
@@ -898,6 +895,7 @@ struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
         ownerID: String? = nil,
         processRunner: (any DiagnosticProcessRunning)? = nil,
         expectedBinaryPath: String? = nil,
+        stateStore: any RemoteConnectorStatePersisting = RemoteConnectorStateStore(),
         pathsSafe: Bool = true
     ) {
         self.desired = desired
@@ -914,6 +912,7 @@ struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
         self.ownerID = ownerID
         self.processRunner = processRunner
         self.expectedBinaryPath = expectedBinaryPath
+        self.stateStore = stateStore
     }
 
     init(
@@ -1008,7 +1007,8 @@ struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
     }
 
     func inspect() throws -> RemoteConnectorFacts {
-        try inspectDetailed().facts
+        let inspection = try inspectDetailed()
+        return inspection.facts.with(identity: currentIdentityFacts())
     }
 
     func inspectDetailed() throws -> RemoteConnectorInspection {
@@ -1052,10 +1052,7 @@ struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
                 agentAPIState: .unavailable
             ), ngrokAuthtokenPresence: authPresence)
         }
-        guard let endpointResponse = try? JSONDecoder().decode(
-            DiagnosticNgrokEndpointResponse.self,
-            from: response.body
-        ) else {
+        guard let endpoints = NgrokEndpointParser.endpoints(from: response.body) else {
             return RemoteConnectorInspection(facts: RemoteConnectorFacts(
                 desired: true,
                 binaryPresent: binaryPresent,
@@ -1068,22 +1065,24 @@ struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
                 agentAPIState: .malformed
             ), ngrokAuthtokenPresence: authPresence)
         }
-        let matchingUpstreamEndpoints = endpointResponse.endpoints.filter { endpoint in
-            normalizedAddress(endpoint.upstream.url) == normalizedAddress(target)
-        }
-        let matchingEndpoints = matchingUpstreamEndpoints.filter { endpoint in
-            isValidPublicHTTPSURL(endpoint.url)
-        }
         let endpointState: RemoteEndpointState
-        switch matchingEndpoints.count {
-        case 0:
-            endpointState = matchingUpstreamEndpoints.isEmpty && !endpointResponse.endpoints.isEmpty
-                ? .foreignOnly
-                : .noExpectedUpstream
-        case 1:
+        let reconciliation = NgrokEndpointParser.reconcile(
+            endpoints: endpoints,
+            matching: target
+        )
+        switch reconciliation {
+        case .current:
             endpointState = .established
-        default:
+        case .foreign:
+            endpointState = .foreignOnly
+        case .ambiguous:
             endpointState = .ambiguous
+        case .missing:
+            endpointState = .noExpectedUpstream
+        case .invalidAgentAPIResponse:
+            endpointState = .noExpectedUpstream
+        case .agentAPIUnavailable:
+            endpointState = .noExpectedUpstream
         }
         let endpointAvailable = endpointState == .established
         let ownershipMarker = processState == .owned || (!ownershipInspectionConfigured && ownershipMarkerPresent)
@@ -1093,7 +1092,7 @@ struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
                 binaryPresent: binaryPresent,
                 configurationPresent: configurationPresent,
                 endpointAvailable: endpointAvailable,
-                endpointCount: endpointResponse.endpoints.count,
+                endpointCount: endpoints.count,
                 ownershipMarkerPresent: ownershipMarker,
                 binaryArchitecture: binaryArchitecture,
                 originalVendorSigning: originalVendorSigning,
@@ -1108,6 +1107,19 @@ struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
 
     private func inspectAuthPresence() -> KeychainPresence {
         return (try? keychainPresenceProvider.inspect(items: [.ngrokAuthtoken]))?.presence(for: .ngrokAuthtoken) ?? .inaccessible
+    }
+
+    private func currentIdentityFacts() -> RemoteConnectorIdentityFacts? {
+        do {
+            guard let state = try stateStore.load() else { return nil }
+            return RemoteConnectorIdentityFacts(
+                connectorCredentialGeneration: state.connectorCredentialGeneration,
+                verifiedPublicOrigin: state.lastVerifiedPublicOrigin,
+                clientHandoff: state.clientHandoffClassification
+            )
+        } catch {
+            return nil
+        }
     }
 
     private func inspectProcessState() -> RemoteManagedProcessState {
@@ -1165,21 +1177,91 @@ struct ReadOnlyRemoteConnectorFactsProvider: RemoteConnectorFactsProviding {
         return nil
     }
 
-    private func isValidPublicHTTPSURL(_ value: String) -> Bool {
-        guard let url = URL(string: value) else { return false }
-        return url.scheme?.lowercased() == "https" && url.host != nil
+}
+
+/// Read-only authenticated remote diagnostic provider. It shares the strict
+/// adapter, URL builder, current-core inventory, and activation probe used by
+/// the lifecycle supervisor. It never writes connector state or credentials.
+final class ReadOnlyRemoteAuthenticatedMCPDiagnosticProvider: @unchecked Sendable,
+    RemoteAuthenticatedMCPDiagnosticProviding {
+    private let configuration: AppConfiguration
+    private let keychain: KeychainStore
+    private let adapter: any RemoteConnectorAdapter
+    private let stateStore: any RemoteConnectorStatePersisting
+    private let session: URLSession
+    private let expectationsProvider: CurrentCoreMCPExpectationProvider
+
+    init(
+        configuration: AppConfiguration,
+        keychain: KeychainStore = KeychainStore(),
+        adapter: any RemoteConnectorAdapter = NgrokRemoteConnectorAdapter(),
+        stateStore: any RemoteConnectorStatePersisting = RemoteConnectorStateStore(),
+        session: URLSession = NoRedirectURLSession.make(),
+        expectationsProvider: CurrentCoreMCPExpectationProvider = CurrentCoreMCPExpectationProvider()
+    ) {
+        self.configuration = configuration
+        self.keychain = keychain
+        self.adapter = adapter
+        self.stateStore = stateStore
+        self.session = session
+        self.expectationsProvider = expectationsProvider
     }
 
-    private func normalizedAddress(_ address: String) -> String {
-        guard var components = URLComponents(string: address.trimmingCharacters(in: .whitespacesAndNewlines)) else {
-            return address.trimmingCharacters(in: .whitespacesAndNewlines).trimmingCharacters(
-                in: CharacterSet(charactersIn: "/")
+    func inspect() async throws -> RemoteAuthenticatedMCPFacts {
+        let expectedTools = expectationsProvider
+            .expectations(for: configuration)
+            .expectedTools
+        let handoff = currentHandoffClassification()
+        let connectorToken: String
+        do {
+            guard let existing = try keychain.value(for: .connectorToken),
+                  !existing.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                return RemoteAuthenticatedMCPFacts(
+                    clientHandoff: handoff
+                )
+            }
+            connectorToken = existing
+        } catch {
+            return RemoteAuthenticatedMCPFacts(
+                clientHandoff: handoff
             )
         }
-        components.path = components.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        components.query = nil
-        components.fragment = nil
-        return components.string ?? address
+
+        let inspection = await adapter.inspectAgentAPI()
+        let reconciliation = adapter.reconcileEndpoint(
+            from: inspection,
+            matching: "http://127.0.0.1:\(configuration.localMCPPort)"
+        )
+        guard case let .current(publicURL) = reconciliation,
+              let publicOrigin = try? RemotePublicOrigin(publicURL.absoluteString),
+              let connectorURL = ConnectorURLBuilder.make(
+                  publicOrigin: publicOrigin,
+                  capabilityToken: connectorToken
+              ) else {
+            return RemoteAuthenticatedMCPFacts(
+                clientHandoff: handoff
+            )
+        }
+
+        let outcome = await RemoteActivationProbe(
+            url: connectorURL,
+            expectedTools: expectedTools,
+            session: session
+        ).runOutcome()
+        return RemoteAuthenticatedMCPFacts.from(
+            probeAvailable: true,
+            expectedTools: expectedTools,
+            outcome: outcome,
+            clientHandoff: handoff
+        )
+    }
+
+    private func currentHandoffClassification() -> RemoteClientHandoffClassification {
+        do {
+            return try stateStore.load()?.clientHandoffClassification ?? .notAvailable
+        } catch {
+            return .notAvailable
+        }
     }
 }
 

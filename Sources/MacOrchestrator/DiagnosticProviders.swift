@@ -718,6 +718,99 @@ struct RemoteAuthenticatedMCPFacts: Codable, Equatable, Sendable {
     }
 }
 
+extension RemoteAuthenticatedMCPFacts {
+    static func from(
+        probeAvailable: Bool,
+        expectedTools: Set<String>,
+        outcome: RemoteActivationProbeOutcome,
+        clientHandoff: RemoteClientHandoffState = .notAvailable
+    ) -> RemoteAuthenticatedMCPFacts {
+        if let details = outcome.details {
+            return RemoteAuthenticatedMCPFacts(
+                probeAvailable: probeAvailable,
+                probeRun: true,
+                authenticationSucceeded: true,
+                initializeSucceeded: true,
+                sessionEstablished: details.sessionEstablished,
+                inventoryChecked: true,
+                expectedTools: expectedTools,
+                exposedTools: details.exposedTools,
+                safeCallChecked: true,
+                safeCallSucceeded: details.safeCallSucceeded,
+                clientHandoff: clientHandoff
+            )
+        }
+
+        let error = outcome.error
+        let authenticationSucceeded: Bool
+        let initializeSucceeded: Bool
+        let sessionEstablished: Bool
+        let inventoryChecked: Bool
+        let safeCallChecked: Bool
+        switch error {
+        case .missingSessionID, .invalidSessionID:
+            authenticationSucceeded = true
+            initializeSucceeded = false
+            sessionEstablished = false
+            inventoryChecked = false
+            safeCallChecked = false
+        case .missingRequiredTool, .unexpectedToolInventory:
+            authenticationSucceeded = true
+            initializeSucceeded = true
+            sessionEstablished = true
+            inventoryChecked = true
+            safeCallChecked = false
+        case .safeCallFailed:
+            authenticationSucceeded = true
+            initializeSucceeded = true
+            sessionEstablished = true
+            inventoryChecked = true
+            safeCallChecked = true
+        case let .mcpRequestFailed(method, _):
+            let initializeRequest = method == "initialize"
+            authenticationSucceeded = !initializeRequest
+            initializeSucceeded = !initializeRequest && outcome.phase != .initialize
+            sessionEstablished = outcome.phase == .toolsList || outcome.phase == .safeCall
+            inventoryChecked = outcome.phase == .safeCall
+            safeCallChecked = outcome.phase == .safeCall
+        case let .mcpResponseInvalid(method):
+            let initializeResponse = method == "initialize"
+            authenticationSucceeded = !initializeResponse
+            initializeSucceeded = !initializeResponse
+            sessionEstablished = outcome.phase == .toolsList || outcome.phase == .safeCall
+            inventoryChecked = outcome.phase == .safeCall
+            safeCallChecked = outcome.phase == .safeCall
+        case let .mcpError(method):
+            let initializeError = method == "initialize"
+            authenticationSucceeded = !initializeError
+            initializeSucceeded = !initializeError
+            sessionEstablished = outcome.phase == .toolsList || outcome.phase == .safeCall
+            inventoryChecked = outcome.phase == .safeCall
+            safeCallChecked = outcome.phase == .safeCall
+        case .transport, .redirectedResponse, .invalidRemoteURL, nil:
+            authenticationSucceeded = false
+            initializeSucceeded = false
+            sessionEstablished = false
+            inventoryChecked = false
+            safeCallChecked = false
+        }
+
+        return RemoteAuthenticatedMCPFacts(
+            probeAvailable: probeAvailable,
+            probeRun: true,
+            authenticationSucceeded: authenticationSucceeded,
+            initializeSucceeded: initializeSucceeded,
+            sessionEstablished: sessionEstablished,
+            inventoryChecked: inventoryChecked,
+            expectedTools: expectedTools,
+            exposedTools: [],
+            safeCallChecked: safeCallChecked,
+            safeCallSucceeded: false,
+            clientHandoff: clientHandoff
+        )
+    }
+}
+
 struct RemoteConnectorFacts: Codable, Equatable, Sendable {
     let desired: Bool
     let binaryPresent: Bool
@@ -813,6 +906,42 @@ struct RemoteConnectorFacts: Codable, Equatable, Sendable {
             authenticatedReadiness: authenticatedReadiness,
             identity: identity
         )
+    }
+
+    func with(
+        identity: RemoteConnectorIdentityFacts?
+    ) -> RemoteConnectorFacts {
+        RemoteConnectorFacts(
+            desired: desired,
+            binaryPresent: binaryPresent,
+            configurationPresent: configurationPresent,
+            endpointAvailable: endpointAvailable,
+            endpointCount: endpointCount,
+            ownershipMarkerPresent: ownershipMarkerPresent,
+            binaryArchitecture: binaryArchitecture,
+            originalVendorSigning: originalVendorSigning,
+            providerCredentialState: providerCredentialState,
+            managedProcessState: managedProcessState,
+            agentAPIState: agentAPIState,
+            endpointState: endpointState,
+            localMCPPrerequisite: localMCPPrerequisite,
+            authenticatedReadiness: authenticatedReadiness,
+            identity: identity
+        )
+    }
+
+    var isInternallyConsistent: Bool {
+        guard endpointCount >= 0 else { return false }
+        switch endpointState {
+        case .established:
+            guard endpointAvailable else { return false }
+        case .notObserved, .noExpectedUpstream, .foreignOnly, .ambiguous:
+            guard !endpointAvailable else { return false }
+        }
+        if authenticatedReadiness.state == .ready {
+            guard endpointState == .established, endpointAvailable else { return false }
+        }
+        return true
     }
 }
 

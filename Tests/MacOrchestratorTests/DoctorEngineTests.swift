@@ -720,6 +720,7 @@ final class DoctorEngineTests: XCTestCase {
 
         let readyChanged = RemoteConnectorFacts(
             desired: true,
+            endpointAvailable: true,
             endpointState: .established,
             agentAPIState: .available,
             authenticatedReadiness: RemoteAuthenticatedMCPFacts(
@@ -745,6 +746,7 @@ final class DoctorEngineTests: XCTestCase {
 
         let unchanged = RemoteConnectorFacts(
             desired: true,
+            endpointAvailable: true,
             endpointState: .established,
             agentAPIState: .available,
             authenticatedReadiness: RemoteAuthenticatedMCPFacts(
@@ -766,6 +768,7 @@ final class DoctorEngineTests: XCTestCase {
 
         let noReceipt = RemoteConnectorFacts(
             desired: true,
+            endpointAvailable: true,
             endpointState: .established,
             agentAPIState: .available,
             authenticatedReadiness: RemoteAuthenticatedMCPFacts(
@@ -802,6 +805,36 @@ final class DoctorEngineTests: XCTestCase {
             XCTAssertEqual(result.status, .skip)
             XCTAssertTrue(result.reason.localizedCaseInsensitiveContains("local MCP"))
         }
+    }
+
+    func testContradictoryEndpointFactsFailClosedAndAuthPathMismatchRecommendsRetry() {
+        let contradictory = RemoteConnectorFacts(
+            desired: true,
+            endpointAvailable: true,
+            endpointState: .notObserved,
+            localMCPPrerequisite: .available
+        )
+        XCTAssertEqual(
+            DiagnosticChecks.remoteEndpoint(contradictory, desired: true).status,
+            .fail
+        )
+
+        let authRejected = RemoteConnectorFacts(
+            desired: true,
+            endpointAvailable: true,
+            endpointState: .established,
+            agentAPIState: .available,
+            localMCPPrerequisite: .available,
+            authenticatedReadiness: RemoteAuthenticatedMCPFacts(
+                probeAvailable: true,
+                probeRun: true,
+                authenticationSucceeded: false
+            )
+        )
+        let result = DiagnosticChecks.remoteAuthenticatedReadiness(authRejected, desired: true)
+        XCTAssertEqual(result.status, .fail)
+        XCTAssertEqual(result.repair?.id, .retryRemoteConnector)
+        XCTAssertNotEqual(result.repair?.id, .rotateConnectorCredential)
     }
 
     func testRemoteAuthenticatedProbeIsOnlyRunAfterLocalAndEndpointPrerequisites() async {

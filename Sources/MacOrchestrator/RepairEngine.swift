@@ -347,8 +347,10 @@ private enum SafeRepairReasons {
                 return "Verified bootstrap handoff is ready; follow the pinned release installation guidance."
             case .replaceNgrokCredential:
                 return "Enter a replacement ngrok credential through the helper's protected input, then run Doctor again."
+            case .retryRemoteConnector:
+                return "Retry remote endpoint reconciliation and authenticated readiness before considering deliberate credential rotation."
             case .rotateConnectorCredential:
-                return "Use the supported connector-credential rotation workflow, then update authorized clients manually."
+                return "Use connector-credential rotation only for compromise, revocation, or requested renewal, then update authorized clients manually."
             case .reconfigureRemoteClients:
                 return "Copy the current connector URL into clients you have recorded; Mac Orchestrator does not inspect or rewrite client configuration."
             default:

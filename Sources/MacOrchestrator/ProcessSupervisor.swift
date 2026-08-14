@@ -772,6 +772,9 @@ final class ProcessSupervisor {
         let request = RemoteProbeRequest(
             tunnelTarget: contract.tunnelTarget,
             connectorToken: connectorToken,
+            expectedTools: CurrentCoreMCPExpectationProvider()
+                .expectations(for: contract.configuration)
+                .expectedTools,
             knownPublicOrigin: verifiedRemoteOrigin,
             forceAuthenticatedProbe: forceAuthenticatedProbe || snapshot.connectorURL == nil
         )

@@ -453,6 +453,9 @@ enum DiagnosticChecks {
         guard remotePrerequisiteIsAvailable(facts) else {
             return result("remote.ngrok", "Remote ngrok", .skip, Text.remoteLocalPrerequisiteUnavailable)
         }
+        guard facts.isInternallyConsistent else {
+            return result("remote.ngrok", "Remote ngrok", .fail, Text.remoteInvalid, repair: .retryRemoteConnector)
+        }
         guard facts.binaryPresent, facts.configurationPresent else {
             return result(
                 "remote.ngrok",
@@ -513,6 +516,9 @@ enum DiagnosticChecks {
         guard remotePrerequisiteIsAvailable(facts) else {
             return result("remote.ngrok-architecture", "Remote ngrok architecture", .skip, Text.remoteLocalPrerequisiteUnavailable)
         }
+        guard facts.isInternallyConsistent else {
+            return result("remote.ngrok-architecture", "Remote ngrok architecture", .fail, Text.remoteInvalid, repair: .retryRemoteConnector)
+        }
         guard facts.binaryPresent else {
             return result("remote.ngrok-architecture", "Remote ngrok architecture", .fail, Text.remoteInvalid, repair: .retryRemoteConnector)
         }
@@ -535,6 +541,9 @@ enum DiagnosticChecks {
         guard remotePrerequisiteIsAvailable(facts) else {
             return result("remote.ngrok-signing", "Remote ngrok vendor signing", .skip, Text.remoteLocalPrerequisiteUnavailable)
         }
+        guard facts.isInternallyConsistent else {
+            return result("remote.ngrok-signing", "Remote ngrok vendor signing", .fail, Text.remoteInvalid, repair: .retryRemoteConnector)
+        }
         guard facts.binaryPresent else {
             return result("remote.ngrok-signing", "Remote ngrok vendor signing", .fail, Text.remoteInvalid, repair: .retryRemoteConnector)
         }
@@ -554,6 +563,9 @@ enum DiagnosticChecks {
         }
         guard remotePrerequisiteIsAvailable(facts) else {
             return result("remote.endpoint", "Remote endpoint", .skip, Text.remoteLocalPrerequisiteUnavailable)
+        }
+        guard facts.isInternallyConsistent else {
+            return result("remote.endpoint", "Remote endpoint", .fail, Text.remoteInvalid, repair: .retryRemoteConnector)
         }
         switch facts.agentAPIState {
         case .unavailable:
@@ -590,6 +602,9 @@ enum DiagnosticChecks {
         guard remotePrerequisiteIsAvailable(facts) else {
             return result("remote.authenticated-readiness", "Remote authenticated readiness", .skip, Text.remoteLocalPrerequisiteUnavailable)
         }
+        guard facts.isInternallyConsistent else {
+            return result("remote.authenticated-readiness", "Remote authenticated readiness", .fail, Text.remoteInvalid, repair: .retryRemoteConnector)
+        }
         guard facts.endpointState == .established || facts.endpointAvailable else {
             return result("remote.authenticated-readiness", "Remote authenticated readiness", .skip, Text.endpointUnavailable)
         }
@@ -602,7 +617,7 @@ enum DiagnosticChecks {
                 "Remote authenticated readiness",
                 .fail,
                 Text.remoteAuthenticationRejected,
-                repair: .rotateConnectorCredential
+                repair: .retryRemoteConnector
             )
         case .initializeSessionFailed:
             return result("remote.authenticated-readiness", "Remote authenticated readiness", .fail, Text.remoteInitializeSessionFailed)
@@ -624,6 +639,9 @@ enum DiagnosticChecks {
         }
         guard remotePrerequisiteIsAvailable(facts) else {
             return result("remote.inventory", "Remote inventory", .skip, Text.remoteLocalPrerequisiteUnavailable)
+        }
+        guard facts.isInternallyConsistent else {
+            return result("remote.inventory", "Remote inventory", .fail, Text.remoteInvalid, repair: .retryRemoteConnector)
         }
         guard facts.endpointState == .established || facts.endpointAvailable else {
             return result("remote.inventory", "Remote inventory", .skip, Text.endpointUnavailable)
@@ -647,6 +665,9 @@ enum DiagnosticChecks {
         }
         guard remotePrerequisiteIsAvailable(facts) else {
             return result("remote.client-handoff", "Remote client handoff", .skip, Text.remoteLocalPrerequisiteUnavailable)
+        }
+        guard facts.isInternallyConsistent else {
+            return result("remote.client-handoff", "Remote client handoff", .fail, Text.remoteInvalid, repair: .retryRemoteConnector)
         }
         guard facts.authenticatedReadiness.state == .ready else {
             return result("remote.client-handoff", "Remote client handoff", .skip, "Client handoff comparison requires current authenticated remote readiness.")

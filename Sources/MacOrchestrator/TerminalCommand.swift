@@ -546,6 +546,17 @@ enum TerminalCommand {
         let ownerID = configuration?.ownerID ?? ""
         let port = configuration?.localMCPPort ?? 0
 
+        let remoteAuthenticatedProvider: (any RemoteAuthenticatedMCPDiagnosticProviding)?
+        if let configuration, remoteDesired {
+            remoteAuthenticatedProvider = ReadOnlyRemoteAuthenticatedMCPDiagnosticProvider(
+                configuration: configuration,
+                keychain: keychain,
+                adapter: NgrokRemoteConnectorAdapter()
+            )
+        } else {
+            remoteAuthenticatedProvider = nil
+        }
+
         let asyncLocalMCPProvider: (any DoctorAsyncLocalMCPDiagnosticProviding)?
         if let configuration {
             asyncLocalMCPProvider = CanonicalLocalMCPDiagnosticProvider(
@@ -602,6 +613,7 @@ enum TerminalCommand {
                 ownerID: ownerID,
                 processRunner: SystemDiagnosticProcessRunner()
             ),
+            remoteAuthenticatedMCPProvider: remoteAuthenticatedProvider,
             diskSpaceProvider: ReadOnlyDiskSpaceProvider(
                 filesystemURL: fileManager.homeDirectoryForCurrentUser,
                 criticalPaths: [support, paths.launchAgentURL]

@@ -4,13 +4,29 @@ import XCTest
 @testable import MacOrchestrator
 
 final class RemoteCredentialTransactionTests: XCTestCase {
-    func testSuccessfulConnectorRotationAdvancesGenerationExactlyOnceAndScopesOldTokenToNegativeHooks() throws {
+    func testCredentialOperationCoordinatorRejectsOverlapWithoutBlocking() async throws {
+        let coordinator = RemoteCredentialOperationCoordinator()
+        try await coordinator.acquire()
+
+        do {
+            try await coordinator.acquire()
+            XCTFail("Expected overlapping operation to be rejected")
+        } catch {
+            XCTAssertEqual(error as? RemoteCredentialOperationError, .operationInProgress)
+        }
+
+        await coordinator.release()
+        try await coordinator.acquire()
+        await coordinator.release()
+    }
+
+    func testSuccessfulConnectorRotationAdvancesGenerationExactlyOnceAndScopesOldTokenToNegativeHooks() async throws {
         let fixture = try ConnectorFixture()
 
-        let receipt = try fixture.transaction.execute()
+        let receipt = try await fixture.transaction.execute()
 
         XCTAssertEqual(receipt.generation, 1)
-        XCTAssertEqual(receipt.handoffGeneration, 1)
+        XCTAssertEqual(receipt.clientHandoff, .notAvailable)
         XCTAssertEqual(
             try fixture.keychain.value(for: .connectorToken),
             String(repeating: "ab", count: 32)
@@ -32,16 +48,19 @@ final class RemoteCredentialTransactionTests: XCTestCase {
         XCTAssertEqual(fixture.hooks.newTokens, Array(repeating: String(repeating: "ab", count: 32), count: 4))
         let state = try XCTUnwrap(try fixture.stateStore.load())
         XCTAssertEqual(state.connectorCredentialGeneration, 1)
-        XCTAssertEqual(state.lastConnectorHandoffGeneration, 1)
+        XCTAssertNil(state.handoffReceipt)
         XCTAssertNil(state.pendingConnectorCredentialGeneration)
         XCTAssertEqual(state.recoveryPhase, .stable)
         XCTAssertEqual(state.lastRemoteResult, .ready)
     }
 
-    func testConnectorRotationFailureBeforeCutoverLeavesOldTokenCanonical() throws {
+    func testConnectorRotationFailureBeforeCutoverLeavesOldTokenCanonical() async throws {
         let fixture = try ConnectorFixture(failingAt: .prerequisites)
 
-        XCTAssertThrowsError(try fixture.transaction.execute()) { error in
+        do {
+            _ = try await fixture.transaction.execute()
+            XCTFail("Expected prerequisites failure")
+        } catch {
             XCTAssertEqual(error as? ConnectorCredentialRotationError, .prerequisitesFailed)
             XCTAssertFalse(String(describing: error).contains("old-token"))
         }
@@ -50,10 +69,13 @@ final class RemoteCredentialTransactionTests: XCTestCase {
         XCTAssertEqual(fixture.keychainClient.updateCalls, [])
     }
 
-    func testConnectorRotationCutoverFailureLeavesOldTokenAndPendingRecoveryState() throws {
+    func testConnectorRotationCutoverFailureLeavesOldTokenAndPendingRecoveryState() async throws {
         let fixture = try ConnectorFixture(keychainUpdateFails: true)
 
-        XCTAssertThrowsError(try fixture.transaction.execute()) { error in
+        do {
+            _ = try await fixture.transaction.execute()
+            XCTFail("Expected cutover failure")
+        } catch {
             XCTAssertEqual(error as? ConnectorCredentialRotationError, .cutoverFailed)
             XCTAssertFalse(String(describing: error).contains("old-token"))
             XCTAssertFalse(String(describing: error).contains(String(repeating: "ab", count: 32)))
@@ -65,10 +87,13 @@ final class RemoteCredentialTransactionTests: XCTestCase {
         XCTAssertEqual(state.pendingConnectorCredentialGeneration, 1)
     }
 
-    func testConnectorRotationFailureAfterCutoverNeverRestoresOldToken() throws {
+    func testPostCutoverFailureRetainsNewTokenAndNeverRestoresOldToken() async throws {
         let fixture = try ConnectorFixture(failingAt: .localActivation)
 
-        XCTAssertThrowsError(try fixture.transaction.execute()) { error in
+        do {
+            _ = try await fixture.transaction.execute()
+            XCTFail("Expected local activation failure")
+        } catch {
             XCTAssertEqual(
                 error as? ConnectorCredentialRotationError,
                 .validationFailed(.localActivation)
@@ -86,10 +111,13 @@ final class RemoteCredentialTransactionTests: XCTestCase {
         XCTAssertEqual(state.lastRemoteResult, .degraded)
     }
 
-    func testConnectorRotationFailureAtOldRemoteValidationNeverRestoresOldToken() throws {
+    func testConnectorRotationFailureAtOldRemoteValidationNeverRestoresOldToken() async throws {
         let fixture = try ConnectorFixture(failingAt: .oldRemote)
 
-        XCTAssertThrowsError(try fixture.transaction.execute()) { error in
+        do {
+            _ = try await fixture.transaction.execute()
+            XCTFail("Expected old remote validation failure")
+        } catch {
             XCTAssertEqual(
                 error as? ConnectorCredentialRotationError,
                 .validationFailed(.oldRemoteValidation)
@@ -101,11 +129,14 @@ final class RemoteCredentialTransactionTests: XCTestCase {
         XCTAssertEqual(fixture.keychainClient.updateCalls.count, 1)
     }
 
-    func testConnectorRotationStatePersistenceFailureAfterCutoverKeepsNewTokenCanonical() throws {
+    func testStateCommitFailureLeavesRecoverableDegradedState() async throws {
         let state = FailingStatePersistenceStore(failingSaveCount: 2)
         let fixture = try ConnectorFixture(stateStore: state)
 
-        XCTAssertThrowsError(try fixture.transaction.execute()) { error in
+        do {
+            _ = try await fixture.transaction.execute()
+            XCTFail("Expected state persistence failure")
+        } catch {
             XCTAssertEqual(
                 error as? ConnectorCredentialRotationError,
                 .statePersistenceFailed(.stateCommit)
@@ -115,36 +146,72 @@ final class RemoteCredentialTransactionTests: XCTestCase {
         }
 
         XCTAssertEqual(try fixture.keychain.value(for: .connectorToken), String(repeating: "ab", count: 32))
+        XCTAssertEqual(try XCTUnwrap(state.state).recoveryPhase, .degraded)
     }
 
-    func testConnectorRotationRejectsInterruptedPendingStateBeforeGeneratingAnotherToken() throws {
-        let fixture = try ConnectorFixture()
-        var state = try fixture.stateStore.loadOrCreate(provider: .ngrok)
-        state.pendingConnectorCredentialGeneration = 1
-        state.recoveryPhase = .cutoverPendingValidation
-        try fixture.stateStore.save(state)
+    func testInterruptedRotationGeneratesFreshForwardTokenFromCurrentKeychainValue() async throws {
+        var pending = RemoteConnectorStateV1.fresh(provider: .ngrok)
+        pending.pendingConnectorCredentialGeneration = 1
+        pending.recoveryPhase = .cutoverPendingValidation
+        let fixture = try ConnectorFixture(
+            currentConnectorToken: "possibly-new-current-token",
+            randomByte: 0xcd,
+            initialState: pending
+        )
 
-        XCTAssertThrowsError(try fixture.transaction.execute()) { error in
-            XCTAssertEqual(error as? ConnectorCredentialRotationError, .interruptedRecoveryRequired)
-        }
-        XCTAssertEqual(fixture.keychainClient.updateCalls, [])
+        let receipt = try await fixture.transaction.execute()
+
+        XCTAssertEqual(receipt.generation, 2)
+        XCTAssertEqual(fixture.hooks.oldLocalTokens, ["possibly-new-current-token"])
+        XCTAssertEqual(fixture.hooks.oldRemoteTokens, ["possibly-new-current-token"])
+        XCTAssertNotEqual(try fixture.keychain.value(for: .connectorToken), "possibly-new-current-token")
+        let state = try XCTUnwrap(try fixture.stateStore.load())
+        XCTAssertEqual(state.connectorCredentialGeneration, 2)
+        XCTAssertEqual(state.recoveryPhase, .stable)
     }
 
-    func testNgrokCandidateIsNotCommittedUntilEndpointAndReadinessValidationSucceed() throws {
+    func testSuccessfulRotationPreservesOldHandoffReceipt() async throws {
+        let origin = try RemotePublicOrigin("https://old.ngrok.app")
+        var initial = RemoteConnectorStateV1.fresh(provider: .ngrok)
+        initial.lastVerifiedPublicOrigin = origin
+        initial.lastSuccessfulRemoteProbeAt = Date(timeIntervalSince1970: 1_700_000_000)
+        initial.lastRemoteResult = .ready
+        initial.handoffReceipt = RemoteConnectorHandoffReceipt(
+            connectorCredentialGeneration: 0,
+            publicOrigin: origin,
+            handedOffAt: Date(timeIntervalSince1970: 1_699_999_999)
+        )
+        let fixture = try ConnectorFixture(initialState: initial)
+
+        let receipt = try await fixture.transaction.execute()
+
+        XCTAssertEqual(receipt.clientHandoff, .changed)
+        let state = try XCTUnwrap(try fixture.stateStore.load())
+        XCTAssertEqual(state.handoffReceipt?.connectorCredentialGeneration, 0)
+        XCTAssertEqual(state.handoffReceipt?.publicOrigin, origin)
+        XCTAssertEqual(state.clientHandoffClassification, .changed)
+    }
+
+    func testNgrokCandidateIsNotPersistedBeforeAuthenticatedValidation() async throws {
         let fixture = try NgrokFixture()
 
-        XCTAssertEqual(try fixture.transaction.execute(candidate: "candidate-authtoken").probe.origin.value,
-                       "https://example.ngrok.app")
+        let receipt = try await fixture.transaction.execute(candidate: "candidate-authtoken")
+        XCTAssertEqual(receipt.probe.origin.value, "https://example.ngrok.app")
 
         XCTAssertEqual(fixture.hooks.observedCredentials, ["old-authtoken", "old-authtoken", "old-authtoken"])
         XCTAssertEqual(try fixture.keychain.value(for: .ngrokAuthtoken), "candidate-authtoken")
         XCTAssertEqual(fixture.hooks.candidateTokens, ["candidate-authtoken"])
+        XCTAssertEqual(fixture.hooks.lastRemoteResultAtReadiness, .unknown)
+        XCTAssertEqual(try XCTUnwrap(try fixture.stateStore.load()).lastRemoteResult, .ready)
     }
 
-    func testNgrokCandidateValidationFailurePreservesOldCredentialInNormalMode() throws {
+    func testNgrokCandidateValidationFailurePreservesOldCredentialInNormalMode() async throws {
         let fixture = try NgrokFixture(failingAt: .readiness, policy: .preserveExistingCredential)
 
-        XCTAssertThrowsError(try fixture.transaction.execute(candidate: "candidate-authtoken")) { error in
+        do {
+            _ = try await fixture.transaction.execute(candidate: "candidate-authtoken")
+            XCTFail("Expected ngrok validation failure")
+        } catch {
             XCTAssertEqual(error as? NgrokCredentialReplacementError, .candidateValidationFailed(.readiness))
             XCTAssertFalse(String(describing: error).contains("old-authtoken"))
             XCTAssertFalse(String(describing: error).contains("candidate-authtoken"))
@@ -154,10 +221,13 @@ final class RemoteCredentialTransactionTests: XCTestCase {
         XCTAssertEqual(fixture.hooks.restoreCalls, 1)
     }
 
-    func testNgrokCompromisedOldModeFailsClosedWithoutRestoringOldCredential() throws {
+    func testNgrokCompromisedOldModeFailsClosedWithoutRestoringOldCredential() async throws {
         let fixture = try NgrokFixture(failingAt: .readiness, policy: .failClosedIfCompromised)
 
-        XCTAssertThrowsError(try fixture.transaction.execute(candidate: "candidate-authtoken")) { error in
+        do {
+            _ = try await fixture.transaction.execute(candidate: "candidate-authtoken")
+            XCTFail("Expected fail-closed result")
+        } catch {
             XCTAssertEqual(error as? NgrokCredentialReplacementError, .failedClosed)
             XCTAssertFalse(String(describing: error).contains("old-authtoken"))
             XCTAssertFalse(String(describing: error).contains("candidate-authtoken"))
@@ -165,6 +235,24 @@ final class RemoteCredentialTransactionTests: XCTestCase {
 
         XCTAssertNil(try fixture.keychain.value(for: .ngrokAuthtoken))
         XCTAssertEqual(fixture.hooks.restoreCalls, 0)
+    }
+
+    func testNgrokCommitAmbiguityDoesNotRestorePossiblyCanonicalOldCredential() async throws {
+        let fixture = try NgrokFixture()
+        fixture.keychainClient.simulateNgrokReadBackMismatch = true
+
+        do {
+            _ = try await fixture.transaction.execute(candidate: "candidate-authtoken")
+            XCTFail("Expected ambiguous commit")
+        } catch {
+            XCTAssertEqual(error as? NgrokCredentialReplacementError, .commitAmbiguous)
+            XCTAssertFalse(String(describing: error).contains("old-authtoken"))
+            XCTAssertFalse(String(describing: error).contains("candidate-authtoken"))
+        }
+
+        XCTAssertEqual(try fixture.keychain.value(for: .ngrokAuthtoken), "candidate-authtoken")
+        XCTAssertEqual(fixture.hooks.restoreCalls, 0)
+        XCTAssertEqual(try XCTUnwrap(try fixture.stateStore.load()).lastRemoteResult, .degraded)
     }
 
     private final class ConnectorFixture {
@@ -178,26 +266,34 @@ final class RemoteCredentialTransactionTests: XCTestCase {
         init(
             failingAt: ConnectorFailurePoint? = nil,
             keychainUpdateFails: Bool = false,
-            stateStore: (any RemoteConnectorStatePersisting)? = nil
+            stateStore: (any RemoteConnectorStatePersisting)? = nil,
+            currentConnectorToken: String = "old-token",
+            randomByte: UInt8 = 0xab,
+            initialState: RemoteConnectorStateV1? = nil
         ) throws {
-            let client = FakeKeychainClient(values: [KeychainItem.connectorToken.key: "old-token"])
+            let client = FakeKeychainClient(values: [KeychainItem.connectorToken.key: currentConnectorToken])
             client.updateFails = keychainUpdateFails
             keychainClient = client
             keychain = KeychainStore(
                 client: client,
-                random: FixedRandomBytes(byte: 0xab)
+                random: FixedRandomBytes(byte: randomByte)
             )
             hooks = FakeConnectorHooks(failingAt: failingAt)
+            let resolvedStateStore: any RemoteConnectorStatePersisting
             if let stateStore {
-                self.stateStore = stateStore
+                resolvedStateStore = stateStore
                 directory = nil
             } else {
                 let directory = FileManager.default.temporaryDirectory
                     .appendingPathComponent("connector-transaction-" + UUID().uuidString, isDirectory: true)
                 try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
                                                          attributes: [.posixPermissions: 0o700])
-                self.stateStore = RemoteConnectorStateStore(directoryURL: directory)
+                resolvedStateStore = RemoteConnectorStateStore(directoryURL: directory)
                 self.directory = directory
+            }
+            self.stateStore = resolvedStateStore
+            if let initialState {
+                try resolvedStateStore.save(initialState)
             }
             transaction = ConnectorCredentialRotationTransaction(
                 keychain: keychain,
@@ -214,8 +310,10 @@ final class RemoteCredentialTransactionTests: XCTestCase {
     private final class NgrokFixture {
         let keychainClient: FakeKeychainClient
         let keychain: KeychainStore
+        let stateStore: any RemoteConnectorStatePersisting
         let hooks: FakeNgrokHooks
         let transaction: NgrokCredentialReplacementTransaction
+        private let directory: URL?
 
         init(
             failingAt: NgrokFailurePoint? = nil,
@@ -224,15 +322,33 @@ final class RemoteCredentialTransactionTests: XCTestCase {
             let client = FakeKeychainClient(values: [KeychainItem.ngrokAuthtoken.key: "old-authtoken"])
             keychainClient = client
             keychain = KeychainStore(client: client)
+            let directory = FileManager.default.temporaryDirectory
+                .appendingPathComponent("ngrok-transaction-" + UUID().uuidString, isDirectory: true)
+            try FileManager.default.createDirectory(
+                at: directory,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+            let resolvedStateStore: any RemoteConnectorStatePersisting =
+                RemoteConnectorStateStore(directoryURL: directory)
+            self.stateStore = resolvedStateStore
+            _ = try resolvedStateStore.loadOrCreate(provider: .ngrok)
+            self.directory = directory
             hooks = FakeNgrokHooks(failingAt: failingAt)
             hooks.readCurrent = { [weak client] in
                 client?.value(for: .ngrokAuthtoken)
             }
+            hooks.stateStore = resolvedStateStore
             transaction = NgrokCredentialReplacementTransaction(
                 keychain: keychain,
                 hooks: hooks,
-                failurePolicy: policy
+                failurePolicy: policy,
+                stateStore: resolvedStateStore
             )
+        }
+
+        deinit {
+            if let directory { try? FileManager.default.removeItem(at: directory) }
         }
     }
 
@@ -245,7 +361,7 @@ final class RemoteCredentialTransactionTests: XCTestCase {
         case oldRemote
     }
 
-    private final class FakeConnectorHooks: ConnectorCredentialRotationHooks {
+    private final class FakeConnectorHooks: @unchecked Sendable, ConnectorCredentialRotationHooks {
         let failingAt: ConnectorFailurePoint?
         var events: [String] = []
         var oldLocalTokens: [String] = []
@@ -257,35 +373,35 @@ final class RemoteCredentialTransactionTests: XCTestCase {
             self.failingAt = failingAt
         }
 
-        func validatePrerequisites() throws {
+        func validatePrerequisites() async throws {
             events.append("prerequisites")
             if failingAt == .prerequisites { throw SyntheticFailure() }
         }
 
-        func restartLocalMCP(using newToken: String) throws {
+        func restartLocalMCP(using newToken: String) async throws {
             events.append("restart-new")
             newTokens.append(newToken)
         }
 
-        func validateLocalActivation(using newToken: String) throws {
+        func validateLocalActivation(using newToken: String) async throws {
             events.append("activate-new")
             newTokens.append(newToken)
             if failingAt == .localActivation { throw SyntheticFailure() }
         }
 
-        func validateOldLocalRouteRejects(oldToken: String) throws {
+        func validateOldLocalRouteRejects(oldToken: String) async throws {
             events.append("reject-old-local")
             oldLocalTokens.append(oldToken)
             if failingAt == .oldLocal { throw SyntheticFailure() }
         }
 
-        func reconcileRemote(using newToken: String) throws {
+        func reconcileRemote(using newToken: String) async throws {
             events.append("reconcile-new")
             newTokens.append(newToken)
             if failingAt == .reconcile { throw SyntheticFailure() }
         }
 
-        func validateRemoteReadiness(using newToken: String) throws -> RemoteConnectorProbe {
+        func validateRemoteReadiness(using newToken: String) async throws -> RemoteConnectorProbe {
             events.append("ready-new")
             newTokens.append(newToken)
             if failingAt == .readiness { throw SyntheticFailure() }
@@ -295,7 +411,7 @@ final class RemoteCredentialTransactionTests: XCTestCase {
             )
         }
 
-        func validateOldRemoteRouteRejects(oldToken: String) throws {
+        func validateOldRemoteRouteRejects(oldToken: String) async throws {
             events.append("reject-old-remote")
             oldRemoteTokens.append(oldToken)
             if failingAt == .oldRemote { throw SyntheticFailure() }
@@ -309,34 +425,39 @@ final class RemoteCredentialTransactionTests: XCTestCase {
         case readiness
     }
 
-    private final class FakeNgrokHooks: NgrokCredentialCandidateValidationHooks {
+    private final class FakeNgrokHooks: @unchecked Sendable, NgrokCredentialCandidateValidationHooks {
         let failingAt: NgrokFailurePoint?
         var candidateTokens: [String] = []
         var observedCredentials: [String?] = []
         var restoreCalls = 0
         var readCurrent: (() -> String?)?
+        var stateStore: (any RemoteConnectorStatePersisting)?
+        var lastRemoteResultAtReadiness: RemoteResultClassification?
 
         init(failingAt: NgrokFailurePoint?) {
             self.failingAt = failingAt
         }
 
-        func validatePrerequisites() throws {
+        func validatePrerequisites() async throws {
             if failingAt == .prerequisites { throw SyntheticFailure() }
         }
 
-        func launchCandidateSession(using candidateAuthtoken: String) throws {
+        func launchCandidateSession(using candidateAuthtoken: String) async throws {
             observedCredentials.append(readCurrent?())
             candidateTokens.append(candidateAuthtoken)
             if failingAt == .launch { throw SyntheticFailure() }
         }
 
-        func reconcileCandidateEndpoint() throws {
+        func reconcileCandidateEndpoint() async throws {
             observedCredentials.append(readCurrent?())
             if failingAt == .endpoint { throw SyntheticFailure() }
         }
 
-        func validateAuthenticatedRemoteReadiness() throws -> RemoteConnectorProbe {
+        func validateAuthenticatedRemoteReadiness() async throws -> RemoteConnectorProbe {
             observedCredentials.append(readCurrent?())
+            if let stateStore {
+                lastRemoteResultAtReadiness = try? stateStore.load()?.lastRemoteResult
+            }
             if failingAt == .readiness { throw SyntheticFailure() }
             return RemoteConnectorProbe(
                 origin: try! RemotePublicOrigin("https://example.ngrok.app"),
@@ -344,7 +465,7 @@ final class RemoteCredentialTransactionTests: XCTestCase {
             )
         }
 
-        func restorePriorProviderSession() throws {
+        func restorePriorProviderSession() async throws {
             restoreCalls += 1
         }
     }
@@ -352,9 +473,10 @@ final class RemoteCredentialTransactionTests: XCTestCase {
     private final class FailingStatePersistenceStore: RemoteConnectorStatePersisting {
         private(set) var state: RemoteConnectorStateV1?
         private var saveCount = 0
+        private let failingSaveCount: Int
 
         init(failingSaveCount: Int) {
-            _ = failingSaveCount
+            self.failingSaveCount = failingSaveCount
         }
 
         func load() throws -> RemoteConnectorStateV1? {
@@ -370,7 +492,7 @@ final class RemoteCredentialTransactionTests: XCTestCase {
 
         func save(_ state: RemoteConnectorStateV1) throws -> RemoteConnectorStateV1 {
             saveCount += 1
-            if saveCount >= 2 {
+            if saveCount == failingSaveCount {
                 throw RemoteConnectorStateStoreError.writeFailed
             }
             self.state = state
@@ -382,12 +504,19 @@ final class RemoteCredentialTransactionTests: XCTestCase {
         private(set) var values: [String: String]
         private(set) var updateCalls: [String] = []
         var updateFails = false
+        var simulateNgrokReadBackMismatch = false
 
         init(values: [String: String]) {
             self.values = values
         }
 
         func read(service: String, account: String) throws -> String? {
+            if simulateNgrokReadBackMismatch,
+               service == KeychainItem.ngrokAuthtoken.service,
+               account == KeychainItem.ngrokAuthtoken.account {
+                simulateNgrokReadBackMismatch = false
+                return "old-authtoken"
+            }
             values[KeychainItem.key(service: service, account: account)]
         }
 

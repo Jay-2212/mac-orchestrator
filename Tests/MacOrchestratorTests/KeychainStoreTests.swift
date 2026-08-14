@@ -95,10 +95,42 @@ final class KeychainStoreTests: XCTestCase {
         XCTAssertEqual(fake.updateCalls, [KeychainItem.ngrokAuthtoken.key])
     }
 
+    func testNgrokReplacementRejectsWhitespaceBearingCandidateBeforeKeychainWrite() throws {
+        let fake = FakeKeychainClient(values: [KeychainItem.ngrokAuthtoken.key: "old-authtoken"])
+        let store = KeychainStore(client: fake)
+
+        XCTAssertThrowsError(
+            try store.replaceNgrokAuthtoken(
+                expectedCurrent: "old-authtoken",
+                with: " candidate-authtoken"
+            )
+        ) { error in
+            XCTAssertEqual(error as? KeychainStoreError, .invalidValue)
+        }
+        XCTAssertEqual(fake.updateCalls, [])
+    }
+
+    func testNgrokUpdateFailureIsClassifiedAsPotentiallyCommitted() throws {
+        let fake = FakeKeychainClient(values: [KeychainItem.ngrokAuthtoken.key: "old-authtoken"])
+        fake.updateFailsAfterWrite = true
+        let store = KeychainStore(client: fake)
+
+        XCTAssertThrowsError(
+            try store.replaceNgrokAuthtoken(
+                expectedCurrent: "old-authtoken",
+                with: "candidate-authtoken"
+            )
+        ) { error in
+            XCTAssertEqual(error as? KeychainStoreError, .commitAmbiguous)
+        }
+        XCTAssertEqual(try store.value(for: .ngrokAuthtoken), "candidate-authtoken")
+    }
+
     private final class FakeKeychainClient: KeychainClient {
         private(set) var values: [String: String]
         private(set) var createCalls: [String] = []
         private(set) var updateCalls: [String] = []
+        var updateFailsAfterWrite = false
 
         init(values: [String: String] = [:]) {
             self.values = values
@@ -124,6 +156,9 @@ final class KeychainStoreTests: XCTestCase {
             }
             updateCalls.append(key)
             values[key] = value
+            if updateFailsAfterWrite {
+                throw KeychainStoreError.operationFailed(-99)
+            }
         }
 
         func delete(service: String, account: String) throws {

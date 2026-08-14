@@ -21,14 +21,14 @@ enum ConnectorRotationPhase: String, Equatable, Sendable {
     case stateCommit
 }
 
-protocol ConnectorCredentialRotationHooks {
-    func validatePrerequisites() throws
-    func restartLocalMCP(using newToken: String) throws
-    func validateLocalActivation(using newToken: String) throws
-    func validateOldLocalRouteRejects(oldToken: String) throws
-    func reconcileRemote(using newToken: String) throws
-    func validateRemoteReadiness(using newToken: String) throws -> RemoteConnectorProbe
-    func validateOldRemoteRouteRejects(oldToken: String) throws
+protocol ConnectorCredentialRotationHooks: Sendable {
+    func validatePrerequisites() async throws
+    func restartLocalMCP(using newToken: String) async throws
+    func validateLocalActivation(using newToken: String) async throws
+    func validateOldLocalRouteRejects(oldToken: String) async throws
+    func reconcileRemote(using newToken: String) async throws
+    func validateRemoteReadiness(using newToken: String) async throws -> RemoteConnectorProbe
+    func validateOldRemoteRouteRejects(oldToken: String) async throws
 }
 
 enum ConnectorCredentialRotationError: Error, Equatable, LocalizedError, Sendable {
@@ -65,28 +65,43 @@ enum ConnectorCredentialRotationError: Error, Equatable, LocalizedError, Sendabl
 
 struct ConnectorCredentialRotationReceipt: Equatable, Sendable {
     let generation: UInt64
-    let handoffGeneration: UInt64
     let probe: RemoteConnectorProbe
+    let clientHandoff: RemoteClientHandoffClassification
 }
 
 struct ConnectorCredentialRotationTransaction {
     private let keychain: KeychainStore
     private let stateStore: any RemoteConnectorStatePersisting
     private let hooks: any ConnectorCredentialRotationHooks
+    private let coordinator: RemoteCredentialOperationCoordinator
 
     init(
         keychain: KeychainStore,
         stateStore: any RemoteConnectorStatePersisting,
-        hooks: any ConnectorCredentialRotationHooks
+        hooks: any ConnectorCredentialRotationHooks,
+        coordinator: RemoteCredentialOperationCoordinator = .shared
     ) {
         self.keychain = keychain
         self.stateStore = stateStore
         self.hooks = hooks
+        self.coordinator = coordinator
     }
 
-    func execute() throws -> ConnectorCredentialRotationReceipt {
+    func execute() async throws -> ConnectorCredentialRotationReceipt {
+        try await coordinator.acquire()
         do {
-            try hooks.validatePrerequisites()
+            let receipt = try await executeUnlocked()
+            await coordinator.release()
+            return receipt
+        } catch {
+            await coordinator.release()
+            throw error
+        }
+    }
+
+    private func executeUnlocked() async throws -> ConnectorCredentialRotationReceipt {
+        do {
+            try await hooks.validatePrerequisites()
         } catch {
             throw ConnectorCredentialRotationError.prerequisitesFailed
         }
@@ -97,12 +112,7 @@ struct ConnectorCredentialRotationTransaction {
         } catch {
             throw ConnectorCredentialRotationError.stateUnavailable
         }
-        guard currentState.pendingConnectorCredentialGeneration == nil,
-              currentState.recoveryPhase != .cutoverPendingValidation else {
-            throw ConnectorCredentialRotationError.interruptedRecoveryRequired
-        }
-
-        var previousToken: String?
+        let previousToken: String
         do {
             guard let current = try keychain.value(for: .connectorToken), !current.isEmpty else {
                 throw ConnectorCredentialRotationError.canonicalCredentialUnavailable
@@ -113,8 +123,6 @@ struct ConnectorCredentialRotationTransaction {
         } catch {
             throw ConnectorCredentialRotationError.canonicalCredentialUnavailable
         }
-        defer { previousToken = nil }
-
         let newToken: String
         do {
             newToken = try keychain.generateConnectorToken()
@@ -122,7 +130,11 @@ struct ConnectorCredentialRotationTransaction {
             throw ConnectorCredentialRotationError.tokenGenerationFailed
         }
 
-        let (nextGeneration, overflow) = currentState.connectorCredentialGeneration.addingReportingOverflow(1)
+        let baseGeneration = max(
+            currentState.connectorCredentialGeneration,
+            currentState.pendingConnectorCredentialGeneration ?? currentState.connectorCredentialGeneration
+        )
+        let (nextGeneration, overflow) = baseGeneration.addingReportingOverflow(1)
         guard !overflow else {
             throw ConnectorCredentialRotationError.stateUnavailable
         }
@@ -138,10 +150,7 @@ struct ConnectorCredentialRotationTransaction {
         }
 
         do {
-            guard let tokenForCutover = previousToken else {
-                throw ConnectorCredentialRotationError.canonicalCredentialUnavailable
-            }
-            try keychain.replaceConnectorToken(expectedCurrent: tokenForCutover, with: newToken)
+            try keychain.replaceConnectorToken(expectedCurrent: previousToken, with: newToken)
         } catch {
             // The pending marker is intentionally retained. It is safer than
             // claiming that an independent Keychain/filesystem cutover is known
@@ -153,24 +162,20 @@ struct ConnectorCredentialRotationTransaction {
         do {
             let probe: RemoteConnectorProbe
             do {
-                guard let tokenForNegativeValidation = previousToken else {
-                    throw ConnectorCredentialRotationError.canonicalCredentialUnavailable
-                }
-                try hooks.restartLocalMCP(using: newToken)
+                try await hooks.restartLocalMCP(using: newToken)
                 phase = .localActivation
-                try hooks.validateLocalActivation(using: newToken)
+                try await hooks.validateLocalActivation(using: newToken)
                 phase = .oldLocalValidation
-                try hooks.validateOldLocalRouteRejects(oldToken: tokenForNegativeValidation)
+                try await hooks.validateOldLocalRouteRejects(oldToken: previousToken)
                 phase = .remoteReconciliation
-                try hooks.reconcileRemote(using: newToken)
+                try await hooks.reconcileRemote(using: newToken)
                 phase = .remoteReadiness
-                probe = try hooks.validateRemoteReadiness(using: newToken)
+                probe = try await hooks.validateRemoteReadiness(using: newToken)
                 phase = .oldRemoteValidation
-                try hooks.validateOldRemoteRouteRejects(oldToken: tokenForNegativeValidation)
+                try await hooks.validateOldRemoteRouteRejects(oldToken: previousToken)
             }
             // The old token is no longer needed once both bounded negative
             // validations have completed, before state commit begins.
-            previousToken = nil
 
             var committedState = pendingState
             committedState.connectorCredentialGeneration = nextGeneration
@@ -179,7 +184,6 @@ struct ConnectorCredentialRotationTransaction {
             committedState.lastVerifiedPublicOrigin = probe.origin
             committedState.lastSuccessfulRemoteProbeAt = probe.verifiedAt
             committedState.lastRemoteResult = .ready
-            committedState.lastConnectorHandoffGeneration = nextGeneration
             phase = .stateCommit
             do {
                 try stateStore.save(committedState)
@@ -190,8 +194,8 @@ struct ConnectorCredentialRotationTransaction {
 
             return ConnectorCredentialRotationReceipt(
                 generation: nextGeneration,
-                handoffGeneration: nextGeneration,
-                probe: probe
+                probe: probe,
+                clientHandoff: committedState.clientHandoffClassification
             )
         } catch let error as ConnectorCredentialRotationError {
             if case .statePersistenceFailed(.stateCommit) = error {
@@ -214,6 +218,8 @@ struct ConnectorCredentialRotationTransaction {
         degraded.pendingConnectorCredentialGeneration = nil
         degraded.recoveryPhase = .degraded
         degraded.lastRemoteResult = .degraded
+        degraded.lastVerifiedPublicOrigin = nil
+        degraded.lastSuccessfulRemoteProbeAt = nil
         _ = try? stateStore.save(degraded)
     }
 }
@@ -231,12 +237,12 @@ enum NgrokCredentialReplacementPhase: String, Equatable, Sendable {
     case commit
 }
 
-protocol NgrokCredentialCandidateValidationHooks {
-    func validatePrerequisites() throws
-    func launchCandidateSession(using candidateAuthtoken: String) throws
-    func reconcileCandidateEndpoint() throws
-    func validateAuthenticatedRemoteReadiness() throws -> RemoteConnectorProbe
-    func restorePriorProviderSession() throws
+protocol NgrokCredentialCandidateValidationHooks: Sendable {
+    func validatePrerequisites() async throws
+    func launchCandidateSession(using candidateAuthtoken: String) async throws
+    func reconcileCandidateEndpoint() async throws
+    func validateAuthenticatedRemoteReadiness() async throws -> RemoteConnectorProbe
+    func restorePriorProviderSession() async throws
 }
 
 enum NgrokCredentialReplacementError: Error, Equatable, LocalizedError, Sendable {
@@ -244,6 +250,7 @@ enum NgrokCredentialReplacementError: Error, Equatable, LocalizedError, Sendable
     case prerequisitesFailed
     case candidateValidationFailed(NgrokCredentialReplacementPhase)
     case commitFailed
+    case commitAmbiguous
     case failedClosed
     case failClosedUnavailable
 
@@ -257,6 +264,8 @@ enum NgrokCredentialReplacementError: Error, Equatable, LocalizedError, Sendable
             return "ngrok credential candidate validation failed during " + phase.rawValue + "."
         case .commitFailed:
             return "The validated ngrok credential candidate could not be committed."
+        case .commitAmbiguous:
+            return "ngrok credential commit could not be classified safely; reconciliation is required."
         case .failedClosed:
             return "ngrok credential replacement failed closed; recovery is required."
         case .failClosedUnavailable:
@@ -273,18 +282,36 @@ struct NgrokCredentialReplacementTransaction {
     private let keychain: KeychainStore
     private let hooks: any NgrokCredentialCandidateValidationHooks
     private let failurePolicy: NgrokCredentialFailurePolicy
+    private let stateStore: (any RemoteConnectorStatePersisting)?
+    private let coordinator: RemoteCredentialOperationCoordinator
 
     init(
         keychain: KeychainStore,
         hooks: any NgrokCredentialCandidateValidationHooks,
-        failurePolicy: NgrokCredentialFailurePolicy
+        failurePolicy: NgrokCredentialFailurePolicy,
+        stateStore: (any RemoteConnectorStatePersisting)? = nil,
+        coordinator: RemoteCredentialOperationCoordinator = .shared
     ) {
         self.keychain = keychain
         self.hooks = hooks
         self.failurePolicy = failurePolicy
+        self.stateStore = stateStore
+        self.coordinator = coordinator
     }
 
-    func execute(candidate: String) throws -> NgrokCredentialReplacementReceipt {
+    func execute(candidate: String) async throws -> NgrokCredentialReplacementReceipt {
+        try await coordinator.acquire()
+        do {
+            let receipt = try await executeUnlocked(candidate: candidate)
+            await coordinator.release()
+            return receipt
+        } catch {
+            await coordinator.release()
+            throw error
+        }
+    }
+
+    private func executeUnlocked(candidate: String) async throws -> NgrokCredentialReplacementReceipt {
         guard !candidate.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw NgrokCredentialReplacementError.invalidCandidate
         }
@@ -306,28 +333,42 @@ struct NgrokCredentialReplacementTransaction {
         }
 
         var phase = NgrokCredentialReplacementPhase.prerequisites
+        var candidateCommitted = false
         do {
-            try hooks.validatePrerequisites()
+            try await hooks.validatePrerequisites()
             phase = .launch
-            try hooks.launchCandidateSession(using: candidateForValidation)
+            try await hooks.launchCandidateSession(using: candidateForValidation)
             phase = .endpoint
-            try hooks.reconcileCandidateEndpoint()
+            try await hooks.reconcileCandidateEndpoint()
             phase = .readiness
-            let probe = try hooks.validateAuthenticatedRemoteReadiness()
+            let probe = try await hooks.validateAuthenticatedRemoteReadiness()
             phase = .commit
-            try keychain.replaceNgrokAuthtoken(expectedCurrent: currentValue, with: candidateForValidation)
+            do {
+                try keychain.replaceNgrokAuthtoken(expectedCurrent: currentValue, with: candidateForValidation)
+            } catch let error as KeychainStoreError
+                where error == .readBackMismatch || error == .commitAmbiguous {
+                throw NgrokCredentialReplacementError.commitAmbiguous
+            }
+            candidateCommitted = true
             currentValue = nil
+            try persistNgrokReadyState(probe)
             return NgrokCredentialReplacementReceipt(probe: probe)
         } catch let error as NgrokCredentialReplacementError {
-            throw handleFailure(currentValue: &currentValue, originalError: error)
+            throw await handleFailure(currentValue: &currentValue, originalError: error)
         } catch {
             let safeError: NgrokCredentialReplacementError
             switch failurePolicy {
             case .preserveExistingCredential:
-                try? hooks.restorePriorProviderSession()
-                safeError = phase == .commit
-                    ? .commitFailed
-                    : .candidateValidationFailed(phase)
+                if phase == .commit, candidateCommitted {
+                    persistNgrokDegradedState()
+                    safeError = .commitFailed
+                } else if phase == .commit {
+                    try? await hooks.restorePriorProviderSession()
+                    safeError = .commitFailed
+                } else {
+                    try? await hooks.restorePriorProviderSession()
+                    safeError = .candidateValidationFailed(phase)
+                }
             case .failClosedIfCompromised:
                 do {
                     try keychain.deleteNgrokAuthtoken(expectedCurrent: currentValue)
@@ -344,10 +385,15 @@ struct NgrokCredentialReplacementTransaction {
     private func handleFailure(
         currentValue: inout String?,
         originalError: NgrokCredentialReplacementError
-    ) -> NgrokCredentialReplacementError {
+    ) async -> NgrokCredentialReplacementError {
+        if originalError == .commitAmbiguous {
+            persistNgrokDegradedState()
+            currentValue = nil
+            return originalError
+        }
         switch failurePolicy {
         case .preserveExistingCredential:
-            try? hooks.restorePriorProviderSession()
+            try? await hooks.restorePriorProviderSession()
             currentValue = nil
             return originalError
         case .failClosedIfCompromised:
@@ -360,5 +406,31 @@ struct NgrokCredentialReplacementTransaction {
                 return .failClosedUnavailable
             }
         }
+    }
+
+    private func persistNgrokReadyState(_ probe: RemoteConnectorProbe) throws {
+        guard let stateStore else { return }
+        var state = try stateStore.loadOrCreate(provider: .ngrok)
+        state.lastVerifiedPublicOrigin = probe.origin
+        state.lastSuccessfulRemoteProbeAt = probe.verifiedAt
+        state.lastRemoteResult = .ready
+        if state.pendingConnectorCredentialGeneration == nil {
+            state.recoveryPhase = .stable
+        } else {
+            state.recoveryPhase = .cutoverPendingValidation
+        }
+        try stateStore.save(state)
+    }
+
+    private func persistNgrokDegradedState() {
+        guard let stateStore,
+              var state = try? stateStore.loadOrCreate(provider: .ngrok) else { return }
+        state.lastVerifiedPublicOrigin = nil
+        state.lastSuccessfulRemoteProbeAt = nil
+        state.lastRemoteResult = .degraded
+        state.recoveryPhase = state.pendingConnectorCredentialGeneration == nil
+            ? .degraded
+            : .cutoverPendingValidation
+        _ = try? stateStore.save(state)
     }
 }

@@ -43,6 +43,7 @@ enum KeychainStoreError: Error, Equatable, LocalizedError, Sendable {
     case invalidConnectorToken
     case concurrentModification
     case readBackMismatch
+    case commitAmbiguous
     case operationFailed(Int)
     case randomGenerationFailed
 
@@ -58,6 +59,8 @@ enum KeychainStoreError: Error, Equatable, LocalizedError, Sendable {
             return "The Keychain item changed before it could be replaced."
         case .readBackMismatch:
             return "The Keychain item could not be verified after replacement."
+        case .commitAmbiguous:
+            return "The Keychain replacement result could not be classified safely."
         case let .operationFailed(status):
             return "The Keychain operation failed with status " + String(status) + "."
         case .randomGenerationFailed:
@@ -288,7 +291,9 @@ struct KeychainStore {
     }
 
     func replaceNgrokAuthtoken(expectedCurrent: String?, with newValue: String) throws {
-        guard !newValue.isEmpty else {
+        guard !newValue.isEmpty,
+              newValue == newValue.trimmingCharacters(in: .whitespacesAndNewlines),
+              newValue.rangeOfCharacter(from: .controlCharacters) == nil else {
             throw KeychainStoreError.invalidValue
         }
 
@@ -296,7 +301,14 @@ struct KeychainStore {
         let current = try value(for: item)
         switch (expectedCurrent, current) {
         case let (.some(expected), .some(actual)) where expected == actual:
-            try client.update(value: newValue, service: item.service, account: item.account)
+            do {
+                try client.update(value: newValue, service: item.service, account: item.account)
+            } catch {
+                // Keychain APIs do not prove whether an update reached the
+                // item when an operation reports an error. Treat the value as
+                // potentially canonical and let the caller reconcile.
+                throw KeychainStoreError.commitAmbiguous
+            }
             guard try value(for: item) == newValue else {
                 throw KeychainStoreError.readBackMismatch
             }

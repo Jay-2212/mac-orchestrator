@@ -17,7 +17,8 @@ Versioned release asset
               ├── python/cpython-3.13.14/
               ├── runtime/.venv/bin/python
               │     └── automac_mcp.py → 127.0.0.1:<selected-port>
-              └── remote/ngrok/ngrok (optional external binary)
+              ├── remote/ngrok/ngrok (optional external binary)
+              └── meridian/indexer (optional separately installed executable)
 ```
 
 The helper is installed below:
@@ -38,6 +39,12 @@ archive named by the concrete manifest, verifies SHA-256, architecture, and
 the original Developer ID authority/team, and never re-signs the binary. The
 LaunchAgent starts only the helper under the installing user's Application
 Support directory.
+
+The public bootstrap also does not contain Meridian's optional indexer or its
+Node/document/embedding dependencies. A separate Meridian distribution may
+promote one executable under `meridian/indexer`; the native helper verifies
+its SHA-256, regular-file ownership, and executable bit before promotion and
+keeps `meridian/indexer.previous` as the last-known-good optional tool.
 
 ## Bootstrap trust and promotion
 
@@ -79,6 +86,10 @@ The Swift helper is the lifecycle and configuration plane:
   arguments.
 - `RotatingLog.swift` writes local restricted logs and redacts capability
   credentials.
+- `MeridianIndexer.swift` owns the optional installed-tool boundary, explicit
+  scope configuration, exact stdin handoff, bounded progress parsing, fixed
+  scheduling, cancellation, retry/rebuild requests, and child lifecycle. It
+  does not implement Meridian discovery, parsing, Core calls, or index state.
 - `MenuController.swift` and `AppDelegate.swift` expose profile, permission
   guidance, remote, restart, and explicit Copy Connector URL controls. Opening
   Settings is guidance only; the managed Python probe remains the permission
@@ -177,6 +188,12 @@ uv sync --extra indexer
 embeddings to a configured external worker. Its directories, worker URL, and
 credentials are a separate trust boundary and it is not started by the core
 supervisor.
+
+The Phase 5 Meridian indexer follows the same boundary with a different
+optional tool: the base runtime never imports or bundles it. The Mac helper
+passes a local-only invocation to the separately installed executable and
+does not persist its token, document contents, vectors, provider bodies, or
+absolute roots in diagnostics.
 
 ## Permissions and identity limits
 

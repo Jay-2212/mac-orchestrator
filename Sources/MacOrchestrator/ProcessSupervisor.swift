@@ -24,6 +24,7 @@ final class ProcessSupervisor {
     private let tunnelLog: RotatingLog
     private let lifecycleScheduler: MainLifecycleScheduler
     private let lifecycle: LifecycleStateMachine
+    private let meridianIndexerCoordinator: MeridianIndexerCoordinator
     private let remoteConnectorAdapter: any RemoteConnectorAdapter
     private let remoteProbeCoordinator: RemoteProbeCoordinator
     private let remoteConnectorStateStore: any RemoteConnectorStatePersisting
@@ -95,12 +96,19 @@ final class ProcessSupervisor {
         serverLog = RotatingLog(directory: logsDirectory, name: "server.log")
         tunnelLog = RotatingLog(directory: logsDirectory, name: "tunnel.log")
         lifecycleScheduler = MainLifecycleScheduler()
+        meridianIndexerCoordinator = MeridianIndexerCoordinator(
+            scheduler: lifecycleScheduler,
+            supportDirectory: supportDirectory
+        )
         lifecycle = LifecycleStateMachine(scheduler: lifecycleScheduler)
         lifecycle.onSnapshot = { [weak self] lifecycleSnapshot in
             self?.applyLifecycleSnapshot(lifecycleSnapshot)
         }
         lifecycle.onEffect = { [weak self] effect in
             self?.handleLifecycleEffect(effect)
+        }
+        meridianIndexerCoordinator.onSnapshot = { [weak self] indexerSnapshot in
+            self?.snapshot.applyMeridianIndexerSnapshot(indexerSnapshot)
         }
     }
 
@@ -214,6 +222,7 @@ final class ProcessSupervisor {
         quitting = true
         networkPathMonitor.stop()
         healthTimer?.invalidate()
+        meridianIndexerCoordinator.stop()
         lifecycle.prepareForMaintenance()
         appLog.write("Supervisor quit cleanly")
     }
@@ -238,7 +247,16 @@ final class ProcessSupervisor {
     }
 
     func prepareForMaintenance() {
+        meridianIndexerCoordinator.stop()
         lifecycle.prepareForMaintenance()
+    }
+
+    func cancelMeridianIndexerRequested() {
+        meridianIndexerCoordinator.cancel()
+    }
+
+    func retryMeridianIndexerRequested(rebuild: Bool = false) {
+        meridianIndexerCoordinator.retry(rebuild: rebuild)
     }
 
     func retry(component: ManagedComponentID) {
@@ -341,6 +359,7 @@ final class ProcessSupervisor {
         appLog.redact(contract.redactedSecrets)
         serverLog.redact(contract.redactedSecrets)
         tunnelLog.redact(contract.redactedSecrets)
+        meridianIndexerCoordinator.reconcile(configuration: contract.configuration, contract: contract)
     }
 
     private func applyLifecycleSnapshot(_ lifecycleSnapshot: LifecycleSnapshot) {

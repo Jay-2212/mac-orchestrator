@@ -42,6 +42,25 @@ struct ManagedRuntimeLaunchContract: Sendable, CustomStringConvertible, CustomDe
     let environment: [String: String]
     let redactedSecrets: [String]
     let ngrokAuthtoken: String?
+    let meridianIndexerToken: String?
+
+    init(
+        port: Int,
+        configuration: AppConfiguration,
+        capabilitySnapshot: CapabilitySnapshot,
+        environment: [String: String],
+        redactedSecrets: [String],
+        ngrokAuthtoken: String?,
+        meridianIndexerToken: String? = nil
+    ) {
+        self.port = port
+        self.configuration = configuration
+        self.capabilitySnapshot = capabilitySnapshot
+        self.environment = environment
+        self.redactedSecrets = redactedSecrets
+        self.ngrokAuthtoken = ngrokAuthtoken
+        self.meridianIndexerToken = meridianIndexerToken
+    }
 
     var description: String { "ManagedRuntimeLaunchContract" }
     var debugDescription: String { description }
@@ -81,6 +100,16 @@ struct ManagedRuntimeLaunchContract: Sendable, CustomStringConvertible, CustomDe
             .flatMap { $0.isEmpty ? nil : $0 }
         if let ngrokAuthtoken {
             redactedSecrets.append(ngrokAuthtoken)
+        }
+
+        let meridianIndexerToken: String?
+        if configuration.integration.meridianIndexer.enabled {
+            meridianIndexerToken = try? keychain.meridianIngestToken()
+            if let meridianIndexerToken, !meridianIndexerToken.isEmpty {
+                redactedSecrets.append(meridianIndexerToken)
+            }
+        } else {
+            meridianIndexerToken = nil
         }
 
         if capabilitySnapshot.capabilities["telegram.send"]?.ready == true {
@@ -129,7 +158,8 @@ struct ManagedRuntimeLaunchContract: Sendable, CustomStringConvertible, CustomDe
             capabilitySnapshot: capabilitySnapshot,
             environment: environment,
             redactedSecrets: redactedSecrets,
-            ngrokAuthtoken: ngrokAuthtoken
+            ngrokAuthtoken: ngrokAuthtoken,
+            meridianIndexerToken: meridianIndexerToken
         )
     }
 

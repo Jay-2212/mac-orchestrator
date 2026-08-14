@@ -1,0 +1,221 @@
+import Foundation
+import XCTest
+@testable import MacOrchestrator
+
+final class MeridianIndexerTests: XCTestCase {
+    func testConfigurationRequiresExplicitSafeScopesAndRoundTrips() throws {
+        let configuration = MeridianIndexerConfiguration(
+            enabled: true,
+            intervalMinutes: 30,
+            scopes: [
+                MeridianSourceScope(
+                    scopeID: "scope-notes",
+                    rootPath: "/Users/example/Notes",
+                    paths: ["work", "notes.md"]
+                )
+            ]
+        )
+
+        let validated = try configuration.validated()
+        let data = try JSONEncoder().encode(validated)
+        let decoded = try JSONDecoder().decode(MeridianIndexerConfiguration.self, from: data)
+
+        XCTAssertEqual(decoded, validated)
+        XCTAssertTrue(String(decoding: data, as: UTF8.self).contains("scope-notes"))
+    }
+
+    func testConfigurationRejectsDefaultScanAndUnsafeSelections() {
+        let invalidScopes = [
+            MeridianSourceScope(scopeID: "scope", rootPath: "/Users/example", paths: []),
+            MeridianSourceScope(scopeID: "scope", rootPath: "~/Documents", paths: ["notes"]),
+            MeridianSourceScope(scopeID: "scope", rootPath: "/Users/example", paths: ["../notes"]),
+            MeridianSourceScope(scopeID: "scope", rootPath: "/Users/example", paths: ["file:///Users/example/notes"]),
+            MeridianSourceScope(scopeID: "scope", rootPath: "/Users/example", paths: ["notes\\private"]),
+        ]
+
+        for scope in invalidScopes {
+            let configuration = MeridianIndexerConfiguration(
+                enabled: true,
+                intervalMinutes: 30,
+                scopes: [scope]
+            )
+            XCTAssertThrowsError(try configuration.validated())
+        }
+    }
+
+    func testInvocationUsesMeridianShapeAndKeepsMacRootLocalToInvocation() throws {
+        let invocation = try MeridianIndexerInvocation(
+            baseURL: URL(string: "https://meridian.example")!,
+            stateURL: URL(fileURLWithPath: "/Users/example/Library/Application Support/Mac Orchestrator/meridian/state.json"),
+            scopes: [
+                MeridianSourceScope(scopeID: "scope", rootPath: "/Users/example/Notes", paths: ["notes.md"])
+            ],
+            rebuild: true
+        )
+
+        let data = try invocation.encoded()
+        let json = String(decoding: data, as: UTF8.self)
+        XCTAssertTrue(json.contains("\"baseUrl\":\"https://meridian.example\""))
+        XCTAssertTrue(json.contains("\"sourceId\":\"scope\""))
+        XCTAssertTrue(json.contains("\"rootPath\":\"/Users/example/Notes\""))
+        XCTAssertTrue(json.contains("\"rebuild\":true"))
+        XCTAssertFalse(json.contains("MERIDIAN_CORE_TOKEN"))
+        XCTAssertFalse(json.contains("Bearer"))
+    }
+
+    func testProgressParserDropsPathsUnknownFieldsAndOversizedLines() throws {
+        let allowed = try XCTUnwrap(
+            MeridianIndexerProgressEvent.parse(
+                line: #"{"protocol_version":"1.0.0","type":"source_committed","source_id":"s-1","relative_path":"notes.md","generation":"g-1"}"#
+            )
+        )
+        XCTAssertEqual(allowed.type, "source_committed")
+
+        XCTAssertNil(
+            MeridianIndexerProgressEvent.parse(
+                line: #"{"protocol_version":"1.0.0","type":"source_failed","source_id":"s-1","relative_path":"/Users/example/private.txt","generation":"g-1","code":"remote_failed"}"#
+            )
+        )
+        XCTAssertNil(
+            MeridianIndexerProgressEvent.parse(
+                line: #"{"protocol_version":"1.0.0","type":"source_committed","source_id":"s-1","relative_path":"notes.md","generation":"g-1","raw_body":"secret"}"#
+            )
+        )
+        XCTAssertNil(MeridianIndexerProgressEvent.parse(line: String(repeating: "x", count: 17_000)))
+    }
+
+    func testOptionalToolInstallRejectsBadDigestWithoutReplacingKnownGood() throws {
+        let directory = try temporaryDirectory()
+        let installer = MeridianIndexerToolInstaller(rootURL: directory)
+        let current = directory.appendingPathComponent("indexer")
+        try Data("known-good".utf8).write(to: current)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: current.path)
+        let candidate = directory.appendingPathComponent("candidate")
+        try Data("candidate".utf8).write(to: candidate)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: candidate.path)
+
+        XCTAssertThrowsError(
+            try installer.install(candidateURL: candidate, expectedSHA256: String(repeating: "a", count: 64))
+        )
+        XCTAssertEqual(try Data(contentsOf: current), Data("known-good".utf8))
+    }
+
+    func testRunControllerRejectsOverlapAndSeparatesCancellationFromFailure() throws {
+        let controller = MeridianIndexerRunController()
+
+        XCTAssertEqual(controller.beginRun(), .started)
+        XCTAssertEqual(controller.beginRun(), .alreadyRunning)
+        controller.cancelRequested()
+        XCTAssertTrue(controller.isCancellationRequested)
+        controller.finish(status: .cancelled, exitCode: 0)
+        XCTAssertFalse(controller.isRunning)
+        XCTAssertEqual(controller.lastStatus, .cancelled)
+    }
+
+    @MainActor
+    func testCoordinatorOwnsOneRunAndCancellationDoesNotOverlap() throws {
+        let directory = try temporaryDirectory()
+        let toolURL = directory.appendingPathComponent("meridian/indexer")
+        try FileManager.default.createDirectory(at: toolURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("tool".utf8).write(to: toolURL)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: toolURL.path)
+
+        let scheduler = TestLifecycleScheduler(start: Date(timeIntervalSince1970: 100))
+        let launcher = FakeMeridianIndexerLauncher()
+        let coordinator = MeridianIndexerCoordinator(
+            scheduler: scheduler,
+            launcher: launcher,
+            supportDirectory: directory
+        )
+        var configuration = AppConfiguration.fresh(ownerID: "owner")
+        configuration.integration.meridianDeploymentURL = "https://meridian.example"
+        configuration.integration.meridianIndexer = MeridianIndexerConfiguration(
+            enabled: true,
+            intervalMinutes: 5,
+            scopes: [MeridianSourceScope(scopeID: "scope", rootPath: "/Users/example/Notes", paths: ["notes.md"])]
+        )
+        let contract = try makeContract(configuration: configuration, token: "core-token")
+
+        coordinator.reconcile(configuration: configuration, contract: contract)
+        scheduler.fire(try XCTUnwrap(scheduler.pendingHandles.first))
+        XCTAssertEqual(launcher.launchCount, 1)
+
+        coordinator.retry(rebuild: true)
+        XCTAssertEqual(launcher.launchCount, 1)
+        coordinator.cancel()
+        XCTAssertTrue(launcher.handle?.terminateCalled == true)
+        launcher.finish(status: "cancelled", exitCode: 0)
+        XCTAssertEqual(coordinator.snapshot.status, .cancelled)
+        XCTAssertTrue(coordinator.snapshot.nextRunAt != nil)
+
+        scheduler.fire(try XCTUnwrap(scheduler.pendingHandles.first))
+        XCTAssertEqual(launcher.launchCount, 2)
+        XCTAssertTrue(String(decoding: try XCTUnwrap(launcher.lastInput), as: UTF8.self).contains("\"rebuild\":true"))
+    }
+
+    @MainActor
+    private func makeContract(configuration: AppConfiguration, token: String) throws -> ManagedRuntimeLaunchContract {
+        let snapshot = CapabilityRegistry(
+            configuration: configuration,
+            facts: CapabilityReadinessFacts(coreSessionReady: true)
+        ).snapshot()
+        return ManagedRuntimeLaunchContract(
+            port: configuration.localMCPPort,
+            configuration: configuration,
+            capabilitySnapshot: snapshot,
+            environment: [:],
+            redactedSecrets: [token],
+            ngrokAuthtoken: nil,
+            meridianIndexerToken: token
+        )
+    }
+
+    private func temporaryDirectory(file: StaticString = #filePath, line: UInt = #line) throws -> URL {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("meridian-indexer-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        return directory
+    }
+}
+
+@MainActor
+private final class FakeMeridianIndexerLauncher: MeridianIndexerProcessLaunching {
+    private(set) var launchCount = 0
+    private(set) var lastInput: Data?
+    private(set) var handle: FakeMeridianIndexerProcess?
+    private var termination: ((Int32) -> Void)?
+
+    func launch(
+        executableURL: URL,
+        environment: [String: String],
+        input: Data,
+        output: @escaping (Data) -> Void,
+        termination: @escaping (Int32) -> Void
+    ) throws -> any MeridianIndexerProcessHandle {
+        _ = executableURL
+        XCTAssertEqual(environment["MERIDIAN_CORE_TOKEN"], "core-token")
+        _ = output
+        launchCount += 1
+        lastInput = input
+        self.termination = termination
+        let handle = FakeMeridianIndexerProcess()
+        self.handle = handle
+        return handle
+    }
+
+    func finish(status: String, exitCode: Int32) {
+        _ = status
+        termination?(exitCode)
+    }
+}
+
+@MainActor
+private final class FakeMeridianIndexerProcess: MeridianIndexerProcessHandle {
+    private(set) var terminateCalled = false
+    var isRunning: Bool { !terminateCalled }
+
+    func terminate() {
+        terminateCalled = true
+    }
+}

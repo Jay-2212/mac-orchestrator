@@ -51,6 +51,10 @@ struct ManagedRuntimeLaunchContract: Sendable {
         "http://127.0.0.1:\(port)"
     }
 
+    var configurationGeneration: UInt64 {
+        UInt64(max(0, configuration.generation))
+    }
+
     static func make(
         configuration: AppConfiguration,
         capabilitySnapshot: CapabilitySnapshot,
@@ -141,6 +145,20 @@ struct ManagedRuntimeLaunchContract: Sendable {
             environment["NGROK_AUTHTOKEN"] = ngrokAuthtoken
         }
         return environment
+    }
+
+    func remoteConnectorLaunchInput(
+        executableURL: URL,
+        configurationURL: URL
+    ) -> RemoteConnectorLaunchInput {
+        RemoteConnectorLaunchInput(
+            executableURL: executableURL,
+            configurationURL: configurationURL,
+            tunnelTarget: tunnelTarget,
+            ownerID: configuration.ownerID,
+            environment: ngrokEnvironment(),
+            authenticationToken: ngrokAuthtoken
+        )
     }
 }
 

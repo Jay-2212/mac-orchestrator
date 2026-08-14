@@ -33,6 +33,9 @@ struct ServiceSnapshot {
         tunnel = Self.serviceState(for: lifecycle.remoteConnector)
         productReadiness = lifecycle.productReadiness
         error = lifecycle.mcpServer.reason ?? lifecycle.remoteConnector.reason
+        if lifecycle.remoteConnector.lifecycle != .ready {
+            connectorURL = nil
+        }
     }
 
     func projected(from lifecycle: LifecycleSnapshot) -> ServiceSnapshot {

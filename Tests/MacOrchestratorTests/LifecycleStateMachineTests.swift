@@ -13,6 +13,18 @@ final class LifecycleStateMachineTests: XCTestCase {
         XCTAssertEqual(ProductReadinessState.partiallyReady.rawValue, "partiallyReady")
     }
 
+    func testLifecycleSnapshotExposesGenerationForAsyncReadinessFences() {
+        let (machine, _) = makeMachine()
+        let initialGeneration = machine.snapshot.mcpServer.generation
+
+        machine.setDesiredState(.enabled, for: .mcpServer)
+        machine.markProcessRunning(for: .mcpServer)
+        machine.markReady(for: .mcpServer)
+
+        XCTAssertGreaterThan(machine.snapshot.mcpServer.generation, initialGeneration)
+        XCTAssertTrue(machine.snapshot.mcpServer.isReady)
+    }
+
     func testDesiredRemoteWaitsForServerWithoutConsumingFailureBudget() {
         let (machine, _) = makeMachine()
 

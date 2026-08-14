@@ -71,6 +71,7 @@ struct ComponentLifecycleSnapshot: Codable, Equatable, Sendable {
     let nextRetryAt: Date?
     let reason: String?
     let circuit: ComponentCircuitState
+    let generation: UInt64
 
     var isReady: Bool {
         desired == .enabled &&
@@ -96,7 +97,8 @@ struct ComponentLifecycleSnapshot: Codable, Equatable, Sendable {
         recentFailureCount: Int = 0,
         nextRetryAt: Date? = nil,
         reason: String? = nil,
-        circuit: ComponentCircuitState = .closed
+        circuit: ComponentCircuitState = .closed,
+        generation: UInt64 = 0
     ) {
         self.id = id
         self.desired = desired
@@ -107,6 +109,7 @@ struct ComponentLifecycleSnapshot: Codable, Equatable, Sendable {
         self.nextRetryAt = nextRetryAt
         self.reason = reason
         self.circuit = circuit
+        self.generation = generation
     }
 
 }
@@ -902,7 +905,8 @@ final class LifecycleStateMachine {
             recentFailureCount: recentFailureCount,
             nextRetryAt: record.nextRetryAt,
             reason: record.reason,
-            circuit: record.circuit
+            circuit: record.circuit,
+            generation: record.generation
         )
     }
 }

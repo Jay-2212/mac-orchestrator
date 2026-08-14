@@ -24,6 +24,9 @@ final class ProcessSupervisor {
     private let tunnelLog: RotatingLog
     private let lifecycleScheduler: MainLifecycleScheduler
     private let lifecycle: LifecycleStateMachine
+    private let remoteConnectorAdapter: any RemoteConnectorAdapter
+    private let remoteProbeCoordinator: RemoteProbeCoordinator
+    private let remoteConnectorStateStore: any RemoteConnectorStatePersisting
 
     private var serverProcess: Process?
     private var tunnelProcess: Process?
@@ -37,6 +40,8 @@ final class ProcessSupervisor {
     private var tunnelLaunchGeneration: UInt64 = 0
     private var serverProcessGroupOwned = false
     private var tunnelProcessGroupOwned = false
+    private var connectorCredentialGeneration: UInt64 = 0
+    private var verifiedRemoteOrigin: RemotePublicOrigin?
 
     private var serverDesired: Bool {
         lifecycle.desiredState(for: .mcpServer).isEnabled
@@ -60,8 +65,15 @@ final class ProcessSupervisor {
         ngrokDirectory.appendingPathComponent("ngrok.yml", isDirectory: false)
     }
 
-    init(runtimeCoordinator: NativeRuntimeCoordinator) throws {
+    init(
+        runtimeCoordinator: NativeRuntimeCoordinator,
+        remoteConnectorAdapter: any RemoteConnectorAdapter = NgrokRemoteConnectorAdapter(),
+        remoteConnectorStateStore: any RemoteConnectorStatePersisting = RemoteConnectorStateStore()
+    ) throws {
         self.runtimeCoordinator = runtimeCoordinator
+        self.remoteConnectorAdapter = remoteConnectorAdapter
+        self.remoteProbeCoordinator = RemoteProbeCoordinator(adapter: remoteConnectorAdapter)
+        self.remoteConnectorStateStore = remoteConnectorStateStore
         let library = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0]
         supportDirectory = library
             .appendingPathComponent("Application Support", isDirectory: true)
@@ -92,6 +104,7 @@ final class ProcessSupervisor {
     func launch(with contract: ManagedRuntimeLaunchContract) {
         activationSucceeded = false
         activationInFlight = false
+        refreshRemoteConnectorIdentity()
         install(contract, requiresClientRefresh: false)
         appLog.write("Supervisor launched")
         cleanStaleOwnedProcesses()
@@ -279,6 +292,7 @@ final class ProcessSupervisor {
     ) {
         invalidateServerActivation()
         activeContract = contract
+        snapshot.connectorURL = nil
         ownerID = contract.configuration.ownerID
         lifecycle.synchronizeDesiredStates(
             mcpServer: contract.configuration.process.serverDesired,
@@ -314,7 +328,7 @@ final class ProcessSupervisor {
         case .stop(.remoteConnector):
             stopTunnelProcess()
         case .revalidate(.remoteConnector):
-            queryTunnelURL()
+            queryTunnelURL(forceAuthenticatedProbe: true)
         case .revalidate(.mcpServer):
             checkHealth()
         }
@@ -422,18 +436,25 @@ final class ProcessSupervisor {
             return
         }
         snapshot.connectorURL = nil
+        let launchSpecification: RemoteConnectorLaunchSpecification
+        do {
+            launchSpecification = try remoteConnectorAdapter.makeLaunchSpecification(
+                for: contract.remoteConnectorLaunchInput(
+                    executableURL: ngrokBinaryURL,
+                    configurationURL: ngrokConfigURL
+                )
+            )
+        } catch {
+            lifecycle.markFailed(
+                for: .remoteConnector,
+                reason: "Remote connector launch inputs are invalid."
+            )
+            return
+        }
         let process = Process()
-        process.executableURL = ngrokBinaryURL
-        process.arguments = [
-            "http", contract.tunnelTarget,
-            "--config", ngrokConfigURL.path,
-            "--log", "stdout",
-            "--log-format", "json",
-            "--log-level", "info",
-            "--inspect=true",
-            "--metadata", "mac-orchestrator-owner=\(ownerID)",
-        ]
-        process.environment = contract.ngrokEnvironment()
+        process.executableURL = launchSpecification.executableURL
+        process.arguments = launchSpecification.arguments
+        process.environment = launchSpecification.environment
         attachOutput(
             of: process,
             to: tunnelLog,
@@ -494,10 +515,12 @@ final class ProcessSupervisor {
         invalidateTunnelLaunch()
         guard let process = tunnelProcess else {
             snapshot.connectorURL = nil
+            verifiedRemoteOrigin = nil
             lifecycle.markStopped(for: .remoteConnector)
             return
         }
         snapshot.connectorURL = nil
+        verifiedRemoteOrigin = nil
         terminateOwned(process, group: tunnelProcessGroupOwned, label: "tunnel")
         tunnelProcessGroupOwned = false
         tunnelProcess = nil
@@ -564,7 +587,9 @@ final class ProcessSupervisor {
         }
 
         if let process = tunnelProcess, process.isRunning {
-            queryTunnelURL()
+            queryTunnelURL(
+                forceAuthenticatedProbe: lifecycle.snapshot.remoteConnector.lifecycle != .ready
+            )
         }
     }
 
@@ -691,6 +716,8 @@ final class ProcessSupervisor {
     @discardableResult
     private func beginTunnelLaunch() -> UInt64 {
         tunnelLaunchGeneration &+= 1
+        verifiedRemoteOrigin = nil
+        snapshot.connectorURL = nil
         return tunnelLaunchGeneration
     }
 
@@ -698,11 +725,10 @@ final class ProcessSupervisor {
         tunnelLaunchGeneration &+= 1
     }
 
-    private func queryTunnelURL() {
-        var request = URLRequest(url: URL(string: "http://127.0.0.1:4040/api/endpoints")!)
-        request.timeoutInterval = 1
-        guard let process = tunnelProcess, process.isRunning else { return }
-        guard let contract = activeContract,
+    private func queryTunnelURL(forceAuthenticatedProbe: Bool = true) {
+        guard let process = tunnelProcess, process.isRunning,
+              let serverProcess, serverProcess.isRunning,
+              let contract = activeContract,
               let connectorToken = contract.environment["MAC_ORCHESTRATOR_CONNECTOR_TOKEN"] else {
             snapshot.connectorURL = nil
             lifecycle.markDegraded(
@@ -711,46 +737,155 @@ final class ProcessSupervisor {
             )
             return
         }
-        let processID = ObjectIdentifier(process)
-        let launchGeneration = tunnelLaunchGeneration
-        let expectedTunnelTarget = contract.tunnelTarget
-        let expectedConnectorToken = connectorToken
-        NoRedirectURLSession.make().dataTask(with: request) { [weak self, processID, launchGeneration, expectedTunnelTarget, expectedConnectorToken] data, response, _ in
-            Task { @MainActor [weak self, processID, launchGeneration, expectedTunnelTarget, expectedConnectorToken] in
-                guard let self, let process = self.tunnelProcess, process.isRunning,
-                      ObjectIdentifier(process) == processID,
-                      self.tunnelLaunchGeneration == launchGeneration,
-                      self.tunnelDesired,
-                      self.serverDesired,
-                      !self.quitting,
-                      !self.lifecycle.isQuiescing,
-                      self.lifecycle.snapshot.mcpServer.isReady,
-                      self.activeContract?.tunnelTarget == expectedTunnelTarget,
-                      self.activeContract?.environment["MAC_ORCHESTRATOR_CONNECTOR_TOKEN"] == expectedConnectorToken else { return }
-                guard (response as? HTTPURLResponse)?.statusCode == 200,
-                      (response as? HTTPURLResponse)?.url == request.url,
-                      let data,
-                      let base = NgrokEndpointParser.publicURL(
-                          from: data,
-                          matching: expectedTunnelTarget
-                      ) else {
-                    // A previously observed public URL is never current
-                    // evidence. Clear it until the owned tunnel is confirmed
-                    // again by the Agent API.
+
+        refreshRemoteConnectorIdentity()
+        let remoteSnapshot = lifecycle.snapshot.remoteConnector
+        let fence = RemoteProbeFence(
+            tunnelProcessID: process.processIdentifier,
+            serverProcessID: serverProcess.processIdentifier,
+            tunnelLaunchGeneration: tunnelLaunchGeneration,
+            serverLaunchGeneration: serverLaunchGeneration,
+            configurationGeneration: contract.configurationGeneration,
+            connectorCredentialGeneration: connectorCredentialGeneration,
+            knownPublicOrigin: verifiedRemoteOrigin,
+            localMCPGeneration: lifecycle.snapshot.mcpServer.generation,
+            localMCPReady: lifecycle.snapshot.mcpServer.isReady,
+            remoteDesired: remoteSnapshot.desired == .enabled,
+            serverDesired: lifecycle.snapshot.mcpServer.desired == .enabled,
+            maintenance: lifecycle.isQuiescing,
+            quitting: quitting
+        )
+        let request = RemoteProbeRequest(
+            tunnelTarget: contract.tunnelTarget,
+            connectorToken: connectorToken,
+            knownPublicOrigin: verifiedRemoteOrigin,
+            forceAuthenticatedProbe: forceAuthenticatedProbe || snapshot.connectorURL == nil
+        )
+
+        Task { @MainActor [weak self, fence] in
+            guard let self else { return }
+            let result = await self.remoteProbeCoordinator.run(request)
+            guard self.isCurrentRemoteProbe(fence) else { return }
+            switch result {
+            case .busy:
+                return
+            case let .unchanged(publicOrigin):
+                self.verifiedRemoteOrigin = publicOrigin
+            case let .authenticated(publicOrigin, connectorURL, _):
+                do {
+                    try self.persistRemoteProbeSuccess(publicOrigin)
+                } catch {
                     self.snapshot.connectorURL = nil
+                    self.verifiedRemoteOrigin = nil
                     self.lifecycle.markDegraded(
                         for: .remoteConnector,
-                        reason: "Remote connector endpoint is not currently confirmed."
+                        reason: "Remote readiness was authenticated but could not be recorded safely."
                     )
                     return
                 }
-                self.snapshot.connectorURL = ConnectorURLBuilder.make(
-                    publicURL: base.absoluteString,
-                    capabilityToken: connectorToken
-                )
+                self.verifiedRemoteOrigin = publicOrigin
+                self.snapshot.connectorURL = connectorURL
                 self.lifecycle.markReady(for: .remoteConnector)
+            case let .failed(failure):
+                self.snapshot.connectorURL = nil
+                self.verifiedRemoteOrigin = nil
+                self.persistRemoteProbeFailure()
+                self.lifecycle.markDegraded(
+                    for: .remoteConnector,
+                    reason: failure.localizedDescription
+                )
             }
-        }.resume()
+        }
+    }
+
+    private func isCurrentRemoteProbe(_ fence: RemoteProbeFence) -> Bool {
+        guard !quitting,
+              !lifecycle.isQuiescing,
+              fence.quitting == false,
+              fence.maintenance == false,
+              tunnelDesired,
+              serverDesired,
+              fence.remoteDesired,
+              fence.serverDesired,
+              let tunnelProcess,
+              tunnelProcess.isRunning,
+              tunnelProcess.processIdentifier == fence.tunnelProcessID,
+              let serverProcess,
+              serverProcess.isRunning,
+              serverProcess.processIdentifier == fence.serverProcessID,
+              tunnelLaunchGeneration == fence.tunnelLaunchGeneration,
+              serverLaunchGeneration == fence.serverLaunchGeneration,
+              activeContract?.configurationGeneration == fence.configurationGeneration,
+              connectorCredentialGeneration == fence.connectorCredentialGeneration,
+              verifiedRemoteOrigin == fence.knownPublicOrigin,
+              lifecycle.snapshot.mcpServer.generation == fence.localMCPGeneration,
+              lifecycle.snapshot.mcpServer.isReady == fence.localMCPReady,
+              lifecycle.snapshot.mcpServer.isReady,
+              lifecycle.snapshot.remoteConnector.desired == .enabled else {
+            return false
+        }
+        let current = RemoteProbeFence(
+            tunnelProcessID: tunnelProcess.processIdentifier,
+            serverProcessID: serverProcess.processIdentifier,
+            tunnelLaunchGeneration: tunnelLaunchGeneration,
+            serverLaunchGeneration: serverLaunchGeneration,
+            configurationGeneration: activeContract?.configurationGeneration ?? 0,
+            connectorCredentialGeneration: connectorCredentialGeneration,
+            knownPublicOrigin: verifiedRemoteOrigin,
+            localMCPGeneration: lifecycle.snapshot.mcpServer.generation,
+            localMCPReady: lifecycle.snapshot.mcpServer.isReady,
+            remoteDesired: lifecycle.snapshot.remoteConnector.desired == .enabled,
+            serverDesired: lifecycle.snapshot.mcpServer.desired == .enabled,
+            maintenance: lifecycle.isQuiescing,
+            quitting: quitting
+        )
+        return fence.matches(current)
+    }
+
+    private func refreshRemoteConnectorIdentity() {
+        do {
+            guard let state = try remoteConnectorStateStore.load() else {
+                connectorCredentialGeneration = 0
+                verifiedRemoteOrigin = nil
+                return
+            }
+            connectorCredentialGeneration = state.connectorCredentialGeneration
+            verifiedRemoteOrigin = state.lastRemoteResult == .ready
+                ? state.lastVerifiedPublicOrigin
+                : nil
+        } catch {
+            connectorCredentialGeneration = 0
+            verifiedRemoteOrigin = nil
+        }
+    }
+
+    private func persistRemoteProbeSuccess(_ origin: RemotePublicOrigin) throws {
+        var state = try remoteConnectorStateStore.loadOrCreate(provider: .ngrok)
+        state.lastVerifiedPublicOrigin = origin
+        state.lastSuccessfulRemoteProbeAt = Date()
+        state.lastRemoteResult = .ready
+        if state.pendingConnectorCredentialGeneration == nil {
+            state.recoveryPhase = .stable
+        }
+        let saved = try remoteConnectorStateStore.save(state)
+        connectorCredentialGeneration = saved.connectorCredentialGeneration
+    }
+
+    private func persistRemoteProbeFailure() {
+        do {
+            var state = try remoteConnectorStateStore.loadOrCreate(provider: .ngrok)
+            state.lastVerifiedPublicOrigin = nil
+            state.lastSuccessfulRemoteProbeAt = nil
+            state.lastRemoteResult = .degraded
+            state.recoveryPhase = state.pendingConnectorCredentialGeneration == nil
+                ? .degraded
+                : .cutoverPendingValidation
+            let saved = try remoteConnectorStateStore.save(state)
+            connectorCredentialGeneration = saved.connectorCredentialGeneration
+        } catch {
+            // The lifecycle remains degraded even when the optional diagnostic
+            // state cannot be updated.
+        }
     }
 
     private func fail(_ message: String) {

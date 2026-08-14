@@ -703,8 +703,8 @@ final class DoctorEngineTests: XCTestCase {
                 configurationPresent: true,
                 agentAPIState: .available,
                 endpointState: .established,
-                authenticatedReadiness: authenticated,
-                localMCPPrerequisite: .available
+                localMCPPrerequisite: .available,
+                authenticatedReadiness: authenticated
             )
             XCTAssertEqual(DiagnosticChecks.remoteAuthenticatedReadiness(facts, desired: true).status, expectedStatus)
         }
@@ -713,8 +713,8 @@ final class DoctorEngineTests: XCTestCase {
             desired: true,
             agentAPIState: .available,
             endpointState: .established,
-            authenticatedReadiness: authenticatedCases[2].0,
-            localMCPPrerequisite: .available
+            localMCPPrerequisite: .available,
+            authenticatedReadiness: authenticatedCases[2].0
         )
         XCTAssertEqual(DiagnosticChecks.remoteInventory(mismatch, desired: true).status, .fail)
 
@@ -723,6 +723,7 @@ final class DoctorEngineTests: XCTestCase {
             endpointAvailable: true,
             agentAPIState: .available,
             endpointState: .established,
+            localMCPPrerequisite: .available,
             authenticatedReadiness: RemoteAuthenticatedMCPFacts(
                 probeAvailable: true,
                 probeRun: true,
@@ -735,8 +736,7 @@ final class DoctorEngineTests: XCTestCase {
                 safeCallChecked: true,
                 safeCallSucceeded: true,
                 clientHandoff: .changed
-            ),
-            localMCPPrerequisite: .available
+            )
         )
         XCTAssertEqual(DiagnosticChecks.remoteAuthenticatedReadiness(readyChanged, desired: true).status, .pass)
         XCTAssertEqual(DiagnosticChecks.remoteInventory(readyChanged, desired: true).status, .pass)
@@ -749,6 +749,7 @@ final class DoctorEngineTests: XCTestCase {
             endpointAvailable: true,
             agentAPIState: .available,
             endpointState: .established,
+            localMCPPrerequisite: .available,
             authenticatedReadiness: RemoteAuthenticatedMCPFacts(
                 probeAvailable: true,
                 probeRun: true,
@@ -761,8 +762,7 @@ final class DoctorEngineTests: XCTestCase {
                 safeCallChecked: true,
                 safeCallSucceeded: true,
                 clientHandoff: .unchanged
-            ),
-            localMCPPrerequisite: .available
+            )
         )
         XCTAssertEqual(DiagnosticChecks.remoteClientHandoff(unchanged, desired: true).status, .pass)
 
@@ -771,6 +771,7 @@ final class DoctorEngineTests: XCTestCase {
             endpointAvailable: true,
             agentAPIState: .available,
             endpointState: .established,
+            localMCPPrerequisite: .available,
             authenticatedReadiness: RemoteAuthenticatedMCPFacts(
                 probeAvailable: true,
                 probeRun: true,
@@ -782,8 +783,7 @@ final class DoctorEngineTests: XCTestCase {
                 exposedTools: ["describe"],
                 safeCallChecked: true,
                 safeCallSucceeded: true
-            ),
-            localMCPPrerequisite: .available
+            )
         )
         let noReceiptResult = DiagnosticChecks.remoteClientHandoff(noReceipt, desired: true)
         XCTAssertEqual(noReceiptResult.status, .skip)
@@ -822,8 +822,8 @@ final class DoctorEngineTests: XCTestCase {
         let authRejected = RemoteConnectorFacts(
             desired: true,
             endpointAvailable: true,
-            endpointState: .established,
             agentAPIState: .available,
+            endpointState: .established,
             localMCPPrerequisite: .available,
             authenticatedReadiness: RemoteAuthenticatedMCPFacts(
                 probeAvailable: true,

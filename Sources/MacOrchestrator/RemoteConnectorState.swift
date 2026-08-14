@@ -1,9 +1,5 @@
 import Foundation
 
-enum RemoteConnectorProvider: String, Codable, Equatable, Sendable {
-    case ngrok
-}
-
 enum RemoteResultClassification: String, Codable, Equatable, Sendable {
     case unknown
     case ready

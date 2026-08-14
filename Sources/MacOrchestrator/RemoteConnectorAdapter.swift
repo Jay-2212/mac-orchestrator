@@ -1,6 +1,6 @@
 import Foundation
 
-enum RemoteConnectorProvider: String, Equatable, Sendable {
+enum RemoteConnectorProvider: String, Codable, Equatable, Sendable {
     case ngrok
 }
 

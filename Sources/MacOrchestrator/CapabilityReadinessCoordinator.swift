@@ -178,6 +178,10 @@ final class CapabilityReadinessCoordinator {
             try? keychain.value(for: .meridianTelegramWebhookSecret)
         ) != nil
 
+        // This is the startup/base capability snapshot. Live network and
+        // authenticated remote lifecycle state are projected separately by
+        // CapabilitySnapshot.projected(from:), so this evaluator never owns
+        // or restarts the lifecycle authority.
         return CapabilityReadinessFacts(
             coreSessionReady: coreSessionReady,
             localUIReady: localUIReady,

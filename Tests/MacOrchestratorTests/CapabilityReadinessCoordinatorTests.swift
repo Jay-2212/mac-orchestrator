@@ -297,6 +297,55 @@ final class CapabilityReadinessCoordinatorTests: XCTestCase {
     }
 
     @MainActor
+    func testLiveRemoteProjectionFollowsLifecycleWithoutChangingBaseSnapshot() throws {
+        var configuration = AppConfiguration.fresh(ownerID: "owner")
+        configuration.desiredCapabilities["remote.connector"] = true
+        configuration.process.tunnelDesired = true
+        let base = CapabilityRegistry(
+            configuration: configuration,
+            facts: CapabilityReadinessFacts(
+                coreSessionReady: true,
+                remoteConnectorConfigured: true,
+                remoteConnectorReady: false
+            )
+        ).snapshot()
+
+        let local = ComponentLifecycleSnapshot(
+            id: .mcpServer,
+            desired: .enabled,
+            lifecycle: .ready,
+            liveness: .running,
+            readiness: .ready
+        )
+        let waitingRemote = ComponentLifecycleSnapshot(
+            id: .remoteConnector,
+            desired: .enabled,
+            lifecycle: .starting,
+            liveness: .running,
+            readiness: .notReady
+        )
+        let readyRemote = ComponentLifecycleSnapshot(
+            id: .remoteConnector,
+            desired: .enabled,
+            lifecycle: .ready,
+            liveness: .running,
+            readiness: .ready
+        )
+
+        let waiting = base.projected(
+            from: LifecycleSnapshot(mcpServer: local, remoteConnector: waitingRemote)
+        )
+        let ready = base.projected(
+            from: LifecycleSnapshot(mcpServer: local, remoteConnector: readyRemote)
+        )
+
+        XCTAssertFalse(try XCTUnwrap(waiting.capabilities["remote.connector"]).ready)
+        XCTAssertTrue(try XCTUnwrap(ready.capabilities["remote.connector"]).ready)
+        XCTAssertEqual(base.configGeneration, ready.configGeneration)
+        XCTAssertFalse(try XCTUnwrap(base.capabilities["remote.connector"]).ready)
+    }
+
+    @MainActor
     private func makeCoordinator(
         permissions: CapabilityPermissionChecking,
         fileManager: FileManager = .default

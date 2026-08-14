@@ -39,7 +39,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             )
             self.runtimeCoordinator = runtimeCoordinator
-            let supervisor = try ProcessSupervisor(runtimeCoordinator: runtimeCoordinator)
+            let supervisor = try ProcessSupervisor(
+                runtimeCoordinator: runtimeCoordinator,
+                networkPathMonitor: SystemNetworkPathMonitor()
+            )
             self.supervisor = supervisor
             menuController = MenuController(supervisor: supervisor)
             NSWorkspace.shared.notificationCenter.addObserver(

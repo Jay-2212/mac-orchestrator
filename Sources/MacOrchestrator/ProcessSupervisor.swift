@@ -27,6 +27,7 @@ final class ProcessSupervisor {
     private let remoteConnectorAdapter: any RemoteConnectorAdapter
     private let remoteProbeCoordinator: RemoteProbeCoordinator
     private let remoteConnectorStateStore: any RemoteConnectorStatePersisting
+    private let networkPathMonitor: any NetworkPathMonitoring
 
     private var serverProcess: Process?
     private var tunnelProcess: Process?
@@ -68,12 +69,14 @@ final class ProcessSupervisor {
     init(
         runtimeCoordinator: NativeRuntimeCoordinator,
         remoteConnectorAdapter: any RemoteConnectorAdapter = NgrokRemoteConnectorAdapter(),
-        remoteConnectorStateStore: any RemoteConnectorStatePersisting = RemoteConnectorStateStore()
+        remoteConnectorStateStore: any RemoteConnectorStatePersisting = RemoteConnectorStateStore(),
+        networkPathMonitor: any NetworkPathMonitoring = SystemNetworkPathMonitor()
     ) throws {
         self.runtimeCoordinator = runtimeCoordinator
         self.remoteConnectorAdapter = remoteConnectorAdapter
         self.remoteProbeCoordinator = RemoteProbeCoordinator(adapter: remoteConnectorAdapter)
         self.remoteConnectorStateStore = remoteConnectorStateStore
+        self.networkPathMonitor = networkPathMonitor
         let library = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0]
         supportDirectory = library
             .appendingPathComponent("Application Support", isDirectory: true)
@@ -108,6 +111,7 @@ final class ProcessSupervisor {
         install(contract, requiresClientRefresh: false)
         appLog.write("Supervisor launched")
         cleanStaleOwnedProcesses()
+        startNetworkPathMonitoring()
         startHealthTimer()
         if serverDesired {
             lifecycle.setDesiredState(.enabled, for: .mcpServer)
@@ -177,6 +181,7 @@ final class ProcessSupervisor {
 
     func stopForQuit() {
         quitting = true
+        networkPathMonitor.stop()
         healthTimer?.invalidate()
         lifecycle.prepareForMaintenance()
         appLog.write("Supervisor quit cleanly")
@@ -197,6 +202,7 @@ final class ProcessSupervisor {
     }
 
     func handleNetworkAvailabilityChanged(_ available: Bool) {
+        guard !quitting else { return }
         lifecycle.handleNetworkAvailabilityChanged(available)
     }
 
@@ -552,6 +558,14 @@ final class ProcessSupervisor {
         healthTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
                 self?.checkHealth()
+            }
+        }
+    }
+
+    private func startNetworkPathMonitoring() {
+        networkPathMonitor.start { [weak self] available in
+            Task { @MainActor [weak self] in
+                self?.handleNetworkAvailabilityChanged(available)
             }
         }
     }

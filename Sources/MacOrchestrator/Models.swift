@@ -20,6 +20,7 @@ struct ServiceSnapshot {
     var totalCapabilityCount: Int = CapabilityRegistry.capabilityIDs.count
     var pendingPermissions: [String] = []
     var clientRefreshRequired: Bool = false
+    var effectiveCapabilitySnapshot: CapabilitySnapshot?
 
     var isHealthy: Bool {
         if productReadiness == .ready {
@@ -35,6 +36,12 @@ struct ServiceSnapshot {
         error = lifecycle.mcpServer.reason ?? lifecycle.remoteConnector.reason
         if lifecycle.remoteConnector.lifecycle != .ready {
             connectorURL = nil
+        }
+        if let capabilitySnapshot = effectiveCapabilitySnapshot {
+            let projected = capabilitySnapshot.projected(from: lifecycle)
+            effectiveCapabilitySnapshot = projected
+            readyCapabilityCount = projected.capabilities.values.filter(\.ready).count
+            totalCapabilityCount = projected.capabilities.count
         }
     }
 
@@ -72,6 +79,7 @@ struct ServiceSnapshot {
         requiresClientRefresh: Bool
     ) {
         controlProfile = contract.capabilitySnapshot.controlProfile
+        effectiveCapabilitySnapshot = contract.capabilitySnapshot
         readyCapabilityCount = contract.capabilitySnapshot.capabilities.values.filter(\.ready).count
         totalCapabilityCount = contract.capabilitySnapshot.capabilities.count
         pendingPermissions = Self.pendingPermissions(in: contract.capabilitySnapshot)

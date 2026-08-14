@@ -279,15 +279,13 @@ struct MeridianIndexerProgressEvent: Codable, Equatable, Sendable {
             allowed = ["protocol_version", "type", "source_id", "relative_path", "generation", "code"]
         case "source_cancelled":
             allowed = ["protocol_version", "type", "source_id", "relative_path", "generation"]
-        case "result":
-            allowed = ["type", "status", "counts"]
-        case "error":
-            allowed = ["type", "code"]
         default: return nil
         }
-        guard Set(dictionary.keys).isSubset(of: allowed) else { return nil }
+        guard Set(dictionary.keys) == allowed else { return nil }
         guard let decoded = try? JSONDecoder().decode(Self.self, from: data) else { return nil }
-        if type != "result" && decoded.protocolVersion != "1.0.0" { return nil }
+        guard decoded.protocolVersion == "1.0.0" else { return nil }
+        if let status = decoded.status,
+           !["completed", "partial_failure", "cancelled", "reconciliation_required"].contains(status) { return nil }
         if let sourceID = decoded.sourceID,
            sourceID.range(of: "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$", options: .regularExpression) == nil { return nil }
         if let relativePath = decoded.relativePath {
@@ -296,7 +294,17 @@ struct MeridianIndexerProgressEvent: Codable, Equatable, Sendable {
         if let generation = decoded.generation,
            generation.range(of: "^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$", options: .regularExpression) == nil { return nil }
         if let code = decoded.code,
-           code.range(of: "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$", options: .regularExpression) == nil { return nil }
+           !["unsupported", "encrypted", "oversized", "permission_denied", "symlink_unsupported", "invalid_utf8", "unavailable", "remote_failed", "index_failed", "state_reconciliation_required", "cancelled"].contains(code) { return nil }
+        let boundedCounts = [decoded.expectedChunks, decoded.uploadedChunks, decoded.totalChunks].compactMap { $0 }
+        guard boundedCounts.allSatisfy({ (0...1_000_000_000).contains($0) }) else { return nil }
+        if let uploadedChunks = decoded.uploadedChunks,
+           let totalChunks = decoded.totalChunks,
+           uploadedChunks > totalChunks { return nil }
+        if let counts = decoded.counts {
+            let values = [counts.discovered, counts.unchanged, counts.committed, counts.skipped, counts.failed, counts.cancelled, counts.reconciliationRequired]
+            guard values.allSatisfy({ (0...1_000_000_000).contains($0) }),
+                  counts.unchanged + counts.committed + counts.skipped + counts.failed + counts.cancelled + counts.reconciliationRequired <= counts.discovered else { return nil }
+        }
         return decoded
     }
 }
@@ -396,6 +404,10 @@ struct MeridianIndexerToolInstaller {
             defer { try? fileManager.removeItem(at: staging) }
             try fileManager.copyItem(at: candidateURL, to: staging)
             try fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: staging.path)
+            guard let stagedData = try? Data(contentsOf: staging),
+                  MaintenanceDigest.sha256(data: stagedData).caseInsensitiveCompare(expectedSHA256) == .orderedSame else {
+                throw MeridianIndexerError.digestMismatch
+            }
 
             if fileManager.fileExists(atPath: previousURL.path) {
                 try fileManager.removeItem(at: previousURL)
@@ -650,14 +662,9 @@ final class MeridianIndexerCoordinator {
             outputBuffer.removeSubrange(...newline)
             guard let line = String(data: lineData, encoding: .utf8),
                   let event = MeridianIndexerProgressEvent.parse(line: line) else { continue }
-            if event.type == "result", let status = event.status {
-                resultStatus = MeridianIndexerRunStatus(rawValue: status)
-                if let counts = event.counts { snapshot.counts = counts }
-            } else if event.type == "run_finished" {
+            if event.type == "run_finished" {
                 resultStatus = event.status.flatMap(MeridianIndexerRunStatus.init(rawValue:))
                 if let counts = event.counts { snapshot.counts = counts }
-            } else if event.type == "error" {
-                snapshot.lastErrorCode = event.code
             } else if event.type == "source_failed" {
                 snapshot.lastErrorCode = event.code
             }
@@ -669,9 +676,8 @@ final class MeridianIndexerCoordinator {
         if !outputBuffer.isEmpty,
            let line = String(data: outputBuffer, encoding: .utf8),
            let event = MeridianIndexerProgressEvent.parse(line: line),
-           event.type == "result",
-           let status = event.status {
-            resultStatus = MeridianIndexerRunStatus(rawValue: status)
+           event.type == "run_finished" {
+            resultStatus = event.status.flatMap(MeridianIndexerRunStatus.init(rawValue:))
             if let counts = event.counts { snapshot.counts = counts }
         }
         outputBuffer.removeAll(keepingCapacity: false)
@@ -679,10 +685,8 @@ final class MeridianIndexerCoordinator {
         let status: MeridianIndexerRunStatus
         if cancellationRequested || resultStatus == .cancelled {
             status = .cancelled
-        } else if let resultStatus {
-            status = resultStatus
         } else if exitCode == 0 {
-            status = .completed
+            status = resultStatus ?? .completed
         } else if exitCode == 2 {
             status = .partialFailure
         } else {

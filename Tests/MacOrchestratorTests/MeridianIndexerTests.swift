@@ -83,9 +83,14 @@ final class MeridianIndexerTests: XCTestCase {
         )
         XCTAssertNil(MeridianIndexerProgressEvent.parse(line: String(repeating: "x", count: 17_000)))
         XCTAssertEqual(
-            MeridianIndexerProgressEvent.parse(line: #"{"type":"error","code":"remote_url_invalid"}"#)?.code,
-            "remote_url_invalid"
+            MeridianIndexerProgressEvent.parse(
+                line: #"{"protocol_version":"1.0.0","type":"run_finished","status":"partial_failure","counts":{"discovered":2,"unchanged":0,"committed":1,"skipped":0,"failed":1,"cancelled":0,"reconciliation_required":0}}"#
+            )?.status,
+            "partial_failure"
         )
+        XCTAssertNil(MeridianIndexerProgressEvent.parse(line: #"{"type":"error","code":"remote_url_invalid"}"#))
+        XCTAssertNil(MeridianIndexerProgressEvent.parse(line: #"{"protocol_version":"1.0.0","type":"run_finished","status":"unknown","counts":{"discovered":0,"unchanged":0,"committed":0,"skipped":0,"failed":0,"cancelled":0,"reconciliation_required":0}}"#))
+        XCTAssertNil(MeridianIndexerProgressEvent.parse(line: #"{"protocol_version":"1.0.0","type":"run_finished","status":"completed","counts":{"discovered":1,"unchanged":1,"committed":1,"skipped":0,"failed":0,"cancelled":0,"reconciliation_required":0}}"#))
     }
 
     func testOptionalToolInstallRejectsBadDigestWithoutReplacingKnownGood() throws {

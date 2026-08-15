@@ -50,7 +50,7 @@ final class MeridianIndexerTests: XCTestCase {
             scopes: [
                 MeridianSourceScope(scopeID: "scope", rootPath: "/Users/example/Notes", paths: ["notes.md"])
             ],
-            rebuild: true
+            action: .rebuild
         )
 
         let data = try invocation.encoded()
@@ -60,7 +60,7 @@ final class MeridianIndexerTests: XCTestCase {
         let source = try XCTUnwrap((object["sources"] as? [[String: Any]])?.first)
         XCTAssertEqual(source["sourceId"] as? String, "scope")
         XCTAssertEqual(source["rootPath"] as? String, "/Users/example/Notes")
-        XCTAssertEqual(source["rebuild"] as? Bool, true)
+        XCTAssertEqual(object["action"] as? String, "rebuild")
         XCTAssertFalse(json.contains("MERIDIAN_CORE_TOKEN"))
         XCTAssertFalse(json.contains("Bearer"))
     }
@@ -126,6 +126,70 @@ final class MeridianIndexerTests: XCTestCase {
     }
 
     @MainActor
+    func testRoadmapSchedulerUsesSixHoursAndRejectsStaleCallbacks() throws {
+        let directory = try temporaryDirectory()
+        let toolURL = directory.appendingPathComponent("meridian/indexer")
+        try FileManager.default.createDirectory(at: toolURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("tool".utf8).write(to: toolURL)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: toolURL.path)
+
+        let start = Date(timeIntervalSince1970: 100)
+        let scheduler = TestLifecycleScheduler(start: start)
+        let launcher = FakeMeridianIndexerLauncher()
+        let coordinator = MeridianIndexerCoordinator(scheduler: scheduler, launcher: launcher, supportDirectory: directory)
+        var configuration = AppConfiguration.fresh(ownerID: "owner")
+        configuration.desiredCapabilities["meridian.search"] = true
+        configuration.integration.meridianDeploymentURL = "https://meridian.example"
+        configuration.integration.meridianIndexer = MeridianIndexerConfiguration(
+            enabled: true,
+            scheduleMode: .everySixHours,
+            scopes: [MeridianSourceScope(scopeID: "scope", rootPath: "/Users/example/Notes", paths: ["notes.md"])]
+        )
+        let contract = try makeContract(configuration: configuration, token: "core-token")
+
+        coordinator.reconcile(configuration: configuration, contract: contract)
+        XCTAssertEqual(coordinator.snapshot.nextRunAt, start.addingTimeInterval(6 * 60 * 60))
+        XCTAssertEqual(launcher.launchCount, 0)
+
+        let stale = try XCTUnwrap(scheduler.pendingHandles.first)
+        coordinator.stop()
+        scheduler.fireIgnoringCancellation(stale)
+        XCTAssertEqual(launcher.launchCount, 0)
+    }
+
+    @MainActor
+    func testWakeRunsOneMissedScheduledExecutionWithoutCatchUpStorm() throws {
+        let directory = try temporaryDirectory()
+        let toolURL = directory.appendingPathComponent("meridian/indexer")
+        try FileManager.default.createDirectory(at: toolURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("tool".utf8).write(to: toolURL)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: toolURL.path)
+
+        let start = Date(timeIntervalSince1970: 100)
+        let scheduler = TestLifecycleScheduler(start: start)
+        let launcher = FakeMeridianIndexerLauncher()
+        let coordinator = MeridianIndexerCoordinator(scheduler: scheduler, launcher: launcher, supportDirectory: directory)
+        var configuration = AppConfiguration.fresh(ownerID: "owner")
+        configuration.desiredCapabilities["meridian.search"] = true
+        configuration.integration.meridianDeploymentURL = "https://meridian.example"
+        configuration.integration.meridianIndexer = MeridianIndexerConfiguration(
+            enabled: true,
+            scheduleMode: .everySixHours,
+            scopes: [MeridianSourceScope(scopeID: "scope", rootPath: "/Users/example/Notes", paths: ["notes.md"])]
+        )
+        let contract = try makeContract(configuration: configuration, token: "core-token")
+
+        coordinator.reconcile(configuration: configuration, contract: contract)
+        let scheduled = try XCTUnwrap(scheduler.pendingHandles.first)
+        scheduler.cancel(scheduled)
+        scheduler.advance(to: start.addingTimeInterval(7 * 60 * 60))
+        coordinator.handleWake()
+        scheduler.fire(try XCTUnwrap(scheduler.pendingHandles.first))
+        XCTAssertEqual(launcher.launchCount, 1)
+        XCTAssertEqual(coordinator.snapshot.status, .running)
+    }
+
+    @MainActor
     func testCoordinatorOwnsOneRunAndCancellationDoesNotOverlap() throws {
         let directory = try temporaryDirectory()
         let toolURL = directory.appendingPathComponent("meridian/indexer")
@@ -142,14 +206,16 @@ final class MeridianIndexerTests: XCTestCase {
         )
         var configuration = AppConfiguration.fresh(ownerID: "owner")
         configuration.integration.meridianDeploymentURL = "https://meridian.example"
+        configuration.desiredCapabilities["meridian.search"] = true
         configuration.integration.meridianIndexer = MeridianIndexerConfiguration(
             enabled: true,
-            intervalMinutes: 5,
+            scheduleMode: .manual,
             scopes: [MeridianSourceScope(scopeID: "scope", rootPath: "/Users/example/Notes", paths: ["notes.md"])]
         )
         let contract = try makeContract(configuration: configuration, token: "core-token")
 
         coordinator.reconcile(configuration: configuration, contract: contract)
+        coordinator.scanNow()
         scheduler.fire(try XCTUnwrap(scheduler.pendingHandles.first))
         XCTAssertEqual(launcher.launchCount, 1)
 
@@ -163,7 +229,7 @@ final class MeridianIndexerTests: XCTestCase {
 
         scheduler.fire(try XCTUnwrap(scheduler.pendingHandles.first))
         XCTAssertEqual(launcher.launchCount, 2)
-        XCTAssertTrue(String(decoding: try XCTUnwrap(launcher.lastInput), as: UTF8.self).contains("\"rebuild\":true"))
+        XCTAssertTrue(String(decoding: try XCTUnwrap(launcher.lastInput), as: UTF8.self).contains("\"action\":\"rebuild\""))
     }
 
     @MainActor
@@ -198,6 +264,7 @@ private final class FakeMeridianIndexerLauncher: MeridianIndexerProcessLaunching
     private(set) var lastInput: Data?
     private(set) var handle: FakeMeridianIndexerProcess?
     private var termination: ((Int32) -> Void)?
+    private var output: ((Data) -> Void)?
 
     func launch(
         executableURL: URL,
@@ -208,7 +275,7 @@ private final class FakeMeridianIndexerLauncher: MeridianIndexerProcessLaunching
     ) throws -> any MeridianIndexerProcessHandle {
         _ = executableURL
         XCTAssertEqual(environment["MERIDIAN_CORE_TOKEN"], "core-token")
-        _ = output
+        self.output = output
         launchCount += 1
         lastInput = input
         self.termination = termination
@@ -218,7 +285,9 @@ private final class FakeMeridianIndexerLauncher: MeridianIndexerProcessLaunching
     }
 
     func finish(status: String, exitCode: Int32) {
-        _ = status
+        let action = status == "cancelled" ? "index" : "rebuild"
+        let result = "{\"control_version\":\"1.0.0\",\"action\":\"\(action)\",\"status\":\"\(status)\",\"exit_code\":\(exitCode),\"counts\":{\"discovered\":0,\"unchanged\":0,\"committed\":0,\"skipped\":0,\"failed\":0,\"cancelled\":0,\"reconciliation_required\":0}}\n"
+        output?(Data(result.utf8))
         termination?(exitCode)
     }
 }

@@ -376,9 +376,15 @@ struct CapabilityRegistry {
             }
             return (true, nil)
         case "meridian.search":
+            guard configuration.integration.meridianIndexer.enabled else {
+                return (false, "Meridian indexing is not explicitly enabled.")
+            }
             guard let url = configuration.integration.meridianDeploymentURL,
                   !url.isEmpty else {
                 return (false, "Meridian deployment is not configured.")
+            }
+            guard (try? configuration.integration.meridianIndexer.validated()) != nil else {
+                return (false, "Meridian source selection or schedule is invalid.")
             }
             guard facts.meridianCredentialsPresent else {
                 return (false, "Meridian Search credentials are not configured.")
@@ -431,7 +437,7 @@ struct CapabilityRegistry {
         case "mac.clipboard.write": return "Clipboard mutation readiness has not been verified."
         case "telegram.send": return "Telegram Send readiness has not been verified."
         case "meridian.search":
-            return "Meridian Search compatibility and index readiness have not been verified."
+            return "Meridian Search compatibility, indexing, and semantic readiness have not been verified."
         case "meridian.telegram": return "Meridian Telegram readiness has not been verified."
         case "remote.connector": return "Remote connector readiness has not been verified."
         default: return "Capability readiness has not been verified."

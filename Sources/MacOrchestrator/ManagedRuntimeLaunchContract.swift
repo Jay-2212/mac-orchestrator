@@ -103,8 +103,15 @@ struct ManagedRuntimeLaunchContract: Sendable, CustomStringConvertible, CustomDe
         }
 
         let meridianIndexerToken: String?
-        if configuration.integration.meridianIndexer.enabled {
-            meridianIndexerToken = try? keychain.meridianIngestToken()
+        if configuration.integration.meridianIndexer.enabled,
+           configuration.desiredCapabilities["meridian.search"] == true {
+            let candidate: String? = try? keychain.meridianIngestToken()
+            if let candidate {
+                let trimmed = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+                meridianIndexerToken = trimmed.isEmpty ? nil : trimmed
+            } else {
+                meridianIndexerToken = nil
+            }
             if let meridianIndexerToken, !meridianIndexerToken.isEmpty {
                 redactedSecrets.append(meridianIndexerToken)
             }
@@ -129,7 +136,13 @@ struct ManagedRuntimeLaunchContract: Sendable, CustomStringConvertible, CustomDe
         }
 
         if capabilitySnapshot.capabilities["meridian.search"]?.ready == true {
-            guard let ingestToken = try keychain.meridianIngestToken(), !ingestToken.isEmpty else {
+            guard let rawIngestToken = try keychain.meridianIngestToken() else {
+                throw ManagedRuntimeLaunchContractError.missingRequiredSecret(
+                    "MAC_ORCHESTRATOR_MERIDIAN_INGEST_TOKEN"
+                )
+            }
+            let ingestToken = rawIngestToken.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !ingestToken.isEmpty else {
                 throw ManagedRuntimeLaunchContractError.missingRequiredSecret(
                     "MAC_ORCHESTRATOR_MERIDIAN_INGEST_TOKEN"
                 )

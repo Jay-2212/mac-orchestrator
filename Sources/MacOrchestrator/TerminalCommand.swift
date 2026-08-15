@@ -866,6 +866,7 @@ enum TerminalCommand {
         let support = (overrideSupportDirectory ?? ConfigurationStore.defaultDirectoryURL(fileManager: fileManager))
             .standardizedFileURL
         let home = (overrideHomeDirectory ?? fileManager.homeDirectoryForCurrentUser).standardizedFileURL
+        let meridianPrivatePaths = meridianPrivatePaths(at: support)
         let receiptURL = support.appendingPathComponent("install/receipt.json")
         let receiptData = (try? Data(contentsOf: receiptURL)) ?? Data("{\"available\":false}".utf8)
         let entries = [
@@ -898,9 +899,26 @@ enum TerminalCommand {
             sources: [Phase3SupportBundleSource(entries: entries)],
             redactor: SensitiveDataRedactor(
                 exactSecrets: supportBundleSecretValues(keychain: keychain),
-                homeDirectory: home.path
+                homeDirectory: home.path,
+                privatePaths: meridianPrivatePaths
             )
         )
+    }
+
+    private static func meridianPrivatePaths(at supportDirectory: URL) -> [String] {
+        let configurationURL = supportDirectory.appendingPathComponent("config.json", isDirectory: false)
+        guard let data = try? Data(contentsOf: configurationURL),
+              let configuration = try? JSONDecoder().decode(AppConfiguration.self, from: data) else {
+            return []
+        }
+        return configuration.integration.meridianIndexer.scopes.flatMap { scope in
+            let root = (scope.rootPath as NSString).standardizingPath
+            return [root] + scope.paths.map {
+                URL(fileURLWithPath: root, isDirectory: true)
+                    .appendingPathComponent($0, isDirectory: false)
+                    .standardizedFileURL.path
+            }
+        }
     }
 
     private static func readBoundedLogs(at directory: URL) throws -> Data {

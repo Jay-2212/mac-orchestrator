@@ -95,6 +95,7 @@ struct SystemDoctorKeychainPresenceProvider: DoctorKeychainPresenceProviding {
         .ngrokAuthtoken,
         .telegramSendBotToken,
         .telegramSendChatID,
+        .meridianIngestToken,
     ]
 
     init(querying: KeychainPresenceQuerying = SystemKeychainPresenceQuery()) {
@@ -173,6 +174,7 @@ struct DoctorDependencies {
     let lifecycleProvider: any LifecycleFactsProviding
     let remoteConnectorProvider: any RemoteConnectorFactsProviding
     let remoteAuthenticatedMCPProvider: (any RemoteAuthenticatedMCPDiagnosticProviding)?
+    let meridianProvider: any MeridianDiagnosticProviding
     let diskSpaceProvider: any DiskSpaceProviding
     let logDirectoryProvider: any LogDirectoryPermissionsProviding
     let updateProvider: any UpdateAvailabilityProviding
@@ -190,6 +192,7 @@ struct DoctorDependencies {
         lifecycleProvider: any LifecycleFactsProviding = UnavailableLifecycleProvider(),
         remoteConnectorProvider: any RemoteConnectorFactsProviding = UnavailableRemoteProvider(),
         remoteAuthenticatedMCPProvider: (any RemoteAuthenticatedMCPDiagnosticProviding)? = nil,
+        meridianProvider: any MeridianDiagnosticProviding = SystemMeridianDiagnosticProvider(),
         diskSpaceProvider: any DiskSpaceProviding = UnavailableDiskProvider(),
         logDirectoryProvider: any LogDirectoryPermissionsProviding = ReadOnlyLogDirectoryPermissionsProvider(
             directoryURL: FileManager.default.homeDirectoryForCurrentUser
@@ -211,6 +214,7 @@ struct DoctorDependencies {
         self.lifecycleProvider = lifecycleProvider
         self.remoteConnectorProvider = remoteConnectorProvider
         self.remoteAuthenticatedMCPProvider = remoteAuthenticatedMCPProvider
+        self.meridianProvider = meridianProvider
         self.diskSpaceProvider = diskSpaceProvider
         self.logDirectoryProvider = logDirectoryProvider
         self.updateProvider = updateProvider
@@ -240,6 +244,8 @@ struct DoctorEngine {
         let remoteDesired = configuration?.process.tunnelDesired == true
             || configuration?.desiredCapabilities["remote.connector"] == true
         let telegramSendDesired = configuration?.desiredCapabilities["telegram.send"] == true
+        let meridianDesired = configuration?.integration.meridianIndexer.enabled == true
+            && configuration?.desiredCapabilities["meridian.search"] == true
 
         let installedInspection = inspectInstalledRelease()
         let installedFacts = installedInspection.value
@@ -259,9 +265,14 @@ struct DoctorEngine {
             localDesired: serverDesired,
             remoteDesired: remoteDesired,
             telegramSendDesired: telegramSendDesired,
+            meridianDesired: meridianDesired,
             hasValidatedConfiguration: hasValidatedConfiguration
         )
         let keychainFacts = keychainInspection.value
+        let meridianInspection = meridianDesired
+            ? inspectMeridian(configuration: configuration)
+            : DoctorInspection<MeridianDiagnosticFacts>(value: .disabled)
+        let meridianFacts = meridianInspection.value
         let remotePrerequisite = remoteLocalPrerequisite(
             localMCPFacts,
             serverDesired: serverDesired,
@@ -322,11 +333,20 @@ struct DoctorEngine {
             DiagnosticChecks.remoteAuthenticatedReadiness(remoteFacts, desired: remoteDesired),
             DiagnosticChecks.remoteInventory(remoteFacts, desired: remoteDesired),
             DiagnosticChecks.remoteClientHandoff(remoteFacts, desired: remoteDesired),
+            DiagnosticChecks.meridianConfiguration(meridianFacts),
+            DiagnosticChecks.meridianSources(meridianFacts),
+            DiagnosticChecks.keychainMeridian(keychainFacts, desired: meridianDesired),
+            DiagnosticChecks.meridianTool(meridianFacts),
+            DiagnosticChecks.meridianCompatibility(meridianFacts),
+            DiagnosticChecks.meridianLastIndex(meridianFacts),
+            DiagnosticChecks.meridianSemanticReadiness(meridianFacts),
+            DiagnosticChecks.meridianScheduler(meridianFacts),
+            DiagnosticChecks.meridianRunState(meridianFacts),
             DiagnosticChecks.updateAvailability(updateFacts),
             DiagnosticChecks.diskFreeSpace(diskFacts, thresholdBytes: dependencies.thresholds.lowDiskBytes),
             DiagnosticChecks.criticalPaths(diskFacts),
             DiagnosticChecks.logDirectoryPermissions(logDirectoryFacts),
-            DiagnosticChecks.futureCapability("capability.meridian", title: "Meridian capability"),
+            DiagnosticChecks.meridianAggregate(meridianFacts),
             DiagnosticChecks.futureCapability("capability.cloudflare", title: "Cloudflare capability"),
             DiagnosticChecks.futureCapability("capability.telegram-assistant", title: "Telegram Assistant capability"),
         ]
@@ -345,17 +365,17 @@ struct DoctorEngine {
             to: ["permissions.requester"],
             in: &results
         )
-        let keychainFailureTarget: [String]
+        var allKeychainFailureTargets: [String] = []
         if serverDesired {
-            keychainFailureTarget = ["keychain.connector"]
+            allKeychainFailureTargets.append("keychain.connector")
         } else if remoteDesired {
-            keychainFailureTarget = ["remote.ngrok"]
+            allKeychainFailureTargets.append("remote.ngrok")
         } else if telegramSendDesired {
-            keychainFailureTarget = ["keychain.telegram-send"]
-        } else {
-            keychainFailureTarget = []
+            allKeychainFailureTargets.append("keychain.telegram-send")
         }
-        applyFailure(keychainInspection.failureReason, to: keychainFailureTarget, in: &results)
+        if meridianDesired { allKeychainFailureTargets.append("meridian.credential") }
+        applyFailure(keychainInspection.failureReason, to: allKeychainFailureTargets, in: &results)
+        applyFailure(meridianInspection.failureReason, to: ["meridian.configuration", "meridian.tool"], in: &results)
         applyFailure(portInspection.failureReason, to: ["port.selected"], in: &results)
         applyFailure(localMCPInspection.failureReason, to: ["mcp.liveness"], in: &results)
         applyFailure(
@@ -413,6 +433,7 @@ struct DoctorEngine {
         localDesired: Bool,
         remoteDesired: Bool,
         telegramSendDesired: Bool,
+        meridianDesired: Bool,
         hasValidatedConfiguration: Bool
     ) -> DoctorInspection<KeychainPresenceFacts> {
         guard hasValidatedConfiguration else { return DoctorInspection() }
@@ -423,11 +444,22 @@ struct DoctorEngine {
             items.insert(.telegramSendBotToken)
             items.insert(.telegramSendChatID)
         }
+        if meridianDesired { items.insert(.meridianIngestToken) }
         guard !items.isEmpty else { return DoctorInspection() }
         do {
             return DoctorInspection(value: try dependencies.keychainPresenceProvider.inspect(items: items))
         } catch {
             return DoctorInspection(failureReason: providerFailureReason(error, subject: "Keychain presence"))
+        }
+    }
+
+    private func inspectMeridian(
+        configuration: AppConfiguration?
+    ) -> DoctorInspection<MeridianDiagnosticFacts> {
+        do {
+            return DoctorInspection(value: try dependencies.meridianProvider.inspect(configuration: configuration))
+        } catch {
+            return DoctorInspection(failureReason: providerFailureReason(error, subject: "Meridian"))
         }
     }
 

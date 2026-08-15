@@ -11,6 +11,7 @@ import atexit
 import functools
 import json
 import logging
+import math
 import os
 import re
 import signal
@@ -24,6 +25,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional
+from urllib.parse import urlsplit
 
 import requests
 import pyautogui
@@ -67,6 +69,9 @@ CAPABILITY_IDS = (
 _CAPABILITY_ID_SET = frozenset(CAPABILITY_IDS)
 _CONTROL_PROFILES = frozenset({"guided", "full"})
 _HEALTH_VALUES = frozenset({"ready", "disabled", "degraded", "unavailable"})
+_MERIDIAN_CONTROL_ROUTE = "/api/v1/search"
+_MERIDIAN_SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_MERIDIAN_SAFE_GENERATION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
 
 
 class CapabilitySnapshotError(ValueError):
@@ -354,6 +359,24 @@ class RuntimeSecrets:
         )
 
 
+def _valid_meridian_base_url(value: str):
+    """Return a credential-safe HTTPS base URL, or None."""
+    if not isinstance(value, str) or not value.strip() or "\x00" in value:
+        return None
+    parsed = urlsplit(value.strip())
+    if parsed.scheme.lower() != "https" or not parsed.hostname:
+        return None
+    if parsed.username is not None or parsed.password is not None:
+        return None
+    if parsed.query or parsed.fragment:
+        return None
+    try:
+        _ = parsed.port
+    except ValueError:
+        return None
+    return parsed
+
+
 @dataclass(frozen=True)
 class ServerRuntime:
     snapshot: CapabilitySnapshot
@@ -372,8 +395,14 @@ def _local_snapshot(environ: Mapping[str, str]) -> CapabilitySnapshot:
     telegram_ready = telegram_opt_in and bool(
         secrets.telegram_bot_token and secrets.telegram_chat_id
     )
-    meridian_ready = meridian_opt_in and bool(
-        secrets.worker_url and secrets.meridian_ingest_token
+    # Local developer mode still needs an explicit readiness marker. A URL and
+    # token are configuration inputs, never proof that Core is compatible or
+    # that the semantic probe succeeded.
+    meridian_ready = (
+        meridian_opt_in
+        and environ.get("MAC_ORCHESTRATOR_MERIDIAN_READY") == "1"
+        and _valid_meridian_base_url(secrets.worker_url) is not None
+        and bool(secrets.meridian_ingest_token)
     )
     local_ready = {
         "core.session",
@@ -2325,28 +2354,139 @@ def vector_search(query: str) -> Dict[str, Any]:
         return denied
     if not query:
         return _fail("query is required")
+    if not isinstance(query, str) or len(query) > 2_000 or "\x00" in query:
+        return _fail("query is invalid", error_code="INVALID_PARAM")
+    if (
+        query.startswith("/")
+        or query.startswith("~")
+        or "\\" in query
+        or re.match(r"^[A-Za-z]:/", query)
+        or re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", query)
+        or any(segment in {".", ".."} for segment in query.split("/"))
+    ):
+        return _fail("query is invalid", error_code="INVALID_PARAM")
+
+    worker_url = _runtime().secrets.worker_url
+    token = _runtime().secrets.meridian_ingest_token
+    parsed_base = _valid_meridian_base_url(worker_url)
+    if parsed_base is None or not token:
+        return _fail(
+            "Meridian search credentials were not supplied by Mac Orchestrator.",
+            error_code="NOT_CONFIGURED",
+        )
+
+    base_path = parsed_base.path.rstrip("/")
+    url = f"{parsed_base.scheme.lower()}://{parsed_base.netloc}{base_path}{_MERIDIAN_CONTROL_ROUTE}"
+    expected = urlsplit(url)
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
     try:
-        worker_url = _runtime().secrets.worker_url
-        if not worker_url:
-            return _fail(
-                "Meridian search credentials were not supplied by Mac Orchestrator.",
-                error_code="NOT_CONFIGURED",
-            )
-        url = f"{worker_url.rstrip('/')}/search"
-        token = _runtime().secrets.meridian_ingest_token
-        if not token:
-            return _fail(
-                "Meridian search credentials were not supplied by Mac Orchestrator.",
-                error_code="NOT_CONFIGURED",
-            )
-        headers = {"Authorization": f"Bearer {token}"}
-        resp = requests.get(url, params={"q": query}, headers=headers, timeout=10)
-        if resp.status_code == 200:
-            return _ok(f"Found matches for: {query}", results=resp.json().get("results", []))
-        else:
-            return _fail(f"Search failed: {resp.status_code} - {resp.text}")
-    except Exception as e:
-        return _fail(f"Search failed: {e}")
+        resp = requests.post(
+            url,
+            json={"query": query, "top_k": 10},
+            headers=headers,
+            timeout=8,
+            allow_redirects=False,
+        )
+    except requests.Timeout:
+        return _fail("Meridian search timed out.", error_code="TIMEOUT")
+    except requests.RequestException:
+        return _fail("Meridian search is temporarily unavailable.", error_code="REMOTE_UNAVAILABLE")
+    except Exception:
+        return _fail("Meridian search failed safely.", error_code="REMOTE_ERROR")
+
+    response_url = getattr(resp, "url", None)
+    if not response_url:
+        return _fail("Meridian search response origin was unavailable.", error_code="REDIRECT_BLOCKED")
+    try:
+        actual = urlsplit(str(response_url))
+        actual_port = actual.port
+    except (TypeError, ValueError):
+        return _fail("Meridian search redirect was blocked.", error_code="REDIRECT_BLOCKED")
+    if (
+        actual.scheme.lower() != expected.scheme.lower()
+        or (actual.hostname or "").lower() != (expected.hostname or "").lower()
+        or actual_port != expected.port
+        or actual.username is not None
+        or actual.password is not None
+        or actual.query
+        or actual.fragment
+        or actual.path.rstrip("/") != expected.path.rstrip("/")
+    ):
+        return _fail("Meridian search redirect was blocked.", error_code="REDIRECT_BLOCKED")
+    if 300 <= getattr(resp, "status_code", 0) < 400:
+        return _fail("Meridian search redirect was blocked.", error_code="REDIRECT_BLOCKED")
+    if getattr(resp, "status_code", 0) != 200:
+        status = getattr(resp, "status_code", 0)
+        code = "REMOTE_UNAUTHORIZED" if status in {401, 403} else (
+            "REMOTE_UNAVAILABLE" if status in {408, 429, 500, 502, 503, 504} else "REMOTE_ERROR"
+        )
+        return _fail("Meridian search returned an unusable response.", error_code=code)
+    try:
+        body = resp.json()
+    except Exception:
+        return _fail("Meridian search returned malformed JSON.", error_code="INVALID_RESPONSE")
+    if not isinstance(body, Mapping) or set(body) - {"results"} or not isinstance(body.get("results"), list):
+        return _fail("Meridian search returned an invalid result shape.", error_code="INVALID_RESPONSE")
+
+    safe_results: list[dict[str, Any]] = []
+    for raw in body["results"][:50]:
+        if not isinstance(raw, Mapping):
+            return _fail("Meridian search returned an invalid result.", error_code="INVALID_RESPONSE")
+        identifier = raw.get("id")
+        score = raw.get("score")
+        source_id = raw.get("sourceId")
+        generation = raw.get("generation")
+        ordinal = raw.get("ordinal")
+        relative_path = raw.get("relativePath")
+        display_name = raw.get("displayName")
+        snippet = raw.get("snippet")
+        if (
+            not isinstance(identifier, str) or not re.fullmatch(r"[0-9a-f]{64}", identifier)
+            or (score is not None and (isinstance(score, bool) or not isinstance(score, (int, float)) or not math.isfinite(score)))
+            or not isinstance(source_id, str) or not _MERIDIAN_SAFE_ID.fullmatch(source_id)
+            or not isinstance(generation, str) or not _MERIDIAN_SAFE_GENERATION.fullmatch(generation)
+            or isinstance(ordinal, bool) or not isinstance(ordinal, int) or not 0 <= ordinal <= 1_000_000_000
+            or not isinstance(relative_path, str) or not _safe_meridian_relative_path(relative_path)
+            or not isinstance(display_name, str) or not _safe_meridian_display_name(display_name)
+            or not isinstance(snippet, str) or len(snippet) > 1_000 or "\x00" in snippet
+        ):
+            return _fail("Meridian search returned an invalid result.", error_code="INVALID_RESPONSE")
+        safe_results.append({
+            "id": identifier,
+            "score": score,
+            "sourceId": source_id,
+            "generation": generation,
+            "ordinal": ordinal,
+            "relativePath": relative_path,
+            "displayName": display_name,
+            "snippet": snippet,
+        })
+    return _ok("Meridian semantic search completed.", results=safe_results)
+
+
+def _safe_meridian_relative_path(value: str) -> bool:
+    return bool(
+        value
+        and len(value) <= 512
+        and not value.startswith(("/", "~", "./"))
+        and not value.endswith("/")
+        and "\\" not in value
+        and "\x00" not in value
+        and "//" not in value
+        and "://" not in value
+        and not any(part in {".", ".."} for part in value.split("/"))
+    )
+
+
+def _safe_meridian_display_name(value: str) -> bool:
+    return bool(
+        value
+        and len(value) <= 255
+        and "\x00" not in value
+        and "/" not in value
+        and "\\" not in value
+        and value not in {".", ".."}
+    )
 
 # ── 10. File I/O ─────────────────────────────────────────────────────────────
 

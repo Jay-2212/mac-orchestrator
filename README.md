@@ -100,6 +100,24 @@ owned process, supports cancellation/retry/rebuild, and records bounded
 status. Missing optional tooling or credentials leaves the base MCP runtime
 usable and marks Meridian indexing unavailable.
 
+The native Meridian controls are deliberately small: configure explicit files
+or folders, preview that selection, scan now, pause/resume, retry, rebuild, or
+delete indexed source data. Scheduling is manual, every six hours (the default
+after configuration), or daily; Meridian is disabled until the user explicitly
+configures it. Disabling cancels its schedule and leaves cloud data untouched.
+Delete All Meridian Data is a separate confirmed action that asks Meridian Core
+to remove indexed D1/Vectorize document data only; it does not delete Cloudflare
+infrastructure or local source files.
+
+`meridian.search` is not enabled by a URL, token, process exit, or health check
+alone. Readiness requires the pinned tool receipt and digest, the frozen Core
+contract, a successful authenticated Meridian-owned probe, and at least one
+successful user-selected index or rebuild with the same deployment and tool
+identity. The bounded receipt contains no token, source root, document text, or
+vector. Doctor reports Meridian as skipped while disabled, and support bundles
+exclude source roots, selected paths, provider bodies, synthetic probe content,
+and credentials.
+
 ## Runtime and connector model
 
 ```text

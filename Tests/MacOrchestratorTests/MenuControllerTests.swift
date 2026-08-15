@@ -22,6 +22,7 @@ final class MenuControllerTests: XCTestCase {
             "Capabilities ready: 7/11",
             "Error: Configuration could not be loaded",
             "MCP client refresh/reconnection required",
+            "Meridian indexing: Disabled",
         ])
     }
 

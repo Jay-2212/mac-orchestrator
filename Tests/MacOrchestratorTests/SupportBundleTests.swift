@@ -45,8 +45,8 @@ final class SupportBundleTests: XCTestCase {
             "telegram-bot-token",
             "telegram-chat-id",
             "telegram-secret",
-            "vectors",
-            "user-documents"
+            "user-documents",
+            "vectors"
         ])
     }
 

@@ -576,6 +576,20 @@ struct MeridianIndexerCounts: Codable, Equatable, Sendable {
         case deleteFailed = "delete_failed"
         case reconciliationSkipped = "reconciliation_skipped"
     }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        discovered = try container.decode(Int.self, forKey: .discovered)
+        unchanged = try container.decode(Int.self, forKey: .unchanged)
+        committed = try container.decode(Int.self, forKey: .committed)
+        skipped = try container.decode(Int.self, forKey: .skipped)
+        failed = try container.decode(Int.self, forKey: .failed)
+        cancelled = try container.decode(Int.self, forKey: .cancelled)
+        reconciliationRequired = try container.decode(Int.self, forKey: .reconciliationRequired)
+        deleted = try container.decodeIfPresent(Int.self, forKey: .deleted) ?? 0
+        deleteFailed = try container.decodeIfPresent(Int.self, forKey: .deleteFailed) ?? 0
+        reconciliationSkipped = try container.decodeIfPresent(Int.self, forKey: .reconciliationSkipped) ?? 0
+    }
 }
 
 struct MeridianIndexerProgressEvent: Codable, Equatable, Sendable {

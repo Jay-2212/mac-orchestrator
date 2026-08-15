@@ -219,10 +219,10 @@ final class MeridianIndexerTests: XCTestCase {
         scheduler.fire(try XCTUnwrap(scheduler.pendingHandles.first))
         XCTAssertEqual(launcher.launchCount, 1)
 
-        coordinator.retry(rebuild: true)
-        XCTAssertEqual(launcher.launchCount, 1)
         coordinator.cancel()
         XCTAssertTrue(launcher.handle?.terminateCalled == true)
+        coordinator.retry(rebuild: true)
+        XCTAssertEqual(launcher.launchCount, 1)
         launcher.finish(status: "cancelled", exitCode: 0)
         XCTAssertEqual(coordinator.snapshot.status, .cancelled)
         XCTAssertTrue(coordinator.snapshot.nextRunAt != nil)

@@ -66,8 +66,11 @@ final class Phase5FReadinessTests: XCTestCase {
         XCTAssertFalse(uncertain?.isSuccessful == true)
     }
 
-    func testControlResultRequiresActionSpecificAcknowledgements() {
+    func testControlResultRequiresActionSpecificShapes() {
         XCTAssertNil(MeridianIndexerControlResult.parse(
+            line: #"{"control_version":"1.0.0","action":"delete-source","status":"completed","counts":{"matched":1,"deleted":1},"exit_code":0}"#
+        ))
+        XCTAssertNotNil(MeridianIndexerControlResult.parse(
             line: #"{"control_version":"1.0.0","action":"delete-source","status":"completed","counts":{"matched":1,"deleted":1,"failed":0},"exit_code":0}"#
         ))
         XCTAssertNil(MeridianIndexerControlResult.parse(

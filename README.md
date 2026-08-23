@@ -101,9 +101,10 @@ status. Missing optional tooling or credentials leaves the base MCP runtime
 usable and marks Meridian indexing unavailable.
 
 The native Meridian controls are deliberately small: configure explicit files
-or folders, preview that selection, scan now, pause/resume, retry, rebuild, or
-delete indexed source data. Scheduling is manual, every six hours (the default
-after configuration), or daily; Meridian is disabled until the user explicitly
+or folders, set the Core credential through a secure Keychain prompt, preview
+that selection, scan now, pause/resume, retry, rebuild, or delete indexed
+source data. Scheduling is manual, every six hours (the default after
+configuration), or daily; Meridian is disabled until the user explicitly
 configures it. Disabling cancels its schedule and leaves cloud data untouched.
 Delete All Meridian Data is a separate confirmed action that asks Meridian Core
 to remove indexed D1/Vectorize document data only; it does not delete Cloudflare

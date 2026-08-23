@@ -850,6 +850,28 @@ class PolicyBypassTests(unittest.TestCase):
         self.assertEqual(kwargs["allow_redirects"], False)
         self.assertLessEqual(kwargs["timeout"], 10)
 
+    def test_vector_search_accepts_url_and_filesystem_text_as_semantic_prose(self):
+        snapshot = make_snapshot(["meridian.search"])
+        secrets = automac_mcp.RuntimeSecrets(
+            worker_url="https://core.example.test",
+            meridian_ingest_token="synthetic-core-token",
+        )
+        response = type("Response", (), {})()
+        response.status_code = 200
+        response.url = "https://core.example.test/api/v1/search"
+        response.json = lambda: {"results": []}
+
+        queries = ["https://example.com", "/usr/bin", "C:/docs"]
+        with patch.object(automac_mcp.requests, "post", return_value=response) as post:
+            with automac_mcp.use_runtime(snapshot, secrets):
+                results = [automac_mcp.vector_search(query) for query in queries]
+
+        self.assertEqual([result["status"] for result in results], ["success"] * len(queries))
+        self.assertEqual(
+            [call.kwargs["json"]["query"] for call in post.call_args_list],
+            queries,
+        )
+
     def test_vector_search_rejects_redirects_malformed_results_and_raw_provider_bodies(self):
         snapshot = make_snapshot(["meridian.search"])
         token = "synthetic-core-token"

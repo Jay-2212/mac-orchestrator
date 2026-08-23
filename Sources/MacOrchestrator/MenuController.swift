@@ -50,6 +50,7 @@ final class MenuController: NSObject {
             menu.addItem(label(title))
         }
         menu.addItem(action("Configure Meridian Sources / Choose Folders…", #selector(configureMeridian)))
+        menu.addItem(action("Set Meridian Core Credential…", #selector(setMeridianCredential)))
         if snapshot.meridianIndexer.desired {
             menu.addItem(action("Preview Meridian Selection", #selector(previewMeridian)))
             menu.addItem(action("Scan Meridian Now", #selector(scanMeridianNow)))
@@ -200,7 +201,7 @@ final class MenuController: NSObject {
     @objc private func configureMeridian() {
         let urlAlert = NSAlert()
         urlAlert.messageText = "Configure Meridian"
-        urlAlert.informativeText = "Enter the HTTPS Meridian Core deployment URL, then choose the folders or files to index. Nothing is selected by default."
+        urlAlert.informativeText = "Enter the HTTPS Meridian Core deployment URL, then choose the folders or files to index. Nothing is selected by default. Use Set Meridian Core Credential… to store the required credential securely in Keychain."
         let field = NSTextField(string: "")
         field.placeholderString = "https://core.example.test"
         field.frame = NSRect(x: 0, y: 0, width: 360, height: 24)
@@ -225,6 +226,30 @@ final class MenuController: NSObject {
         }
         supervisor.configureMeridianRequested(deploymentURL: deploymentURL, scopes: scopes)
         show(message: "Meridian configured", details: "The selected sources are saved. Meridian will run its first scheduled scan according to the selected schedule.")
+    }
+
+    @objc private func setMeridianCredential() {
+        let alert = NSAlert()
+        alert.messageText = "Set Meridian Core Credential"
+        alert.informativeText = "The credential is stored in macOS Keychain and is not written to configuration, logs, or support bundles."
+        let field = NSSecureTextField(string: "")
+        field.placeholderString = "Core credential"
+        field.frame = NSRect(x: 0, y: 0, width: 360, height: 24)
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Save Credential")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        guard !field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            show(message: "Meridian", details: "Enter a non-empty credential.")
+            return
+        }
+        supervisor.setMeridianCredentialRequested(field.stringValue) { [weak self] saved in
+            if saved {
+                self?.show(message: "Meridian credential saved", details: "The credential is stored in Keychain. Run Scan Now or Doctor to continue the bounded readiness checks.")
+            } else {
+                self?.showFailure()
+            }
+        }
     }
 
     @objc private func previewMeridian() { supervisor.previewMeridianRequested() }

@@ -82,6 +82,10 @@ final class NativeRuntimeCoordinator {
         return try await makeLaunchContract(configuration: configuration)
     }
 
+    func setMeridianIngestToken(_ value: String) throws {
+        try keychain.setMeridianIngestToken(value)
+    }
+
     @discardableResult
     func markPhase2Completed() async throws -> AppConfiguration {
         let configuration = try store.load()

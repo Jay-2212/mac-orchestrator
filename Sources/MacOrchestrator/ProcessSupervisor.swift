@@ -285,6 +285,23 @@ final class ProcessSupervisor {
         }
     }
 
+    func setMeridianCredentialRequested(
+        _ value: String,
+        completion: @escaping (Bool) -> Void = { _ in }
+    ) {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                try self.runtimeCoordinator.setMeridianIngestToken(value)
+                self.apply(try await self.runtimeCoordinator.reload())
+                completion(true)
+            } catch {
+                self.appLog.write("ERROR: Meridian credential update failed safely")
+                completion(false)
+            }
+        }
+    }
+
     func disableMeridianRequested() {
         meridianIndexerCoordinator.stop()
         Task { @MainActor [weak self] in

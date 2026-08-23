@@ -67,13 +67,14 @@ timeout, redirect protection, response validation, and safe error classes.
 ## Product surface
 
 The existing native status-menu/AppKit surface gains a compact Meridian section:
-explicit Configure Sources / Choose Folders, preview, Scan Now, schedule
-selection, pause/resume, retry, rebuild, source deletion, and Delete All
-Meridian Data with clear confirmation. No default Desktop, Documents,
-Downloads, home-directory, or silent expansion is allowed. Delete All targets
-indexed document data through Meridian's exact control contract and never
-Cloudflare infrastructure. Disabling cancels local scheduling/runs and removes
-the semantic capability without deleting cloud data.
+explicit Configure Sources / Choose Folders, secure Core credential entry into
+Keychain, preview, Scan Now, schedule selection, pause/resume, retry, rebuild,
+source deletion, and Delete All Meridian Data with clear confirmation. No
+default Desktop, Documents, Downloads, home-directory, or silent expansion is
+allowed. Delete All targets indexed document data through Meridian's exact
+control contract and never Cloudflare infrastructure. Disabling cancels local
+scheduling/runs and removes the semantic capability without deleting cloud
+data.
 
 ## Doctor and support
 

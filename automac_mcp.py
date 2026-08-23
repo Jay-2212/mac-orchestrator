@@ -2356,16 +2356,6 @@ def vector_search(query: str) -> Dict[str, Any]:
         return _fail("query is required")
     if not isinstance(query, str) or len(query) > 2_000 or "\x00" in query:
         return _fail("query is invalid", error_code="INVALID_PARAM")
-    if (
-        query.startswith("/")
-        or query.startswith("~")
-        or "\\" in query
-        or re.match(r"^[A-Za-z]:/", query)
-        or re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", query)
-        or any(segment in {".", ".."} for segment in query.split("/"))
-    ):
-        return _fail("query is invalid", error_code="INVALID_PARAM")
-
     worker_url = _runtime().secrets.worker_url
     token = _runtime().secrets.meridian_ingest_token
     parsed_base = _valid_meridian_base_url(worker_url)

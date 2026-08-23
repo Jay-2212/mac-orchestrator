@@ -1085,7 +1085,13 @@ final class MeridianIndexerCoordinator {
     func resume() {
         snapshot.paused = false
         guard configuration != nil else { return }
-        if process == nil { scheduleFromSafePoint() }
+        if process == nil {
+            if pendingAction != nil {
+                scheduleNow()
+            } else {
+                scheduleFromSafePoint()
+            }
+        }
         publish(status: process == nil ? .scheduled : .running)
     }
 

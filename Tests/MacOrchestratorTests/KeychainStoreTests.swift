@@ -34,6 +34,30 @@ final class KeychainStoreTests: XCTestCase {
         XCTAssertEqual(item.account, "jay")
     }
 
+    func testSetMeridianIngestTokenStoresNormalizedValueOnTheCanonicalUserItem() throws {
+        let fake = FakeKeychainClient()
+        let store = KeychainStore(client: fake, meridianAccount: "synthetic-user")
+
+        try store.setMeridianIngestToken("  synthetic-core-token  \n")
+
+        let item = KeychainItem.meridianIngestToken(account: "synthetic-user")
+        XCTAssertEqual(try store.value(for: item), "synthetic-core-token")
+        XCTAssertEqual(fake.createCalls, [item.key])
+    }
+
+    func testSetMeridianIngestTokenRejectsBlankOrControlBearingValues() {
+        let fake = FakeKeychainClient()
+        let store = KeychainStore(client: fake, meridianAccount: "synthetic-user")
+
+        for value in ["   ", "synthetic\ncore-token"] {
+            XCTAssertThrowsError(try store.setMeridianIngestToken(value)) { error in
+                XCTAssertEqual(error as? KeychainStoreError, .invalidValue)
+            }
+        }
+        XCTAssertTrue(fake.createCalls.isEmpty)
+        XCTAssertTrue(fake.updateCalls.isEmpty)
+    }
+
     func testSeparateNamedItemsExistForTelegramAndFutureMeridianCredentials() {
         XCTAssertNotEqual(KeychainItem.telegramSendBotToken.key, KeychainItem.telegramSendChatID.key)
         XCTAssertNotEqual(

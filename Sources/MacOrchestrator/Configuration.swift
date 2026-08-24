@@ -87,21 +87,25 @@ struct IntegrationConfiguration: Codable, Equatable, Sendable {
     var meridianDeploymentURL: String?
     var meridianAlias: String?
     var aliases: [String: String]
+    var meridianIndexer: MeridianIndexerConfiguration
 
     init(
         meridianDeploymentURL: String? = nil,
         meridianAlias: String? = nil,
-        aliases: [String: String] = [:]
+        aliases: [String: String] = [:],
+        meridianIndexer: MeridianIndexerConfiguration = MeridianIndexerConfiguration()
     ) {
         self.meridianDeploymentURL = meridianDeploymentURL
         self.meridianAlias = meridianAlias
         self.aliases = aliases
+        self.meridianIndexer = meridianIndexer
     }
 
     private enum CodingKeys: String, CodingKey {
         case meridianDeploymentURL
         case meridianAlias
         case aliases
+        case meridianIndexer
     }
 
     init(from decoder: Decoder) throws {
@@ -109,7 +113,11 @@ struct IntegrationConfiguration: Codable, Equatable, Sendable {
         self.init(
             meridianDeploymentURL: try container.decodeIfPresent(String.self, forKey: .meridianDeploymentURL),
             meridianAlias: try container.decodeIfPresent(String.self, forKey: .meridianAlias),
-            aliases: try container.decodeIfPresent([String: String].self, forKey: .aliases) ?? [:]
+            aliases: try container.decodeIfPresent([String: String].self, forKey: .aliases) ?? [:],
+            meridianIndexer: try container.decodeIfPresent(
+                MeridianIndexerConfiguration.self,
+                forKey: .meridianIndexer
+            ) ?? MeridianIndexerConfiguration()
         )
     }
 }
@@ -164,6 +172,7 @@ enum ConfigurationValidationError: Error, Equatable, LocalizedError, Sendable {
     case invalidPort(Int)
     case blankOwnerID
     case invalidMeridianURL
+    case meridianIndexerRequiresDeploymentURL
     case invalidApprovedFileRoot(String)
 
     var errorDescription: String? {
@@ -178,6 +187,8 @@ enum ConfigurationValidationError: Error, Equatable, LocalizedError, Sendable {
             return "Configuration owner identity is missing."
         case .invalidMeridianURL:
             return "Meridian deployment URL must use http:// or https://."
+        case .meridianIndexerRequiresDeploymentURL:
+            return "Meridian indexer configuration requires a Meridian deployment URL."
         case let .invalidApprovedFileRoot(root):
             return "Approved file root must be a nonblank normalized absolute path: " + root
         }
@@ -369,6 +380,15 @@ struct AppConfiguration: Codable, Equatable, Sendable {
             // The URL is a nonsecret alias/settings value. No further network
             // or provider validation belongs in the configuration layer.
         } else if integration.meridianDeploymentURL != nil {
+            throw ConfigurationValidationError.invalidMeridianURL
+        }
+        _ = try integration.meridianIndexer.validated()
+        if integration.meridianIndexer.enabled && integration.meridianDeploymentURL == nil {
+            throw ConfigurationValidationError.meridianIndexerRequiresDeploymentURL
+        }
+        if integration.meridianIndexer.enabled,
+           let deploymentURL = integration.meridianDeploymentURL,
+           URL(string: deploymentURL)?.scheme?.lowercased() != "https" {
             throw ConfigurationValidationError.invalidMeridianURL
         }
         var normalized = self

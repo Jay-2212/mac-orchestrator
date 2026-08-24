@@ -123,6 +123,52 @@ final class RuntimeLaunchContractTests: XCTestCase {
         XCTAssertFalse(encodedSnapshot.contains("keychain-meridian-token"))
     }
 
+    func testReadyMeridianSecretIsScopedToMCPRuntimeAndNeverSnapshotOrTunnel() throws {
+        var configuration = AppConfiguration.fresh(ownerID: "owner-meridian-runtime")
+        configuration.desiredCapabilities["meridian.search"] = true
+        configuration.integration.meridianDeploymentURL = "https://core.example.test"
+        configuration.integration.meridianIndexer = MeridianIndexerConfiguration(
+            enabled: true,
+            scheduleMode: .manual,
+            scopes: [MeridianSourceScope(
+                scopeID: "scope-runtime",
+                rootPath: "/Users/example/Notes",
+                paths: ["notes.md"]
+            )]
+        )
+        let capabilitySnapshot = CapabilityRegistry(
+            configuration: configuration,
+            facts: CapabilityReadinessFacts(
+                coreSessionReady: true,
+                meridianCredentialsPresent: true,
+                meridianSearchReady: true
+            )
+        ).snapshot()
+        let connectorToken = String(repeating: "c", count: 64)
+        let meridianToken = "keychain-meridian-token"
+        let keychain = KeychainStore(
+            client: RuntimeKeychainClient(values: [
+                KeychainItem.connectorToken.key: connectorToken,
+                KeychainItem.meridianIngestToken(account: "runtime-test").key: meridianToken,
+            ]),
+            meridianAccount: "runtime-test"
+        )
+
+        let contract = try ManagedRuntimeLaunchContract.make(
+            configuration: configuration,
+            capabilitySnapshot: capabilitySnapshot,
+            keychain: keychain,
+            inheritedEnvironment: ["PATH": "/usr/bin"]
+        )
+
+        XCTAssertEqual(contract.meridianIndexerToken, meridianToken)
+        XCTAssertEqual(contract.environment["MAC_ORCHESTRATOR_MERIDIAN_INGEST_TOKEN"], meridianToken)
+        XCTAssertEqual(contract.environment["MAC_ORCHESTRATOR_WORKER_URL"], "https://core.example.test")
+        XCTAssertNil(contract.ngrokEnvironment()["MAC_ORCHESTRATOR_MERIDIAN_INGEST_TOKEN"])
+        let encodedSnapshot = try XCTUnwrap(contract.environment["MAC_ORCHESTRATOR_CAPABILITY_SNAPSHOT"])
+        XCTAssertFalse(encodedSnapshot.contains(meridianToken))
+    }
+
     func testReadyCapabilityWithoutItsRequiredKeychainSecretFailsClosed() throws {
         var configuration = AppConfiguration.fresh(ownerID: "owner-runtime")
         configuration.desiredCapabilities["telegram.send"] = true

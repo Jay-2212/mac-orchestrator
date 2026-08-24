@@ -15,15 +15,32 @@ struct SensitiveDataRedactor: Sendable {
         "privatekey",
         "ngrokauthtoken",
         "webhooksecret",
-        "capabilitytoken"
+        "capabilitytoken",
+        "providerbody",
+        "rawbody",
+        "responsebody",
+        "documentcontent",
+        "vector",
+        "vectors",
+        "probetext",
+        "probecontent"
     ]
 
     private let exactSecrets: [String]
+    private let privatePaths: [String]
     private let homeDirectory: String?
 
-    init(exactSecrets: [String], homeDirectory: String?) {
+    init(
+        exactSecrets: [String],
+        homeDirectory: String?,
+        privatePaths: [String] = []
+    ) {
         self.exactSecrets = exactSecrets
             .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            .sorted { $0.count > $1.count }
+        self.privatePaths = privatePaths
+            .map { ($0 as NSString).standardizingPath }
+            .filter { $0.hasPrefix("/") && $0 != "/" }
             .sorted { $0.count > $1.count }
         let normalizedHome = homeDirectory?.trimmingCharacters(in: .whitespacesAndNewlines)
         self.homeDirectory = normalizedHome.flatMap { $0.isEmpty ? nil : $0 }
@@ -32,6 +49,7 @@ struct SensitiveDataRedactor: Sendable {
     func redact(_ value: String) -> String {
         var redacted = replaceConnectorURLs(in: value)
         redacted = replaceExactSecrets(in: redacted)
+        redacted = replacePrivatePaths(in: redacted)
         redacted = replaceSecretAssignments(in: redacted)
         return normalizeHomePaths(in: redacted)
     }
@@ -60,12 +78,23 @@ struct SensitiveDataRedactor: Sendable {
         redacted = replaceUserHomePath(in: redacted)
         redacted = replaceConnectorURLs(in: redacted)
         redacted = replaceExactSecrets(in: redacted)
+        redacted = replacePrivatePaths(in: redacted)
         return replaceSecretAssignments(in: redacted)
     }
 
     private func replaceExactSecrets(in value: String) -> String {
         exactSecrets.reduce(value) { current, secret in
             current.replacingOccurrences(of: secret, with: "<redacted>")
+        }
+    }
+
+    private func replacePrivatePaths(in value: String) -> String {
+        privatePaths.reduce(value) { current, path in
+            let escaped = NSRegularExpression.escapedPattern(for: path)
+            let exactPattern = "(?<![A-Za-z0-9_])\(escaped)(?=$|[/\\\\\\s\"'<>),;:{}])"
+            let exact = replacingMatches(pattern: exactPattern, in: current, with: "<meridian-source>")
+            let descendantPattern = "(?<![A-Za-z0-9_])\(escaped)(?:/[A-Za-z0-9._~%+@()\\- ]+)*(?=$|[/\\\\\\s\"'<>),;:{}])"
+            return replacingMatches(pattern: descendantPattern, in: exact, with: "<meridian-source>")
         }
     }
 
@@ -84,7 +113,7 @@ struct SensitiveDataRedactor: Sendable {
 
     private func replaceSecretAssignments(in value: String) -> String {
         replacingMatches(
-            pattern: #"(?i)(\b(?:token|bot[_-]?token|auth[_-]?token|access[_-]?token|refresh[_-]?token|capability[_-]?token|connector[_-]?(?:url|token|secret)|api[_-]?(?:key|token|secret)|ngrok[_-]?authtoken|chat[_-]?id|password|secret|authorization|credential|private[_-]?key|webhook[_-]?secret|client[_-]?secret)\b\s*[:=]\s*["']?(?:Bearer\s+)?)([^\s"'&,}\]]+)"#,
+            pattern: #"(?i)(\b(?:token|bot[_-]?token|auth[_-]?token|access[_-]?token|refresh[_-]?token|capability[_-]?token|connector[_-]?(?:url|token|secret)|api[_-]?(?:key|token|secret)|ngrok[_-]?authtoken|chat[_-]?id|password|secret|authorization|credential|private[_-]?key|webhook[_-]?secret|client[_-]?secret|provider[_-]?body|raw[_-]?body|response[_-]?body|document[_-]?content|vectors?|probe[_-]?(?:text|content))\b\s*[:=]\s*["']?(?:Bearer\s+)?)([^\s"'&,}\]]+)"#,
             in: value,
             with: "$1<redacted>"
         )

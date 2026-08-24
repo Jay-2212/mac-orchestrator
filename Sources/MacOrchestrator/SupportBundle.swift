@@ -10,6 +10,7 @@ struct SupportBundleRedactionSummary: Codable, Equatable, Sendable {
             "exact-secret-replacement",
             "connector-url-and-route-redaction",
             "structured-secret-field-redaction",
+            "configured-private-path-redaction",
             "home-path-normalization"
         ],
         excludedSensitiveCategories: [String] = [
@@ -33,7 +34,13 @@ struct SupportBundleRedactionSummary: Codable, Equatable, Sendable {
             "telegram-bot-secret",
             "telegram-bot-token",
             "telegram-chat-id",
-            "telegram-secret"
+            "telegram-secret",
+            "meridian-source-roots",
+            "meridian-selected-source-paths",
+            "meridian-readiness-probe-content",
+            "document-content",
+            "vectors",
+            "provider-response-bodies"
         ]
     ) {
         self.appliedTransforms = appliedTransforms.sorted()
@@ -586,6 +593,8 @@ final class SupportBundleEngine: @unchecked Sendable {
             "responsebodies",
             "requestresponsebody",
             "requestresponsebodies",
+            "providerresponsebody",
+            "providerresponsebodies",
             "mcpbody",
             "mcpbodies",
             "mcprequestbody",
@@ -595,6 +604,14 @@ final class SupportBundleEngine: @unchecked Sendable {
             "mcprequestresponsebodies",
             "userdocument",
             "userdocuments",
+            "documentcontent",
+            "vector",
+            "vectors",
+            "meridiansourceroot",
+            "meridiansourceroots",
+            "meridianselectedsourcepath",
+            "meridianselectedsourcepaths",
+            "meridianreadinessprobecontent",
             "browserdata",
             "browserhistory",
             "shellbrowserdata",
@@ -631,6 +648,12 @@ final class SupportBundleEngine: @unchecked Sendable {
             "requestbody",
             "responsebody",
             "requestresponse",
+            "providerresponsebody",
+            "documentcontent",
+            "vector",
+            "meridiansource",
+            "meridianselectedsourcepath",
+            "meridianreadinessprobecontent",
             "mcpbody",
             "connectorurl",
             "connectortoken",

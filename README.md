@@ -63,6 +63,9 @@ The helper and runtime are owned by the installing macOS user:
 ├── runtime/{automac_mcp.py,pyproject.toml,uv.lock}
 ├── remote/ngrok/ngrok
 ├── remote/ngrok/ngrok.yml
+├── meridian/indexer                 # optional separately installed tool
+├── meridian/indexer.previous        # last-known-good optional tool
+├── meridian/index-state.json         # owned by Meridian's indexer
 └── install/{staging-*,runtime.previous/}
 ```
 
@@ -74,6 +77,47 @@ ID authority/team. It is never re-signed by this project.
 Installation stages and validates a new runtime before promotion. A failed or
 interrupted promotion keeps the previous runtime, configuration, and Keychain
 state available for recovery. The installer does not change the global `PATH`.
+
+## Optional Meridian indexer
+
+Meridian indexing is an explicit opt-in capability. The Mac helper does not
+copy Meridian's `src/indexer`, install Node or embedding packages, or place the
+indexer in the public Python core payload. A separately distributed,
+release-pinned Meridian indexer executable may be installed into the optional
+tool boundary with the helper's digest-checked installer. A failed candidate
+verification or promotion leaves the previous optional executable available.
+
+The configured invocation supplies explicit source scopes and the Core URL as
+local stdin JSON. Absolute roots are consumed only by the local indexer; Core
+requests, progress events, Mac logs, support artifacts, and remote IDs contain
+only opaque source IDs and canonical relative paths. `MERIDIAN_CORE_TOKEN` is
+read from Keychain and supplied only to the owned indexer child environment.
+
+The canonical indexer owns discovery, parsing, hashing, chunking, Core
+begin/ingest/commit reconciliation, local index state, and last-known-good
+replacement. Mac Orchestrator only schedules one-shot runs, supervises the
+owned process, supports cancellation/retry/rebuild, and records bounded
+status. Missing optional tooling or credentials leaves the base MCP runtime
+usable and marks Meridian indexing unavailable.
+
+The native Meridian controls are deliberately small: configure explicit files
+or folders, set the Core credential through a secure Keychain prompt, preview
+that selection, scan now, pause/resume, retry, rebuild, or delete indexed
+source data. Scheduling is manual, every six hours (the default after
+configuration), or daily; Meridian is disabled until the user explicitly
+configures it. Disabling cancels its schedule and leaves cloud data untouched.
+Delete All Meridian Data is a separate confirmed action that asks Meridian Core
+to remove indexed D1/Vectorize document data only; it does not delete Cloudflare
+infrastructure or local source files.
+
+`meridian.search` is not enabled by a URL, token, process exit, or health check
+alone. Readiness requires the pinned tool receipt and digest, the frozen Core
+contract, a successful authenticated Meridian-owned probe, and at least one
+successful user-selected index or rebuild with the same deployment and tool
+identity. The bounded receipt contains no token, source root, document text, or
+vector. Doctor reports Meridian as skipped while disabled, and support bundles
+exclude source roots, selected paths, provider bodies, synthetic probe content,
+and credentials.
 
 ## Runtime and connector model
 

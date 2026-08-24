@@ -42,6 +42,25 @@ struct ManagedRuntimeLaunchContract: Sendable, CustomStringConvertible, CustomDe
     let environment: [String: String]
     let redactedSecrets: [String]
     let ngrokAuthtoken: String?
+    let meridianIndexerToken: String?
+
+    init(
+        port: Int,
+        configuration: AppConfiguration,
+        capabilitySnapshot: CapabilitySnapshot,
+        environment: [String: String],
+        redactedSecrets: [String],
+        ngrokAuthtoken: String?,
+        meridianIndexerToken: String? = nil
+    ) {
+        self.port = port
+        self.configuration = configuration
+        self.capabilitySnapshot = capabilitySnapshot
+        self.environment = environment
+        self.redactedSecrets = redactedSecrets
+        self.ngrokAuthtoken = ngrokAuthtoken
+        self.meridianIndexerToken = meridianIndexerToken
+    }
 
     var description: String { "ManagedRuntimeLaunchContract" }
     var debugDescription: String { description }
@@ -83,6 +102,23 @@ struct ManagedRuntimeLaunchContract: Sendable, CustomStringConvertible, CustomDe
             redactedSecrets.append(ngrokAuthtoken)
         }
 
+        let meridianIndexerToken: String?
+        if configuration.integration.meridianIndexer.enabled,
+           configuration.desiredCapabilities["meridian.search"] == true {
+            let candidate: String? = try? keychain.meridianIngestToken()
+            if let candidate {
+                let trimmed = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+                meridianIndexerToken = trimmed.isEmpty ? nil : trimmed
+            } else {
+                meridianIndexerToken = nil
+            }
+            if let meridianIndexerToken, !meridianIndexerToken.isEmpty {
+                redactedSecrets.append(meridianIndexerToken)
+            }
+        } else {
+            meridianIndexerToken = nil
+        }
+
         if capabilitySnapshot.capabilities["telegram.send"]?.ready == true {
             guard let botToken = try keychain.value(for: .telegramSendBotToken), !botToken.isEmpty else {
                 throw ManagedRuntimeLaunchContractError.missingRequiredSecret(
@@ -100,7 +136,13 @@ struct ManagedRuntimeLaunchContract: Sendable, CustomStringConvertible, CustomDe
         }
 
         if capabilitySnapshot.capabilities["meridian.search"]?.ready == true {
-            guard let ingestToken = try keychain.meridianIngestToken(), !ingestToken.isEmpty else {
+            guard let rawIngestToken = try keychain.meridianIngestToken() else {
+                throw ManagedRuntimeLaunchContractError.missingRequiredSecret(
+                    "MAC_ORCHESTRATOR_MERIDIAN_INGEST_TOKEN"
+                )
+            }
+            let ingestToken = rawIngestToken.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !ingestToken.isEmpty else {
                 throw ManagedRuntimeLaunchContractError.missingRequiredSecret(
                     "MAC_ORCHESTRATOR_MERIDIAN_INGEST_TOKEN"
                 )
@@ -129,7 +171,8 @@ struct ManagedRuntimeLaunchContract: Sendable, CustomStringConvertible, CustomDe
             capabilitySnapshot: capabilitySnapshot,
             environment: environment,
             redactedSecrets: redactedSecrets,
-            ngrokAuthtoken: ngrokAuthtoken
+            ngrokAuthtoken: ngrokAuthtoken,
+            meridianIndexerToken: meridianIndexerToken
         )
     }
 

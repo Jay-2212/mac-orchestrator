@@ -20,7 +20,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let runtimeDirectory = supportDirectory.appendingPathComponent("runtime", isDirectory: true)
             let readinessCoordinator = CapabilityReadinessCoordinator(
                 session: .shared,
-                fileManager: fileManager
+                fileManager: fileManager,
+                meridianSupportDirectory: supportDirectory
             )
             let runtimeCoordinator = NativeRuntimeCoordinator(
                 store: ConfigurationStore(fileManager: fileManager),

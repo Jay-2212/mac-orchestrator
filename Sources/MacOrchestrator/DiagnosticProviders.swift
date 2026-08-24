@@ -257,6 +257,7 @@ enum KeychainPresenceItem: String, Codable, CaseIterable, Hashable, Sendable {
     case ngrokAuthtoken
     case telegramSendBotToken
     case telegramSendChatID
+    case meridianIngestToken
     case meridianTelegramBotToken
     case meridianTelegramWebhookSecret
 
@@ -270,6 +271,8 @@ enum KeychainPresenceItem: String, Codable, CaseIterable, Hashable, Sendable {
             return .telegramSendBotToken
         case .telegramSendChatID:
             return .telegramSendChatID
+        case .meridianIngestToken:
+            return .currentMeridianIngestToken
         case .meridianTelegramBotToken:
             return .meridianTelegramBotToken
         case .meridianTelegramWebhookSecret:

@@ -98,38 +98,74 @@ final class CapabilityReadinessCoordinator {
     private let fileManager: FileManager
     private let permissionChecker: CapabilityPermissionChecking
     private let managedPermissionChecker: ManagedPermissionChecking?
+    private let meridianProbe: MeridianReadinessProbing?
+    private let meridianReceiptStore: MeridianReadinessReceiptStoring?
+    private let meridianSupportDirectory: URL?
 
     init(
         session: URLSession = .shared,
-        fileManager: FileManager = .default
+        fileManager: FileManager = .default,
+        meridianSupportDirectory: URL? = nil,
+        meridianProbe: MeridianReadinessProbing? = nil,
+        meridianReceiptStore: MeridianReadinessReceiptStoring? = nil
     ) {
         self.session = session
         self.fileManager = fileManager
         self.permissionChecker = SystemCapabilityPermissionChecker()
         self.managedPermissionChecker = SystemManagedPermissionChecker(fileManager: fileManager)
-    }
-
-    init(
-        session: URLSession,
-        fileManager: FileManager,
-        permissionChecker: CapabilityPermissionChecking
-    ) {
-        self.session = session
-        self.fileManager = fileManager
-        self.permissionChecker = permissionChecker
-        self.managedPermissionChecker = nil
+        self.meridianSupportDirectory = meridianSupportDirectory
+        self.meridianProbe = meridianProbe ?? (meridianSupportDirectory == nil ? nil : SystemMeridianReadinessProbe())
+        self.meridianReceiptStore = meridianReceiptStore ?? meridianSupportDirectory.map {
+            FileMeridianReadinessReceiptStore(
+                url: $0.appendingPathComponent("meridian/readiness-receipt.json", isDirectory: false),
+                fileManager: fileManager
+            )
+        }
     }
 
     init(
         session: URLSession,
         fileManager: FileManager,
         permissionChecker: CapabilityPermissionChecking,
-        managedPermissionChecker: ManagedPermissionChecking
+        meridianSupportDirectory: URL? = nil,
+        meridianProbe: MeridianReadinessProbing? = nil,
+        meridianReceiptStore: MeridianReadinessReceiptStoring? = nil
+    ) {
+        self.session = session
+        self.fileManager = fileManager
+        self.permissionChecker = permissionChecker
+        self.managedPermissionChecker = nil
+        self.meridianSupportDirectory = meridianSupportDirectory
+        self.meridianProbe = meridianProbe ?? (meridianSupportDirectory == nil ? nil : SystemMeridianReadinessProbe())
+        self.meridianReceiptStore = meridianReceiptStore ?? meridianSupportDirectory.map {
+            FileMeridianReadinessReceiptStore(
+                url: $0.appendingPathComponent("meridian/readiness-receipt.json", isDirectory: false),
+                fileManager: fileManager
+            )
+        }
+    }
+
+    init(
+        session: URLSession,
+        fileManager: FileManager,
+        permissionChecker: CapabilityPermissionChecking,
+        managedPermissionChecker: ManagedPermissionChecking,
+        meridianSupportDirectory: URL? = nil,
+        meridianProbe: MeridianReadinessProbing? = nil,
+        meridianReceiptStore: MeridianReadinessReceiptStoring? = nil
     ) {
         self.session = session
         self.fileManager = fileManager
         self.permissionChecker = permissionChecker
         self.managedPermissionChecker = managedPermissionChecker
+        self.meridianSupportDirectory = meridianSupportDirectory
+        self.meridianProbe = meridianProbe ?? (meridianSupportDirectory == nil ? nil : SystemMeridianReadinessProbe())
+        self.meridianReceiptStore = meridianReceiptStore ?? meridianSupportDirectory.map {
+            FileMeridianReadinessReceiptStore(
+                url: $0.appendingPathComponent("meridian/readiness-receipt.json", isDirectory: false),
+                fileManager: fileManager
+            )
+        }
     }
 
     func evaluate(
@@ -171,12 +207,30 @@ final class CapabilityReadinessCoordinator {
             )
         }
 
-        let meridianCredentialsPresent = nonblankSecret(try? keychain.meridianIngestToken()) != nil
-        let meridianTelegramConfigured = nonblankSecret(
-            try? keychain.value(for: .meridianTelegramBotToken)
-        ) != nil && nonblankSecret(
-            try? keychain.value(for: .meridianTelegramWebhookSecret)
-        ) != nil
+        let meridianEnabled = configuration.integration.meridianIndexer.enabled
+        let meridianDesired = configuration.desiredCapabilities["meridian.search"] == true
+        let meridianToken: String?
+        if meridianEnabled && meridianDesired {
+            meridianToken = nonblankSecret(try? keychain.meridianIngestToken())
+        } else {
+            meridianToken = nil
+        }
+        let meridianCredentialsPresent = meridianToken != nil
+        let meridianSearchReady = await evaluateMeridianReadiness(
+            configuration: configuration,
+            token: meridianToken
+        )
+        let meridianTelegramConfigured: Bool
+        if meridianEnabled && meridianDesired,
+           configuration.desiredCapabilities["meridian.telegram"] == true {
+            meridianTelegramConfigured = nonblankSecret(
+                try? keychain.value(for: .meridianTelegramBotToken)
+            ) != nil && nonblankSecret(
+                try? keychain.value(for: .meridianTelegramWebhookSecret)
+            ) != nil
+        } else {
+            meridianTelegramConfigured = false
+        }
 
         // This is the startup/base capability snapshot. Live network and
         // authenticated remote lifecycle state are projected separately by
@@ -193,12 +247,76 @@ final class CapabilityReadinessCoordinator {
             telegramCredentialsPresent: telegramCredentialsPresent,
             telegramReady: telegramReady,
             meridianCredentialsPresent: meridianCredentialsPresent,
-            meridianSearchReady: false,
+            meridianSearchReady: meridianSearchReady,
             meridianTelegramConfigured: meridianTelegramConfigured,
             meridianTelegramReady: false,
             remoteConnectorConfigured: configuration.process.tunnelDesired,
             remoteConnectorReady: false
         )
+    }
+
+    private func evaluateMeridianReadiness(
+        configuration: AppConfiguration,
+        token: String?
+    ) async -> Bool {
+        let indexerConfiguration = configuration.integration.meridianIndexer
+        guard configuration.desiredCapabilities["meridian.search"] == true,
+              indexerConfiguration.enabled,
+              (try? indexerConfiguration.validated()) != nil,
+              let token,
+              let deployment = configuration.integration.meridianDeploymentURL,
+              let baseURL = URL(string: deployment),
+              let meridianSupportDirectory,
+              let meridianReceiptStore else {
+            return false
+        }
+        let meridianDirectory = meridianSupportDirectory.appendingPathComponent("meridian", isDirectory: true)
+        let installer = MeridianIndexerToolInstaller(rootURL: meridianDirectory, fileManager: fileManager)
+        let currentDigest = installer.currentDigest()
+        let tool = installer.receipt()
+        var receipt = meridianReceiptStore.load() ?? MeridianReadinessReceipt()
+        let deploymentFingerprint = MeridianReadinessEvaluator.fingerprint(for: deployment)
+        let indexEvidenceMatches = receipt.deploymentFingerprint == deploymentFingerprint
+            && receipt.toolDigest?.lowercased() == currentDigest?.lowercased()
+        if !indexEvidenceMatches {
+            receipt.lastSuccessfulIndexAt = nil
+            receipt.lastSuccessfulIndexAction = nil
+            receipt.lastResult = nil
+        }
+        let probeMatches = receipt.lastProbe?.passed == true
+            && receipt.lastProbe?.deploymentFingerprint == deploymentFingerprint
+            && receipt.lastProbe?.toolDigest?.lowercased() == currentDigest?.lowercased()
+        if !probeMatches,
+           let meridianProbe,
+           let currentDigest {
+            let probe = await meridianProbe.probe(
+                baseURL: baseURL,
+                stateURL: meridianDirectory.appendingPathComponent("index-state.json"),
+                toolURL: installer.installedURL,
+                token: token,
+                currentToolDigest: currentDigest
+            )
+            receipt.deploymentFingerprint = deploymentFingerprint
+            receipt.toolDigest = currentDigest
+            receipt.lastProbe = probe
+            try? meridianReceiptStore.save(receipt)
+        }
+        return MeridianReadinessEvaluator.evaluate(
+            MeridianReadinessEvaluationInput(
+                desired: true,
+                enabled: true,
+                deploymentURL: deployment,
+                tokenPresent: true,
+                tool: tool,
+                currentToolDigest: currentDigest,
+                lastSuccessfulIndexAt: receipt.lastSuccessfulIndexAt,
+                lastSuccessfulIndexAction: receipt.lastSuccessfulIndexAction,
+                lastSuccessfulIndexDeploymentFingerprint: receipt.deploymentFingerprint,
+                lastSuccessfulIndexToolDigest: receipt.toolDigest,
+                lastProbe: receipt.lastProbe,
+                now: Date()
+            )
+        ).ready
     }
 
     private func localRuntimeIsReady(at runtimeDirectory: URL) -> Bool {

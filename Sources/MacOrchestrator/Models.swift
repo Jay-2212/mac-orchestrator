@@ -12,6 +12,7 @@ enum ServiceState: String {
 struct ServiceSnapshot {
     var server: ServiceState = .stopped
     var tunnel: ServiceState = .stopped
+    var meridianIndexer = MeridianIndexerSnapshot()
     var productReadiness: ProductReadinessState = .needsAttention
     var error: String?
     var controlProfile: ControlProfile?
@@ -80,6 +81,10 @@ struct ServiceSnapshot {
         totalCapabilityCount = contract.capabilitySnapshot.capabilities.count
         pendingPermissions = Self.pendingPermissions(in: contract.capabilitySnapshot)
         clientRefreshRequired = clientRefreshRequired || requiresClientRefresh
+    }
+
+    mutating func applyMeridianIndexerSnapshot(_ meridianIndexer: MeridianIndexerSnapshot) {
+        self.meridianIndexer = meridianIndexer
     }
 
     private static func pendingPermissions(in snapshot: CapabilitySnapshot) -> [String] {

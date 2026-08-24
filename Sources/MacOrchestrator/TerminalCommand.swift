@@ -321,6 +321,24 @@ enum TerminalCommand {
                 try KeychainStore().set(token, for: .ngrokAuthtoken)
                 print("ngrok authtoken stored in Keychain.")
                 return 0
+            case "--install-meridian-indexer":
+                guard arguments.count == 5,
+                      arguments[1] == "--candidate",
+                      arguments[3] == "--sha256",
+                      !arguments[2].isEmpty,
+                      !arguments[4].isEmpty else {
+                    throw TerminalCommandError.invalidArguments(
+                        "Usage: --install-meridian-indexer --candidate PATH --sha256 DIGEST"
+                    )
+                }
+                let support = ConfigurationStore.defaultDirectoryURL()
+                    .appendingPathComponent("meridian", isDirectory: true)
+                _ = try MeridianIndexerToolInstaller(rootURL: support).install(
+                    candidateURL: URL(fileURLWithPath: arguments[2]),
+                    expectedSHA256: arguments[4]
+                )
+                print("Optional Meridian indexer installed in the user-owned support boundary.")
+                return 0
             case "--clear-ngrok-token-if-matches":
                 guard arguments.count == 1 else {
                     throw TerminalCommandError.invalidArguments(
@@ -434,6 +452,7 @@ enum TerminalCommand {
             """
             Mac Orchestrator terminal commands:
               --store-ngrok-token       Read an authtoken from hidden stdin input and store it in Keychain.
+              --install-meridian-indexer Install a separately distributed optional tool after digest verification.
               --clear-ngrok-token-if-matches Remove only a matching token read from hidden stdin input.
               --set-profile guided      Select the default Guided Control profile.
               --set-profile full        Select Full Control with --confirm-full-control.
@@ -847,6 +866,7 @@ enum TerminalCommand {
         let support = (overrideSupportDirectory ?? ConfigurationStore.defaultDirectoryURL(fileManager: fileManager))
             .standardizedFileURL
         let home = (overrideHomeDirectory ?? fileManager.homeDirectoryForCurrentUser).standardizedFileURL
+        let meridianPrivatePaths = meridianPrivatePaths(at: support)
         let receiptURL = support.appendingPathComponent("install/receipt.json")
         let receiptData = (try? Data(contentsOf: receiptURL)) ?? Data("{\"available\":false}".utf8)
         let entries = [
@@ -879,9 +899,26 @@ enum TerminalCommand {
             sources: [Phase3SupportBundleSource(entries: entries)],
             redactor: SensitiveDataRedactor(
                 exactSecrets: supportBundleSecretValues(keychain: keychain),
-                homeDirectory: home.path
+                homeDirectory: home.path,
+                privatePaths: meridianPrivatePaths
             )
         )
+    }
+
+    private static func meridianPrivatePaths(at supportDirectory: URL) -> [String] {
+        let configurationURL = supportDirectory.appendingPathComponent("config.json", isDirectory: false)
+        guard let data = try? Data(contentsOf: configurationURL),
+              let configuration = try? JSONDecoder().decode(AppConfiguration.self, from: data) else {
+            return []
+        }
+        return configuration.integration.meridianIndexer.scopes.flatMap { scope in
+            let root = (scope.rootPath as NSString).standardizingPath
+            return [root] + scope.paths.map {
+                URL(fileURLWithPath: root, isDirectory: true)
+                    .appendingPathComponent($0, isDirectory: false)
+                    .standardizedFileURL.path
+            }
+        }
     }
 
     private static func readBoundedLogs(at directory: URL) throws -> Data {

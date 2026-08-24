@@ -43,6 +43,41 @@ final class MenuController: NSObject {
         let copyConnectorURL = action("Copy Connector URL", #selector(copyConnectorURL))
         copyConnectorURL.isEnabled = snapshot.tunnel == .running
         menu.addItem(copyConnectorURL)
+
+        menu.addItem(.separator())
+        menu.addItem(label(Self.meridianStatusTitle(for: snapshot.meridianIndexer)))
+        for title in Self.meridianDetailTitles(for: snapshot.meridianIndexer) {
+            menu.addItem(label(title))
+        }
+        menu.addItem(action("Configure Meridian Sources / Choose Folders…", #selector(configureMeridian)))
+        menu.addItem(action("Set Meridian Core Credential…", #selector(setMeridianCredential)))
+        if snapshot.meridianIndexer.desired {
+            menu.addItem(action("Preview Meridian Selection", #selector(previewMeridian)))
+            menu.addItem(action("Scan Meridian Now", #selector(scanMeridianNow)))
+            let schedule = NSMenuItem(title: "Meridian Schedule", action: nil, keyEquivalent: "")
+            let scheduleMenu = NSMenu()
+            for mode in [MeridianScheduleMode.manual, .everySixHours, .daily] {
+                let item = action(Self.scheduleTitle(for: mode), #selector(setMeridianSchedule(_:)))
+                item.representedObject = mode.rawValue
+                item.state = snapshot.meridianIndexer.scheduleMode == mode ? .on : .off
+                scheduleMenu.addItem(item)
+            }
+            schedule.submenu = scheduleMenu
+            menu.addItem(schedule)
+            if snapshot.meridianIndexer.paused {
+                menu.addItem(action("Resume Meridian Indexing", #selector(resumeMeridian)))
+            } else {
+                menu.addItem(action("Pause Meridian Indexing", #selector(pauseMeridian)))
+            }
+            menu.addItem(action("Retry Meridian Indexing", #selector(retryMeridian)))
+            menu.addItem(action("Rebuild Meridian Index", #selector(rebuildMeridian)))
+            if !supervisor.meridianScopeIDs.isEmpty {
+                menu.addItem(action("Delete Meridian Source…", #selector(deleteMeridianSource)))
+            }
+            menu.addItem(action("Delete All Meridian Data…", #selector(deleteAllMeridianData)))
+            menu.addItem(action("Disable Meridian", #selector(disableMeridian)))
+        }
+
         menu.addItem(action("Run Doctor", #selector(runDoctor)))
         menu.addItem(action("Repair Primary Failure", #selector(repairPrimaryFailure)))
         menu.addItem(action("Restart Services", #selector(restart)))
@@ -107,7 +142,43 @@ final class MenuController: NSObject {
         if snapshot.clientRefreshRequired {
             titles.append("MCP client refresh/reconnection required")
         }
+        titles.append(meridianStatusTitle(for: snapshot.meridianIndexer))
         return titles
+    }
+
+    static func meridianStatusTitle(for snapshot: MeridianIndexerSnapshot) -> String {
+        guard snapshot.desired else { return "Meridian indexing: Disabled" }
+        let suffix = snapshot.nextRunAt == nil ? "" : " (next run scheduled)"
+        return "Meridian indexing: \(snapshot.status.rawValue)\(suffix)"
+    }
+
+    static func meridianDetailTitles(for snapshot: MeridianIndexerSnapshot) -> [String] {
+        guard snapshot.desired else { return [] }
+        var titles = [
+            "Meridian counts: \(snapshot.counts.committed) committed, \(snapshot.counts.failed) failed, \(snapshot.counts.deleted) deleted"
+        ]
+        if let preview = snapshot.preview {
+            let certainty = preview.uncertain || preview.truncated ? " (bounded/uncertain)" : ""
+            titles.append("Meridian preview: \(preview.discovered) found, \(preview.supported) supported, \(preview.skipped) skipped\(certainty)")
+        }
+        let formatter = DateFormatter()
+        formatter.dateStyle = .short
+        formatter.timeStyle = .short
+        if let lastRunAt = snapshot.lastRunAt {
+            titles.append("Meridian last run: \(formatter.string(from: lastRunAt))")
+        }
+        if let nextRunAt = snapshot.nextRunAt {
+            titles.append("Meridian next run: \(formatter.string(from: nextRunAt))")
+        }
+        return titles
+    }
+
+    private static func scheduleTitle(for mode: MeridianScheduleMode) -> String {
+        switch mode {
+        case .manual: return "Manual only"
+        case .everySixHours: return "Every 6 hours"
+        case .daily: return "Daily"
+        }
     }
 
     private func label(_ title: String) -> NSMenuItem {
@@ -126,6 +197,127 @@ final class MenuController: NSObject {
     @objc private func stopServer() { supervisor.stopServerRequested() }
     @objc private func enableConnector() { supervisor.enableConnectorRequested() }
     @objc private func disableConnector() { supervisor.disableConnectorRequested() }
+
+    @objc private func configureMeridian() {
+        let urlAlert = NSAlert()
+        urlAlert.messageText = "Configure Meridian"
+        urlAlert.informativeText = "Enter the HTTPS Meridian Core deployment URL, then choose the folders or files to index. Nothing is selected by default. Use Set Meridian Core Credential… to store the required credential securely in Keychain."
+        let field = NSTextField(string: "")
+        field.placeholderString = "https://core.example.test"
+        field.frame = NSRect(x: 0, y: 0, width: 360, height: 24)
+        urlAlert.accessoryView = field
+        urlAlert.addButton(withTitle: "Choose Sources…")
+        urlAlert.addButton(withTitle: "Cancel")
+        guard urlAlert.runModal() == .alertFirstButtonReturn else { return }
+        let deploymentURL = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard MeridianReadinessEvaluator.fingerprint(for: deploymentURL) != nil else {
+            show(message: "Meridian", details: "Use a valid HTTPS deployment URL without embedded credentials or query parameters.")
+            return
+        }
+
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = true
+        panel.prompt = "Use Selected Sources"
+        guard panel.runModal() == .OK, !panel.urls.isEmpty,
+              let scopes = Self.scopes(from: panel.urls), !scopes.isEmpty else {
+            return
+        }
+        supervisor.configureMeridianRequested(deploymentURL: deploymentURL, scopes: scopes)
+        show(message: "Meridian configured", details: "The selected sources are saved. Meridian will run its first scheduled scan according to the selected schedule.")
+    }
+
+    @objc private func setMeridianCredential() {
+        let alert = NSAlert()
+        alert.messageText = "Set Meridian Core Credential"
+        alert.informativeText = "The credential is stored in macOS Keychain and is not written to configuration, logs, or support bundles."
+        let field = NSSecureTextField(string: "")
+        field.placeholderString = "Core credential"
+        field.frame = NSRect(x: 0, y: 0, width: 360, height: 24)
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Save Credential")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        guard !field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            show(message: "Meridian", details: "Enter a non-empty credential.")
+            return
+        }
+        supervisor.setMeridianCredentialRequested(field.stringValue) { [weak self] saved in
+            if saved {
+                self?.show(message: "Meridian credential saved", details: "The credential is stored in Keychain. Run Scan Now or Doctor to continue the bounded readiness checks.")
+            } else {
+                self?.showFailure()
+            }
+        }
+    }
+
+    @objc private func previewMeridian() { supervisor.previewMeridianRequested() }
+    @objc private func scanMeridianNow() { supervisor.scanMeridianNowRequested() }
+    @objc private func pauseMeridian() { supervisor.pauseMeridianRequested() }
+    @objc private func resumeMeridian() { supervisor.resumeMeridianRequested() }
+    @objc private func retryMeridian() { supervisor.retryMeridianIndexerRequested() }
+    @objc private func rebuildMeridian() { supervisor.retryMeridianIndexerRequested(rebuild: true) }
+    @objc private func disableMeridian() {
+        let alert = NSAlert()
+        alert.messageText = "Disable Meridian indexing?"
+        alert.informativeText = "Scheduled and active local Meridian runs will stop. Indexed cloud data will remain available and will not be deleted."
+        alert.addButton(withTitle: "Disable")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        supervisor.disableMeridianRequested()
+    }
+
+    @objc private func setMeridianSchedule(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String,
+              let mode = MeridianScheduleMode(rawValue: raw) else { return }
+        supervisor.setMeridianScheduleRequested(mode)
+    }
+
+    @objc private func deleteMeridianSource() {
+        let identifiers = supervisor.meridianScopeIDs
+        guard !identifiers.isEmpty else { return }
+        let popup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 300, height: 26), pullsDown: false)
+        popup.addItems(withTitles: identifiers)
+        let alert = NSAlert()
+        alert.messageText = "Delete indexed Meridian source?"
+        alert.informativeText = "Only the selected source scope's indexed document data will be deleted. Local source files and Cloudflare infrastructure are not deleted."
+        alert.accessoryView = popup
+        alert.addButton(withTitle: "Delete Source")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn,
+              let scopeID = popup.selectedItem?.title else { return }
+        supervisor.deleteMeridianSourceRequested(scopeID: scopeID)
+    }
+
+    @objc private func deleteAllMeridianData() {
+        let alert = NSAlert()
+        alert.messageText = "Delete all Meridian indexed data?"
+        alert.informativeText = "This permanently deletes indexed D1/Vectorize document data through Meridian Core. It does not delete Cloudflare infrastructure or local source files."
+        alert.addButton(withTitle: "Delete All Data")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        supervisor.deleteAllMeridianDataRequested()
+    }
+
+    private static func scopes(from urls: [URL]) -> [MeridianSourceScope]? {
+        var grouped: [String: Set<String>] = [:]
+        for url in urls.map(\.standardizedFileURL) {
+            let parent = url.deletingLastPathComponent().path
+            let name = url.lastPathComponent
+            guard parent.hasPrefix("/"), parent != "/", !name.isEmpty else { return nil }
+            grouped[parent, default: []].insert(name)
+        }
+        return grouped.keys.sorted().enumerated().compactMap { index, root in
+            let paths = grouped[root, default: []].sorted()
+            let scope = MeridianSourceScope(
+                scopeID: "scope-\(index + 1)-\(UUID().uuidString.lowercased())",
+                rootPath: root,
+                paths: paths
+            )
+            return try? scope.validated()
+        }
+    }
     @objc private func copyConnectorURL() {
         supervisor.copyConnectorURLRequested { [weak self] result in
             switch result {

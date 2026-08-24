@@ -955,6 +955,26 @@ final class DoctorEngineTests: XCTestCase {
         XCTAssertTrue(fixture.keychain.requests.isEmpty)
     }
 
+    func testEnabledMeridianDoctorUsesBoundedChecksAndPresenceOnlyCredentialQuery() async {
+        let fixture = DoctorFixture.make(
+            serverDesired: false,
+            remoteDesired: false,
+            meridianDesired: true
+        )
+
+        let report = await DoctorEngine(dependencies: fixture.dependencies).run()
+
+        XCTAssertEqual(fixture.meridian.calls, 1)
+        XCTAssertEqual(fixture.keychain.requests, [Set([.meridianIngestToken])])
+        XCTAssertEqual(report.result(withID: "meridian.configuration")?.status, .pass)
+        XCTAssertEqual(report.result(withID: "meridian.sources")?.status, .pass)
+        XCTAssertEqual(report.result(withID: "meridian.tool")?.status, .pass)
+        XCTAssertEqual(report.result(withID: "meridian.semantic-readiness")?.status, .pass)
+        XCTAssertEqual(report.result(withID: "meridian.scheduler")?.status, .pass)
+        XCTAssertEqual(report.result(withID: "capability.meridian")?.status, .pass)
+        XCTAssertTrue(report.results.allSatisfy { !$0.reason.contains("/private/") })
+    }
+
     func testSystemDoctorKeychainProviderSelectsRequestedCurrentCorePresenceOnly() throws {
         let querying = RecordingKeychainPresenceQuery()
         let dependencies = DoctorDependencies(
@@ -1088,6 +1108,7 @@ private struct DoctorFixture {
     let lifecycle: RecordingLifecycleProvider
     let keychain: RecordingDoctorKeychainProvider
     let permission: RecordingPermissionProvider
+    let meridian: RecordingMeridianProvider
 
     var mutationSnapshot: MutationSnapshot {
         MutationSnapshot(
@@ -1104,6 +1125,7 @@ private struct DoctorFixture {
         validatedContext: Bool = true,
         serverDesired: Bool = true,
         remoteDesired: Bool = false,
+        meridianDesired: Bool = false,
         asyncLocalMCPProvider: (any DoctorAsyncLocalMCPDiagnosticProviding)? = nil,
         remoteAuthenticatedProvider: (any RemoteAuthenticatedMCPDiagnosticProviding)? = nil,
         configurationContextProvider: (any DoctorConfigurationContextProviding)? = nil
@@ -1115,6 +1137,19 @@ private struct DoctorFixture {
         configuration.process.serverDesired = serverDesired
         configuration.process.tunnelDesired = remoteDesired
         configuration.desiredCapabilities["remote.connector"] = remoteDesired
+        configuration.desiredCapabilities["meridian.search"] = meridianDesired
+        if meridianDesired {
+            configuration.integration.meridianDeploymentURL = "https://core.example.test"
+            configuration.integration.meridianIndexer = MeridianIndexerConfiguration(
+                enabled: true,
+                scheduleMode: .manual,
+                scopes: [MeridianSourceScope(
+                    scopeID: "scope-fixture",
+                    rootPath: "/private/selected",
+                    paths: ["notes"]
+                )]
+            )
+        }
 
         let facts = ConfigurationDiagnosticFacts(
             directoryExists: true,
@@ -1167,6 +1202,25 @@ private struct DoctorFixture {
             activeConsole: true,
             requesterIsManagedRuntime: true
         ))
+        let meridian = RecordingMeridianProvider(facts: MeridianDiagnosticFacts(
+            enabled: meridianDesired,
+            configurationValid: meridianDesired,
+            sourcesSelected: meridianDesired,
+            deploymentValid: meridianDesired,
+            toolInstalled: meridianDesired,
+            toolTrusted: meridianDesired,
+            toolMatches: meridianDesired,
+            coreVersionVerified: meridianDesired,
+            diagnosticsVerified: meridianDesired,
+            migrationsCompatible: meridianDesired,
+            lastSuccessfulIndexVerified: meridianDesired,
+            semanticReadinessVerified: meridianDesired,
+            schedulerConfigured: meridianDesired,
+            paused: false,
+            running: false,
+            noOverlap: true,
+            reconciliationRequired: false
+        ))
 
         let dependencies = DoctorDependencies(
             configurationContextProvider: context,
@@ -1179,6 +1233,7 @@ private struct DoctorFixture {
             lifecycleProvider: lifecycle,
             remoteConnectorProvider: remote,
             remoteAuthenticatedMCPProvider: remoteAuthenticatedProvider,
+            meridianProvider: meridian,
             diskSpaceProvider: FixtureDiskProvider(facts: DiskSpaceFacts(filesystemAccessible: true, availableBytes: 10_000)),
             updateProvider: FixtureUpdateProvider(facts: UpdateAvailabilityFacts()),
             thresholds: DoctorThresholds(lowDiskBytes: 1_000),
@@ -1190,7 +1245,8 @@ private struct DoctorFixture {
             remote: remote,
             lifecycle: lifecycle,
             keychain: keychain,
-            permission: permission
+            permission: permission,
+            meridian: meridian
         )
     }
 
@@ -1360,6 +1416,18 @@ private final class RecordingDoctorKeychainProvider: DoctorKeychainPresenceProvi
     func inspect(items: Set<KeychainPresenceItem>) throws -> KeychainPresenceFacts {
         requests.append(items)
         return KeychainPresenceFacts(states: Dictionary(uniqueKeysWithValues: items.map { ($0, .present) }))
+    }
+}
+
+private final class RecordingMeridianProvider: MeridianDiagnosticProviding, @unchecked Sendable {
+    let facts: MeridianDiagnosticFacts
+    var calls = 0
+
+    init(facts: MeridianDiagnosticFacts) { self.facts = facts }
+
+    func inspect(configuration: AppConfiguration?) throws -> MeridianDiagnosticFacts {
+        calls += 1
+        return facts
     }
 }
 

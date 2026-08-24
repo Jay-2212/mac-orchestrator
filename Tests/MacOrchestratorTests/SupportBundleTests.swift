@@ -29,9 +29,14 @@ final class SupportBundleTests: XCTestCase {
             "connector-token",
             "connector-url",
             "credentials",
+            "document-content",
             "keychain-values",
             "mcp-request-response-bodies",
+            "meridian-readiness-probe-content",
+            "meridian-selected-source-paths",
+            "meridian-source-roots",
             "ngrok-credentials",
+            "provider-response-bodies",
             "request-response-bodies",
             "secret-material",
             "shell-browser-data",
@@ -40,7 +45,8 @@ final class SupportBundleTests: XCTestCase {
             "telegram-bot-token",
             "telegram-chat-id",
             "telegram-secret",
-            "user-documents"
+            "user-documents",
+            "vectors"
         ])
     }
 
@@ -185,6 +191,70 @@ final class SupportBundleTests: XCTestCase {
             .map { String(decoding: $0.data, as: UTF8.self) }
             .joined(separator: "\n")
         XCTAssertFalse(archiveText.contains(secret))
+        XCTAssertTrue(archiveText.contains("<redacted>"))
+    }
+
+    func testProductionSupportBundleExcludesMeridianRootsAndSensitiveProbeMaterial() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let home = root.appendingPathComponent("home", isDirectory: true)
+        let logs = home.appendingPathComponent("Library/Logs/Mac Orchestrator", isDirectory: true)
+        try FileManager.default.createDirectory(at: logs, withIntermediateDirectories: true)
+
+        var configuration = AppConfiguration.fresh(ownerID: "support-owner")
+        configuration.desiredCapabilities["meridian.search"] = true
+        configuration.integration.meridianDeploymentURL = "https://core.example.test"
+        configuration.integration.meridianIndexer = MeridianIndexerConfiguration(
+            enabled: true,
+            scheduleMode: .everySixHours,
+            scopes: [MeridianSourceScope(
+                scopeID: "scope-private",
+                rootPath: "/private/ugly-jay/Family Secrets",
+                paths: ["notes/private.md"]
+            )]
+        )
+        let configurationData = try JSONEncoder().encode(configuration)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try configurationData.write(to: root.appendingPathComponent("config.json"))
+
+        let token = "meridian-support-token-123"
+        let providerBody = "provider-body-must-not-escape"
+        let syntheticText = "synthetic-readiness-text-must-not-escape"
+        let vectorPayload = "vector-payload-must-not-escape"
+        try Data(("source=/private/ugly-jay/Family Secrets/notes/private.md "
+            + "provider_body=\(providerBody) "
+            + "probe_content=\(syntheticText) "
+            + "vectors=\(vectorPayload) token=\(token)\n").utf8)
+            .write(to: logs.appendingPathComponent("app.log"))
+
+        let keychain = KeychainStore(client: SupportBundleKeychainClient(values: [
+            KeychainItem.currentMeridianIngestToken.key: token
+        ]))
+        let report = DoctorReport(generatedAt: Date(timeIntervalSince1970: 1), results: [])
+        let engine = TerminalCommand.makeSupportBundleEngine(
+            report: report,
+            keychain: keychain,
+            supportDirectory: root,
+            homeDirectory: home
+        )
+        let archive = root.appendingPathComponent("support.zip")
+
+        _ = try engine.create(plan: engine.preview(), to: archive)
+
+        let archiveText = try extractEntries(from: archive)
+            .map { String(decoding: $0.data, as: UTF8.self) }
+            .joined(separator: "\n")
+        for value in [
+            "/private/ugly-jay/Family Secrets",
+            "notes/private.md",
+            token,
+            providerBody,
+            syntheticText,
+            vectorPayload,
+        ] {
+            XCTAssertFalse(archiveText.contains(value), value)
+        }
+        XCTAssertTrue(archiveText.contains("<meridian-source>"))
         XCTAssertTrue(archiveText.contains("<redacted>"))
     }
 

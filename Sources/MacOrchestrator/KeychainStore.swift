@@ -347,6 +347,15 @@ struct KeychainStore {
         return nil
     }
 
+    func setMeridianIngestToken(_ value: String) throws {
+        let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty,
+              normalized.rangeOfCharacter(from: .controlCharacters) == nil else {
+            throw KeychainStoreError.invalidValue
+        }
+        try set(normalized, for: meridianIngestItem)
+    }
+
     var meridianIngestItem: KeychainItem {
         .meridianIngestToken(account: meridianAccount)
     }

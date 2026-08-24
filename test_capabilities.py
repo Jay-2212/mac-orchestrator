@@ -805,6 +805,100 @@ class PolicyBypassTests(unittest.TestCase):
         self.assertEqual(result["error_code"], "POLICY_DENIED")
         get.assert_not_called()
 
+    def test_vector_search_uses_frozen_core_route_post_shape_and_safe_fields(self):
+        snapshot = make_snapshot(["meridian.search"])
+        secrets = automac_mcp.RuntimeSecrets(
+            worker_url="https://core.example.test",
+            meridian_ingest_token="synthetic-core-token",
+        )
+        response = type("Response", (), {})()
+        response.status_code = 200
+        response.url = "https://core.example.test/api/v1/search"
+        response.json = lambda: {
+            "results": [{
+                "id": "a" * 64,
+                "score": 0.91,
+                "sourceId": "scope-1",
+                "generation": "g-1",
+                "ordinal": 0,
+                "relativePath": "notes/plan.md",
+                "displayName": "plan.md",
+                "snippet": "safe snippet",
+                "provider_body": "must not escape",
+            }]
+        }
+        with patch.object(automac_mcp.requests, "post", return_value=response) as post:
+            with automac_mcp.use_runtime(snapshot, secrets):
+                result = automac_mcp.vector_search("meaning")
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["results"], [{
+            "id": "a" * 64,
+            "score": 0.91,
+            "sourceId": "scope-1",
+            "generation": "g-1",
+            "ordinal": 0,
+            "relativePath": "notes/plan.md",
+            "displayName": "plan.md",
+            "snippet": "safe snippet",
+        }])
+        post.assert_called_once()
+        args, kwargs = post.call_args
+        self.assertEqual(args[0], "https://core.example.test/api/v1/search")
+        self.assertEqual(kwargs["json"], {"query": "meaning", "top_k": 10})
+        self.assertEqual(kwargs["headers"]["Authorization"], "Bearer synthetic-core-token")
+        self.assertEqual(kwargs["allow_redirects"], False)
+        self.assertLessEqual(kwargs["timeout"], 10)
+
+    def test_vector_search_accepts_url_and_filesystem_text_as_semantic_prose(self):
+        snapshot = make_snapshot(["meridian.search"])
+        secrets = automac_mcp.RuntimeSecrets(
+            worker_url="https://core.example.test",
+            meridian_ingest_token="synthetic-core-token",
+        )
+        response = type("Response", (), {})()
+        response.status_code = 200
+        response.url = "https://core.example.test/api/v1/search"
+        response.json = lambda: {"results": []}
+
+        queries = ["https://example.com", "/usr/bin", "C:/docs"]
+        with patch.object(automac_mcp.requests, "post", return_value=response) as post:
+            with automac_mcp.use_runtime(snapshot, secrets):
+                results = [automac_mcp.vector_search(query) for query in queries]
+
+        self.assertEqual([result["status"] for result in results], ["success"] * len(queries))
+        self.assertEqual(
+            [call.kwargs["json"]["query"] for call in post.call_args_list],
+            queries,
+        )
+
+    def test_vector_search_rejects_redirects_malformed_results_and_raw_provider_bodies(self):
+        snapshot = make_snapshot(["meridian.search"])
+        token = "synthetic-core-token"
+        secrets = automac_mcp.RuntimeSecrets(
+            worker_url="https://core.example.test",
+            meridian_ingest_token=token,
+        )
+        response = type("Response", (), {})()
+        response.status_code = 502
+        response.url = "https://evil.example.test/api/v1/search"
+        response.text = f"provider-body password={token}"
+        with patch.object(automac_mcp.requests, "post", return_value=response):
+            with automac_mcp.use_runtime(snapshot, secrets):
+                redirected = automac_mcp.vector_search("meaning")
+        self.assertEqual(redirected["error_code"], "REDIRECT_BLOCKED")
+        self.assertNotIn(token, json.dumps(redirected))
+        self.assertNotIn("provider-body", json.dumps(redirected))
+
+        malformed = type("Response", (), {})()
+        malformed.status_code = 200
+        malformed.url = "https://core.example.test/api/v1/search"
+        malformed.json = lambda: {"results": [{"id": "not-an-id", "relativePath": "/private/secret"}]}
+        with patch.object(automac_mcp.requests, "post", return_value=malformed):
+            with automac_mcp.use_runtime(snapshot, secrets):
+                invalid = automac_mcp.vector_search("meaning")
+        self.assertEqual(invalid["error_code"], "INVALID_RESPONSE")
+
     def test_legacy_meridian_environment_values_do_not_register_a_disabled_tool(self):
         snapshot = make_snapshot(["mac.files.read"])
         with patch.dict(

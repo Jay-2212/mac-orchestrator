@@ -106,6 +106,11 @@ final class CapabilityRegistryTests: XCTestCase {
         var configuration = AppConfiguration.fresh(ownerID: "owner-1")
         configuration.controlProfile = .full
         configuration.integration.meridianDeploymentURL = "https://meridian.example"
+        configuration.integration.meridianIndexer = MeridianIndexerConfiguration(
+            enabled: true,
+            scheduleMode: .manual,
+            scopes: [MeridianSourceScope(scopeID: "scope", rootPath: "/Users/example/Notes", paths: ["notes.md"])]
+        )
         configuration.desiredCapabilities["meridian.search"] = true
         configuration.desiredCapabilities["meridian.telegram"] = true
         let facts = readyFacts(meridianSearchReady: false, meridianTelegramReady: true)
@@ -120,6 +125,11 @@ final class CapabilityRegistryTests: XCTestCase {
     func testMeridianURLAndCredentialFactsDoNotAloneMarkSearchReady() {
         var configuration = AppConfiguration.fresh(ownerID: "owner-1")
         configuration.integration.meridianDeploymentURL = "https://meridian.example"
+        configuration.integration.meridianIndexer = MeridianIndexerConfiguration(
+            enabled: true,
+            scheduleMode: .manual,
+            scopes: [MeridianSourceScope(scopeID: "scope", rootPath: "/Users/example/Notes", paths: ["notes.md"])]
+        )
         configuration.desiredCapabilities["meridian.search"] = true
         let facts = readyFacts(meridianCredentialsPresent: true, meridianSearchReady: false)
 
@@ -131,7 +141,7 @@ final class CapabilityRegistryTests: XCTestCase {
         XCTAssertFalse(state.ready)
         XCTAssertEqual(
             state.reason,
-            "Meridian Search compatibility and index readiness have not been verified."
+            "Meridian Search compatibility, indexing, and semantic readiness have not been verified."
         )
     }
 

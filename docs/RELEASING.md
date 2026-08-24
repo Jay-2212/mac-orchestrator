@@ -55,6 +55,14 @@ Support directory, and does not contain ngrok. The bootstrap obtains ngrok from
 the vendor, verifies its original Developer ID authority/team, and never
 re-signs it. Config and Keychain state remain outside runtime promotion.
 
+The release payload also does not contain Meridian's optional indexer. That
+tool is a separate, release-pinned executable handoff installed under the
+owned `meridian/` directory by the native helper's digest-checked optional
+installer. Core release verification must continue to reject `src/indexer`,
+`scripts/indexer.mjs`, Node dependencies, and document/embedding packages in
+the Mac core payload. Optional-tool installation failures are non-destructive
+to the prior tool and to the base MCP runtime.
+
 ## Phase 3C update and uninstall contract
 
 The native maintenance layer persists `InstallationReceiptV1` at the install

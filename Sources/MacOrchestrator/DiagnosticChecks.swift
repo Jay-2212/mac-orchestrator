@@ -752,7 +752,7 @@ enum DiagnosticChecks {
         facts.localMCPPrerequisite != .unavailable
     }
 
-    private static func result(
+    static func result(
         _ id: String,
         _ title: String,
         _ status: DiagnosticStatus,

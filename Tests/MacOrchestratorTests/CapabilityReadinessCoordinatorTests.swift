@@ -267,7 +267,7 @@ final class CapabilityReadinessCoordinatorTests: XCTestCase {
     }
 
     @MainActor
-    func testMeridianAndRemoteConnectorRemainNotReadyInProductionFacts() async throws {
+    func testMeridianAndRemoteConnectorRemainNotReadyWithoutFullReadinessProof() async throws {
         let client = ReadinessKeychainClient(values: [
             KeychainItem.meridianIngestToken(account: NSUserName()).key: "synthetic-ingest",
             KeychainItem.meridianTelegramBotToken.key: "synthetic-bot",
@@ -275,6 +275,11 @@ final class CapabilityReadinessCoordinatorTests: XCTestCase {
         ])
         var configuration = AppConfiguration.fresh(ownerID: "owner")
         configuration.integration.meridianDeploymentURL = "https://meridian.invalid"
+        configuration.integration.meridianIndexer = MeridianIndexerConfiguration(
+            enabled: true,
+            scheduleMode: .manual,
+            scopes: [MeridianSourceScope(scopeID: "scope", rootPath: "/Users/example/Notes", paths: ["notes.md"])]
+        )
         configuration.desiredCapabilities["meridian.search"] = true
         configuration.desiredCapabilities["meridian.telegram"] = true
         configuration.desiredCapabilities["remote.connector"] = true

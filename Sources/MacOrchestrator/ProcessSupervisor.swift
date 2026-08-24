@@ -14,6 +14,14 @@ final class ProcessSupervisor {
         lifecycle.snapshot
     }
 
+    var meridianConfiguration: MeridianIndexerConfiguration {
+        activeContract?.configuration.integration.meridianIndexer ?? MeridianIndexerConfiguration()
+    }
+
+    var meridianScopeIDs: [String] {
+        meridianConfiguration.scopes.map(\.scopeID).sorted()
+    }
+
     private let runtimeCoordinator: NativeRuntimeCoordinator
     private let supportDirectory: URL
     let logsDirectory: URL
@@ -24,6 +32,7 @@ final class ProcessSupervisor {
     private let tunnelLog: RotatingLog
     private let lifecycleScheduler: MainLifecycleScheduler
     private let lifecycle: LifecycleStateMachine
+    private let meridianIndexerCoordinator: MeridianIndexerCoordinator
     private let remoteConnectorAdapter: any RemoteConnectorAdapter
     private let remoteProbeCoordinator: RemoteProbeCoordinator
     private let remoteConnectorStateStore: any RemoteConnectorStatePersisting
@@ -95,12 +104,22 @@ final class ProcessSupervisor {
         serverLog = RotatingLog(directory: logsDirectory, name: "server.log")
         tunnelLog = RotatingLog(directory: logsDirectory, name: "tunnel.log")
         lifecycleScheduler = MainLifecycleScheduler()
+        meridianIndexerCoordinator = MeridianIndexerCoordinator(
+            scheduler: lifecycleScheduler,
+            supportDirectory: supportDirectory
+        )
         lifecycle = LifecycleStateMachine(scheduler: lifecycleScheduler)
         lifecycle.onSnapshot = { [weak self] lifecycleSnapshot in
             self?.applyLifecycleSnapshot(lifecycleSnapshot)
         }
         lifecycle.onEffect = { [weak self] effect in
             self?.handleLifecycleEffect(effect)
+        }
+        meridianIndexerCoordinator.onSnapshot = { [weak self] indexerSnapshot in
+            self?.snapshot.applyMeridianIndexerSnapshot(indexerSnapshot)
+        }
+        meridianIndexerCoordinator.onReadinessEvidenceChanged = { [weak self] in
+            self?.reloadMeridianReadiness()
         }
     }
 
@@ -214,6 +233,7 @@ final class ProcessSupervisor {
         quitting = true
         networkPathMonitor.stop()
         healthTimer?.invalidate()
+        meridianIndexerCoordinator.stop()
         lifecycle.prepareForMaintenance()
         appLog.write("Supervisor quit cleanly")
     }
@@ -228,6 +248,7 @@ final class ProcessSupervisor {
                 self.fail("Configuration reload failed: \(error.localizedDescription)")
             }
             self.lifecycle.handleWake()
+            self.meridianIndexerCoordinator.handleWake()
             self.checkHealth()
         }
     }
@@ -238,7 +259,89 @@ final class ProcessSupervisor {
     }
 
     func prepareForMaintenance() {
+        meridianIndexerCoordinator.stop()
         lifecycle.prepareForMaintenance()
+    }
+
+    func cancelMeridianIndexerRequested() {
+        meridianIndexerCoordinator.cancel()
+    }
+
+    func retryMeridianIndexerRequested(rebuild: Bool = false) {
+        meridianIndexerCoordinator.retry(rebuild: rebuild)
+    }
+
+    func configureMeridianRequested(deploymentURL: String, scopes: [MeridianSourceScope]) {
+        Task { @MainActor [weak self] in
+            await self?.updateConfiguration { configuration in
+                configuration.integration.meridianDeploymentURL = deploymentURL
+                configuration.integration.meridianIndexer = MeridianIndexerConfiguration(
+                    enabled: true,
+                    scheduleMode: configuration.integration.meridianIndexer.scheduleMode,
+                    scopes: scopes
+                )
+                configuration.desiredCapabilities["meridian.search"] = true
+            }
+        }
+    }
+
+    func setMeridianCredentialRequested(
+        _ value: String,
+        completion: @escaping (Bool) -> Void = { _ in }
+    ) {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                try self.runtimeCoordinator.setMeridianIngestToken(value)
+                self.apply(try await self.runtimeCoordinator.reload())
+                completion(true)
+            } catch {
+                self.appLog.write("ERROR: Meridian credential update failed safely")
+                completion(false)
+            }
+        }
+    }
+
+    func disableMeridianRequested() {
+        meridianIndexerCoordinator.stop()
+        Task { @MainActor [weak self] in
+            await self?.updateConfiguration { configuration in
+                configuration.integration.meridianIndexer.enabled = false
+                configuration.desiredCapabilities["meridian.search"] = false
+            }
+        }
+    }
+
+    func setMeridianScheduleRequested(_ mode: MeridianScheduleMode) {
+        Task { @MainActor [weak self] in
+            await self?.updateConfiguration { configuration in
+                configuration.integration.meridianIndexer.scheduleMode = mode
+            }
+        }
+    }
+
+    func scanMeridianNowRequested() {
+        meridianIndexerCoordinator.scanNow()
+    }
+
+    func previewMeridianRequested() {
+        meridianIndexerCoordinator.preview()
+    }
+
+    func pauseMeridianRequested() {
+        meridianIndexerCoordinator.pause()
+    }
+
+    func resumeMeridianRequested() {
+        meridianIndexerCoordinator.resume()
+    }
+
+    func deleteMeridianSourceRequested(scopeID: String) {
+        meridianIndexerCoordinator.deleteSource(scopeID: scopeID)
+    }
+
+    func deleteAllMeridianDataRequested() {
+        meridianIndexerCoordinator.deleteAllData()
     }
 
     func retry(component: ManagedComponentID) {
@@ -293,6 +396,7 @@ final class ProcessSupervisor {
             replacement: replacement
         )
         if forceRestart || transition.requiresRestart {
+            meridianIndexerCoordinator.stop()
             lifecycle.prepareForMaintenance()
             install(
                 replacement,
@@ -341,6 +445,19 @@ final class ProcessSupervisor {
         appLog.redact(contract.redactedSecrets)
         serverLog.redact(contract.redactedSecrets)
         tunnelLog.redact(contract.redactedSecrets)
+        meridianIndexerCoordinator.reconcile(configuration: contract.configuration, contract: contract)
+    }
+
+    private func reloadMeridianReadiness() {
+        guard !quitting else { return }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                self.apply(try await self.runtimeCoordinator.reload())
+            } catch {
+                self.appLog.write("Meridian readiness refresh was not applied")
+            }
+        }
     }
 
     private func applyLifecycleSnapshot(_ lifecycleSnapshot: LifecycleSnapshot) {
